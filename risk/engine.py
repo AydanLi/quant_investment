@@ -56,4 +56,12 @@ class RiskEngine:
         }
         return self.normalize_weights(clipped)
 
+    def pre_trade_check(self, weights: Dict[str, float]) -> Tuple[bool, str]:
+        total = sum(weights.values())
+        if total <= 0.99 or total >= 1.01:
+            return False, f"Weights do not sum close to 1.0: {total:.4f}"
+        if any(v < -1e-9 for v in weights.values()):
+            return False, "Negative weights not allowed in v2.1 long-only system."
+        if any(v > 1.000001 for v in weights.values()):
+            return False, "Single asset weight exceeds 100%."
         return True, "OK"
