@@ -1,4 +1,4 @@
-# Quant System v2
+# Quant System v2.1
 
 A modular ETF rotation quant framework with:
 - Market data loading
@@ -9,8 +9,10 @@ A modular ETF rotation quant framework with:
 - Backtesting engine
 - Mock broker execution
 - Reporting
+- Latest allocation signal service
+- Basic unit tests
 
-## Install
+## 1. Install
 
 ```bash
 pip install -r requirements.txt

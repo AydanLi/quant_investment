@@ -10,7 +10,7 @@ class MockBroker:
         self.order_log: List[Dict] = []
 
     def submit_orders(self, date: pd.Timestamp, current_weights: Dict[str, float], target_weights: Dict[str, float]) -> List[Dict]:
-        orders = []
+        orders: List[Dict] = []
         all_tickers = sorted(set(current_weights.keys()).union(target_weights.keys()))
 
         for ticker in all_tickers:

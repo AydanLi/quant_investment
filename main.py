@@ -6,11 +6,12 @@ from data.features import FeatureEngineer
 from data.loader import MarketDataLoader
 from report.reporter import ReportGenerator
 from risk.engine import RiskEngine
+from services.signal_service import SignalService
 from strategy.momentum_rotation import MomentumRotationStrategy
 from strategy.regime import RegimeDetector
 
 
-def main() -> None:
+def run_backtest() -> None:
     config = Config(
         start_date="2018-01-01",
         end_date=None,
@@ -55,16 +56,16 @@ def main() -> None:
     summary = reporter.summarize(portfolio)
 
     print("\n================ Backtest Summary ================")
-    for k, v in summary.items():
-        if isinstance(v, float):
-            if "Equity" in k:
-                print(f"{k:<16}: ${v:,.2f}")
-            elif k in {"Sharpe", "Avg Turnover"}:
-                print(f"{k:<16}: {v:.4f}")
+    for key, value in summary.items():
+        if isinstance(value, float):
+            if "Equity" in key:
+                print(f"{key:<16}: ${value:,.2f}")
+            elif key in {"Sharpe", "Sortino", "Avg Turnover"}:
+                print(f"{key:<16}: {value:.4f}")
             else:
-                print(f"{k:<16}: {v:.2%}")
+                print(f"{key:<16}: {value:.2%}")
         else:
-            print(f"{k:<16}: {v}")
+            print(f"{key:<16}: {value}")
     print("==================================================")
 
     reporter.print_latest_signal(portfolio)
@@ -76,5 +77,8 @@ def main() -> None:
     reporter.plot(portfolio, prices[config.benchmark])
 
 
-if __name__ == "__main__":
-    main()
+def run_signal_only() -> None:
+    config = Config()
+    service = SignalService(config)
+    signal = service.generate_latest_allocation()
+    # run_signal_only()

@@ -1,6 +1,14 @@
-# Quant Investment Framework v2 (Multi-file Project)
+# Quant Investment Framework v2.1 (Runnable Project Package)
 
-下面是第二版：按专业工程目录拆分的多文件版本。你可以直接照这个结构在本地创建文件。
+这是一份更接近可落地开发的 v2.1 项目版。
+
+相比 v2，新增了：
+
+* `utils/metrics.py`：绩效指标统一管理
+* `services/signal_service.py`：只输出最新调仓建议
+* `tests/`：基础单元测试骨架
+* 更清晰的 README
+* 更清晰的扩展位点（后续接 Streamlit / Broker API / DB）
 
 ---
 
@@ -31,9 +39,19 @@ quant_system/
 ├── backtest/
 │   ├── __init__.py
 │   └── engine.py
-└── report/
+├── report/
+│   ├── __init__.py
+│   └── reporter.py
+├── utils/
+│   ├── __init__.py
+│   └── metrics.py
+├── services/
+│   ├── __init__.py
+│   └── signal_service.py
+└── tests/
     ├── __init__.py
-    └── reporter.py
+    ├── test_metrics.py
+    └── test_risk_engine.py
 ```
 
 ---
@@ -45,6 +63,7 @@ pandas
 numpy
 yfinance
 matplotlib
+pytest
 ```
 
 ---
@@ -52,7 +71,7 @@ matplotlib
 ## File: `README.md`
 
 ````md
-# Quant System v2
+# Quant System v2.1
 
 A modular ETF rotation quant framework with:
 - Market data loading
@@ -63,18 +82,50 @@ A modular ETF rotation quant framework with:
 - Backtesting engine
 - Mock broker execution
 - Reporting
+- Latest allocation signal service
+- Basic unit tests
 
-## Install
+## 1. Install
 
 ```bash
 pip install -r requirements.txt
 ````
 
-## Run
+## 2. Run backtest
 
 ```bash
 python main.py
 ```
+
+## 3. Run tests
+
+```bash
+pytest -q
+```
+
+## 4. Current scope
+
+This version is:
+
+* Long-only
+* ETF-focused
+* End-of-day data
+* Suitable for research / prototype / paper trading
+
+This version is NOT yet:
+
+* Institution-grade OMS/EMS
+* Tick-level or HFT-ready
+* Broker-live by default
+
+## 5. Suggested next upgrades
+
+* Add `dashboard/streamlit_app.py`
+* Add real broker integration (IBKR / Alpaca)
+* Add database persistence
+* Add walk-forward testing
+* Add news sentiment features
+* Add parameter optimization
 
 ````
 
@@ -118,7 +169,7 @@ class Config:
     benchmark: str = "SPY"
     fear_gauge: str = "^VIX"
 
-    rebalance_frequency: str = "M"
+    rebalance_frequency: str = "M"  # D / W / M
     top_n: int = 3
     min_momentum_threshold: float = 0.0
 
@@ -179,22 +230,32 @@ class MarketDataLoader:
             threads=True,
         )
 
+        if data.empty:
+            raise ValueError("No market data returned. Check ticker list, dates, or network connection.")
+
         result: Dict[str, pd.DataFrame] = {}
         for t in tickers:
-            if t in data.columns.get_level_values(0):
-                df = data[t].copy()
-            else:
-                cols = [c for c in data.columns if isinstance(c, tuple) and c[0] == t]
-                if cols:
-                    df = data[cols].copy()
-                    df.columns = [c[1] for c in cols]
+            try:
+                if t in data.columns.get_level_values(0):
+                    df = data[t].copy()
                 else:
-                    continue
+                    cols = [c for c in data.columns if isinstance(c, tuple) and c[0] == t]
+                    if cols:
+                        df = data[cols].copy()
+                        df.columns = [c[1] for c in cols]
+                    else:
+                        continue
 
-            df = df.rename(columns=str.title)
-            keep_cols = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
-            df = df[keep_cols].dropna(how="all")
-            result[t] = df
+                df = df.rename(columns=str.title)
+                keep_cols = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
+                df = df[keep_cols].dropna(how="all")
+                if not df.empty:
+                    result[t] = df
+            except Exception:
+                continue
+
+        if not result:
+            raise ValueError("Failed to parse downloaded market data.")
 
         return result
 ```
@@ -224,13 +285,16 @@ class FeatureEngineer:
         for ticker, df in self.data.items():
             if "Close" in df.columns:
                 prices[ticker] = df["Close"]
-        return pd.DataFrame(prices).sort_index().dropna(how="all")
+        price_df = pd.DataFrame(prices).sort_index().dropna(how="all")
+        if price_df.empty:
+            raise ValueError("Price frame is empty. Cannot continue.")
+        return price_df
 
     def make_returns_frame(self, prices: pd.DataFrame) -> pd.DataFrame:
         return prices.pct_change().replace([np.inf, -np.inf], np.nan)
 
     def compute_features(self, prices: pd.DataFrame, returns: pd.DataFrame) -> Dict[str, pd.DataFrame]:
-        features = {}
+        features: Dict[str, pd.DataFrame] = {}
         features["mom_20"] = prices / prices.shift(20) - 1.0
         features["mom_60"] = prices / prices.shift(60) - 1.0
         features["mom_120"] = prices / prices.shift(120) - 1.0
@@ -273,21 +337,21 @@ class RegimeDetector:
             return "neutral"
 
         try:
-            spy_price = prices.at[date, benchmark]
+            benchmark_price = prices.at[date, benchmark]
             vix = prices.at[date, fear]
             ma_200 = features["ma_200"].at[date, benchmark]
             dd_200 = features["drawdown_200"].at[date, benchmark]
         except Exception:
             return "neutral"
 
-        if pd.isna(spy_price) or pd.isna(vix) or pd.isna(ma_200) or pd.isna(dd_200):
+        if pd.isna(benchmark_price) or pd.isna(vix) or pd.isna(ma_200) or pd.isna(dd_200):
             return "neutral"
 
         if vix >= self.config.vix_risk_off_threshold or dd_200 <= self.config.max_allowed_drawdown_from_200d:
             return "risk_off"
-        if spy_price > ma_200 and vix < self.config.vix_high_threshold:
+        if benchmark_price > ma_200 and vix < self.config.vix_high_threshold:
             return "bull_trend"
-        if spy_price <= ma_200 and vix >= self.config.vix_high_threshold:
+        if benchmark_price <= ma_200 and vix >= self.config.vix_high_threshold:
             return "bear_high_vol"
         return "neutral"
 ```
@@ -320,6 +384,8 @@ class MomentumRotationStrategy:
 
     def score_assets(self, date: pd.Timestamp, prices: pd.DataFrame, features: dict) -> pd.Series:
         tickers = [t for t in self.config.universe if t in prices.columns]
+        if not tickers:
+            return pd.Series(dtype=float)
 
         mom_20 = features["mom_20"].loc[date, tickers]
         mom_60 = features["mom_60"].loc[date, tickers]
@@ -329,8 +395,8 @@ class MomentumRotationStrategy:
         inv_vol = 1.0 / vol_20.replace(0, np.nan)
         inv_vol = inv_vol.replace([np.inf, -np.inf], np.nan)
 
-        def rank_norm(s: pd.Series) -> pd.Series:
-            return s.rank(pct=True).fillna(0.0)
+        def rank_norm(series: pd.Series) -> pd.Series:
+            return series.rank(pct=True).fillna(0.0)
 
         score = (
             self.config.weight_mom_20 * rank_norm(mom_20)
@@ -403,6 +469,9 @@ class RiskEngine:
         return {k: max(v, 0.0) / total for k, v in weights.items()}
 
     def scale_to_target_vol(self, date: pd.Timestamp, raw_weights: Dict[str, float], returns: pd.DataFrame) -> Dict[str, float]:
+        if not raw_weights:
+            return raw_weights
+
         tickers = [t for t in raw_weights if t in returns.columns]
         if not tickers:
             return raw_weights
@@ -441,7 +510,9 @@ class RiskEngine:
         if total <= 0.99 or total >= 1.01:
             return False, f"Weights do not sum close to 1.0: {total:.4f}"
         if any(v < -1e-9 for v in weights.values()):
-            return False, "Negative weights not allowed in v2 long-only system."
+            return False, "Negative weights not allowed in v2.1 long-only system."
+        if any(v > 1.000001 for v in weights.values()):
+            return False, "Single asset weight exceeds 100%."
         return True, "OK"
 ```
 
@@ -470,7 +541,7 @@ class MockBroker:
         self.order_log: List[Dict] = []
 
     def submit_orders(self, date: pd.Timestamp, current_weights: Dict[str, float], target_weights: Dict[str, float]) -> List[Dict]:
-        orders = []
+        orders: List[Dict] = []
         all_tickers = sorted(set(current_weights.keys()).union(target_weights.keys()))
 
         for ticker in all_tickers:
@@ -538,6 +609,9 @@ class Backtester:
         min_warmup = 220
         dates = self.prices.index[min_warmup:]
 
+        if len(dates) == 0:
+            raise ValueError("Not enough data after warmup window. Extend start_date earlier.")
+
         current_weights = {"BIL": 1.0} if "BIL" in self.config.universe else {}
         history = []
         equity = self.config.initial_capital
@@ -546,9 +620,9 @@ class Backtester:
         for date in dates:
             if prev_date is not None:
                 daily_ret = 0.0
-                for ticker, w in current_weights.items():
+                for ticker, weight in current_weights.items():
                     if ticker in self.returns.columns and pd.notna(self.returns.at[date, ticker]):
-                        daily_ret += w * self.returns.at[date, ticker]
+                        daily_ret += weight * self.returns.at[date, ticker]
                 equity *= (1.0 + daily_ret)
             else:
                 daily_ret = 0.0
@@ -591,6 +665,75 @@ class Backtester:
 
 ---
 
+## File: `utils/__init__.py`
+
+```python
+# empty
+```
+
+---
+
+## File: `utils/metrics.py`
+
+```python
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+
+
+def annualized_volatility(returns: pd.Series, periods_per_year: int = 252) -> float:
+    ret = returns.dropna()
+    if ret.empty:
+        return np.nan
+    return float(ret.std() * np.sqrt(periods_per_year))
+
+
+
+def max_drawdown(equity_curve: pd.Series) -> float:
+    curve = equity_curve.dropna()
+    if curve.empty:
+        return np.nan
+    running_max = curve.cummax()
+    dd = curve / running_max - 1.0
+    return float(dd.min())
+
+
+
+def sharpe_ratio(returns: pd.Series, rf: float = 0.0, periods_per_year: int = 252) -> float:
+    ret = returns.dropna()
+    if ret.empty or ret.std() == 0:
+        return np.nan
+    excess = ret - rf / periods_per_year
+    return float(excess.mean() / ret.std() * np.sqrt(periods_per_year))
+
+
+
+def sortino_ratio(returns: pd.Series, rf: float = 0.0, periods_per_year: int = 252) -> float:
+    ret = returns.dropna()
+    if ret.empty:
+        return np.nan
+    downside = ret[ret < 0]
+    if downside.empty or downside.std() == 0:
+        return np.nan
+    excess = ret - rf / periods_per_year
+    return float(excess.mean() / downside.std() * np.sqrt(periods_per_year))
+
+
+
+def cagr(equity_curve: pd.Series, periods_per_year: int = 252) -> float:
+    curve = equity_curve.dropna()
+    if len(curve) < 2:
+        return np.nan
+    total_return = curve.iloc[-1] / curve.iloc[0]
+    years = len(curve) / periods_per_year
+    if years <= 0:
+        return np.nan
+    return float(total_return ** (1 / years) - 1)
+```
+
+---
+
 ## File: `report/__init__.py`
 
 ```python
@@ -605,45 +748,15 @@ class Backtester:
 from __future__ import annotations
 
 import matplotlib.pyplot as plt
-import numpy as np
 import pandas as pd
 
 from config.settings import Config
+from utils.metrics import annualized_volatility, cagr, max_drawdown, sharpe_ratio, sortino_ratio
 
 
 class ReportGenerator:
     def __init__(self, config: Config):
         self.config = config
-
-    @staticmethod
-    def annualized_volatility(returns: pd.Series, periods_per_year: int = 252) -> float:
-        if returns.dropna().empty:
-            return np.nan
-        return float(returns.std() * np.sqrt(periods_per_year))
-
-    @staticmethod
-    def max_drawdown(equity_curve: pd.Series) -> float:
-        running_max = equity_curve.cummax()
-        dd = equity_curve / running_max - 1.0
-        return float(dd.min())
-
-    @staticmethod
-    def sharpe_ratio(returns: pd.Series, periods_per_year: int = 252) -> float:
-        ret = returns.dropna()
-        if ret.empty or ret.std() == 0:
-            return np.nan
-        return float(ret.mean() / ret.std() * np.sqrt(periods_per_year))
-
-    @staticmethod
-    def cagr(equity_curve: pd.Series, periods_per_year: int = 252) -> float:
-        curve = equity_curve.dropna()
-        if len(curve) < 2:
-            return np.nan
-        total_return = curve.iloc[-1] / curve.iloc[0]
-        years = len(curve) / periods_per_year
-        if years <= 0:
-            return np.nan
-        return float(total_return ** (1 / years) - 1)
 
     def summarize(self, portfolio: pd.DataFrame) -> pd.Series:
         equity_curve = portfolio["equity"]
@@ -654,10 +767,11 @@ class ReportGenerator:
                 "Start Equity": float(equity_curve.iloc[0]),
                 "End Equity": float(equity_curve.iloc[-1]),
                 "Total Return": float(equity_curve.iloc[-1] / equity_curve.iloc[0] - 1.0),
-                "CAGR": self.cagr(equity_curve),
-                "Annual Vol": self.annualized_volatility(returns),
-                "Sharpe": self.sharpe_ratio(returns),
-                "Max Drawdown": self.max_drawdown(equity_curve),
+                "CAGR": cagr(equity_curve),
+                "Annual Vol": annualized_volatility(returns),
+                "Sharpe": sharpe_ratio(returns),
+                "Sortino": sortino_ratio(returns),
+                "Max Drawdown": max_drawdown(equity_curve),
                 "Avg Turnover": float(portfolio["turnover"].mean()),
             }
         )
@@ -670,9 +784,9 @@ class ReportGenerator:
         print(f"Equity: ${latest['equity']:,.2f}")
         print("Suggested weights:")
         for ticker in self.config.universe:
-            w = latest.get(f"w_{ticker}", 0.0)
-            if w > 0.0001:
-                print(f"  {ticker:<5} {w:>6.2%}")
+            weight = latest.get(f"w_{ticker}", 0.0)
+            if weight > 0.0001:
+                print(f"  {ticker:<5} {weight:>6.2%}")
         print("============================================================\n")
 
     def plot(self, portfolio: pd.DataFrame, benchmark_prices: pd.Series) -> None:
@@ -693,6 +807,124 @@ class ReportGenerator:
 
 ---
 
+## File: `services/__init__.py`
+
+```python
+# empty
+```
+
+---
+
+## File: `services/signal_service.py`
+
+```python
+from __future__ import annotations
+
+from config.settings import Config
+from data.features import FeatureEngineer
+from data.loader import MarketDataLoader
+from risk.engine import RiskEngine
+from strategy.momentum_rotation import MomentumRotationStrategy
+from strategy.regime import RegimeDetector
+
+
+class SignalService:
+    def __init__(self, config: Config):
+        self.config = config
+
+    def generate_latest_allocation(self) -> dict:
+        loader = MarketDataLoader(self.config)
+        data = loader.load()
+
+        fe = FeatureEngineer(data, self.config)
+        prices = fe.make_price_frame()
+        returns = fe.make_returns_frame(prices)
+        features = fe.compute_features(prices, returns)
+
+        date = prices.index[-1]
+        regime_detector = RegimeDetector(self.config)
+        strategy = MomentumRotationStrategy(self.config)
+        risk_engine = RiskEngine(self.config)
+
+        regime = regime_detector.classify(date, prices, features)
+        target = strategy.target_weights(date, regime, prices, features)
+        target = risk_engine.scale_to_target_vol(date, target, returns)
+        target = risk_engine.enforce_weight_limits(target)
+
+        ok, reason = risk_engine.pre_trade_check(target)
+        if not ok:
+            raise ValueError(f"Latest signal failed pre-trade check: {reason}")
+
+        return {
+            "date": str(date.date()),
+            "regime": regime,
+            "weights": target,
+        }
+```
+
+---
+
+## File: `tests/__init__.py`
+
+```python
+# empty
+```
+
+---
+
+## File: `tests/test_metrics.py`
+
+```python
+import pandas as pd
+
+from utils.metrics import annualized_volatility, cagr, max_drawdown
+
+
+def test_max_drawdown_negative_or_zero():
+    equity = pd.Series([100, 110, 105, 90, 95])
+    result = max_drawdown(equity)
+    assert result <= 0
+
+
+def test_annualized_volatility_non_negative():
+    returns = pd.Series([0.01, -0.02, 0.005, 0.003])
+    result = annualized_volatility(returns)
+    assert result >= 0
+
+
+def test_cagr_float_output():
+    equity = pd.Series([100, 105, 110, 120])
+    result = cagr(equity, periods_per_year=4)
+    assert isinstance(result, float)
+```
+
+---
+
+## File: `tests/test_risk_engine.py`
+
+```python
+from config.settings import Config
+from risk.engine import RiskEngine
+
+
+def test_pre_trade_check_valid_weights():
+    config = Config()
+    engine = RiskEngine(config)
+    ok, reason = engine.pre_trade_check({"SPY": 0.5, "QQQ": 0.5})
+    assert ok is True
+    assert reason == "OK"
+
+
+def test_pre_trade_check_invalid_sum():
+    config = Config()
+    engine = RiskEngine(config)
+    ok, reason = engine.pre_trade_check({"SPY": 0.4, "QQQ": 0.4})
+    assert ok is False
+    assert "Weights do not sum" in reason
+```
+
+---
+
 ## File: `main.py`
 
 ```python
@@ -704,11 +936,12 @@ from data.features import FeatureEngineer
 from data.loader import MarketDataLoader
 from report.reporter import ReportGenerator
 from risk.engine import RiskEngine
+from services.signal_service import SignalService
 from strategy.momentum_rotation import MomentumRotationStrategy
 from strategy.regime import RegimeDetector
 
 
-def main() -> None:
+def run_backtest() -> None:
     config = Config(
         start_date="2018-01-01",
         end_date=None,
@@ -753,16 +986,16 @@ def main() -> None:
     summary = reporter.summarize(portfolio)
 
     print("\n================ Backtest Summary ================")
-    for k, v in summary.items():
-        if isinstance(v, float):
-            if "Equity" in k:
-                print(f"{k:<16}: ${v:,.2f}")
-            elif k in {"Sharpe", "Avg Turnover"}:
-                print(f"{k:<16}: {v:.4f}")
+    for key, value in summary.items():
+        if isinstance(value, float):
+            if "Equity" in key:
+                print(f"{key:<16}: ${value:,.2f}")
+            elif key in {"Sharpe", "Sortino", "Avg Turnover"}:
+                print(f"{key:<16}: {value:.4f}")
             else:
-                print(f"{k:<16}: {v:.2%}")
+                print(f"{key:<16}: {value:.2%}")
         else:
-            print(f"{k:<16}: {v}")
+            print(f"{key:<16}: {value}")
     print("==================================================")
 
     reporter.print_latest_signal(portfolio)
@@ -774,37 +1007,60 @@ def main() -> None:
     reporter.plot(portfolio, prices[config.benchmark])
 
 
+def run_signal_only() -> None:
+    config = Config()
+    service = SignalService(config)
+    signal = service.generate_latest_allocation()
+    print("Latest signal:")
+    print(signal)
+
+
 if __name__ == "__main__":
-    main()
+    run_backtest()
+    # run_signal_only()
 ```
-
----
-
-## 这个 v2 相比 v1 的提升
-
-* 单文件改成多模块，后续维护容易得多
-* 配置与业务逻辑分离
-* 数据 / 策略 / 风控 / 执行 / 回测 / 报告职责更清楚
-* 更接近真实可扩展工程
-
----
-
-## 下一步最值得做的 v2.1 升级
-
-1. 加 `utils/metrics.py`，把绩效指标独立出去
-2. 加 `portfolio/allocator.py`，把权重优化独立出去
-3. 加 `signal_service.py`，支持只输出最新调仓建议
-4. 加 `dashboard/streamlit_app.py`
-5. 加 `tests/` 单元测试
-6. 加 `broker/alpaca.py` 或 `broker/ib.py` 真正对接券商
 
 ---
 
 ## 本地创建方式
 
-在项目根目录下逐个建立这些文件，然后运行：
+在本地先建目录：
+
+```bash
+mkdir quant_system
+cd quant_system
+mkdir config data strategy risk execution backtest report utils services tests
+```
+
+然后把对应代码分别复制进去，最后运行：
 
 ```bash
 pip install -r requirements.txt
 python main.py
+pytest -q
 ```
+
+---
+
+## v2.1 的意义
+
+这版已经不只是“代码示例”，而是比较像你后面能持续迭代的个人量化研究项目骨架。
+
+它适合继续往下长成：
+
+* v2.2：加 Streamlit dashboard
+* v2.3：加真实 Broker API
+* v2.4：加数据库与日志
+* v2.5：加新闻情绪与宏观因子
+* v3.0：多策略组合 + walk-forward + 参数管理
+
+---
+
+## 我建议你下一步最该做的事
+
+不是继续堆功能，而是优先做下面两件：
+
+1. 把这个 v2.1 真正在你本地跑通
+2. 我再帮你做一个 `dashboard/streamlit_app.py`
+
+这样你就不只是有代码，还有一个你能每天看的量化驾驶舱。

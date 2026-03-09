@@ -25,7 +25,7 @@ class Config:
     benchmark: str = "SPY"
     fear_gauge: str = "^VIX"
 
-    rebalance_frequency: str = "M"
+    rebalance_frequency: str = "M"  # D / W / M
     top_n: int = 3
     min_momentum_threshold: float = 0.0
 

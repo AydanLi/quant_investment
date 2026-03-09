@@ -24,21 +24,31 @@ class MarketDataLoader:
             threads=True,
         )
 
+        if data.empty:
+            raise ValueError("No market data returned. Check ticker list, dates, or network connection.")
+
         result: Dict[str, pd.DataFrame] = {}
         for t in tickers:
-            if t in data.columns.get_level_values(0):
-                df = data[t].copy()
-            else:
-                cols = [c for c in data.columns if isinstance(c, tuple) and c[0] == t]
-                if cols:
-                    df = data[cols].copy()
-                    df.columns = [c[1] for c in cols]
+            try:
+                if t in data.columns.get_level_values(0):
+                    df = data[t].copy()
                 else:
-                    continue
+                    cols = [c for c in data.columns if isinstance(c, tuple) and c[0] == t]
+                    if cols:
+                        df = data[cols].copy()
+                        df.columns = [c[1] for c in cols]
+                    else:
+                        continue
 
-            df = df.rename(columns=str.title)
-            keep_cols = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
-            df = df[keep_cols].dropna(how="all")
-            result[t] = df
+                df = df.rename(columns=str.title)
+                keep_cols = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
+                df = df[keep_cols].dropna(how="all")
+                if not df.empty:
+                    result[t] = df
+            except Exception:
+                continue
+
+        if not result:
+            raise ValueError("Failed to parse downloaded market data.")
 
         return result

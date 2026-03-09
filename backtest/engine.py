@@ -32,6 +32,9 @@ class Backtester:
         min_warmup = 220
         dates = self.prices.index[min_warmup:]
 
+        if len(dates) == 0:
+            raise ValueError("Not enough data after warmup window. Extend start_date earlier.")
+
         current_weights = {"BIL": 1.0} if "BIL" in self.config.universe else {}
         history = []
         equity = self.config.initial_capital
@@ -40,9 +43,9 @@ class Backtester:
         for date in dates:
             if prev_date is not None:
                 daily_ret = 0.0
-                for ticker, w in current_weights.items():
+                for ticker, weight in current_weights.items():
                     if ticker in self.returns.columns and pd.notna(self.returns.at[date, ticker]):
-                        daily_ret += w * self.returns.at[date, ticker]
+                        daily_ret += weight * self.returns.at[date, ticker]
                 equity *= (1.0 + daily_ret)
             else:
                 daily_ret = 0.0
@@ -74,10 +77,4 @@ class Backtester:
                 "turnover": turnover,
             }
             for ticker in self.config.universe:
-                snapshot[f"w_{ticker}"] = current_weights.get(ticker, 0.0)
-            history.append(snapshot)
-            prev_date = date
-
-        portfolio = pd.DataFrame(history).set_index("date")
-        orders = pd.DataFrame(self.broker.order_log)
         return {"portfolio": portfolio, "orders": orders}

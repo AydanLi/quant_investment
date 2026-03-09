@@ -17,20 +17,20 @@ class RegimeDetector:
             return "neutral"
 
         try:
-            spy_price = prices.at[date, benchmark]
+            benchmark_price = prices.at[date, benchmark]
             vix = prices.at[date, fear]
             ma_200 = features["ma_200"].at[date, benchmark]
             dd_200 = features["drawdown_200"].at[date, benchmark]
         except Exception:
             return "neutral"
 
-        if pd.isna(spy_price) or pd.isna(vix) or pd.isna(ma_200) or pd.isna(dd_200):
+        if pd.isna(benchmark_price) or pd.isna(vix) or pd.isna(ma_200) or pd.isna(dd_200):
             return "neutral"
 
         if vix >= self.config.vix_risk_off_threshold or dd_200 <= self.config.max_allowed_drawdown_from_200d:
             return "risk_off"
-        if spy_price > ma_200 and vix < self.config.vix_high_threshold:
+        if benchmark_price > ma_200 and vix < self.config.vix_high_threshold:
             return "bull_trend"
-        if spy_price <= ma_200 and vix >= self.config.vix_high_threshold:
+        if benchmark_price <= ma_200 and vix >= self.config.vix_high_threshold:
             return "bear_high_vol"
         return "neutral"

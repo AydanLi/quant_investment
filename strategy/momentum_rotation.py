@@ -21,6 +21,8 @@ class MomentumRotationStrategy:
 
     def score_assets(self, date: pd.Timestamp, prices: pd.DataFrame, features: dict) -> pd.Series:
         tickers = [t for t in self.config.universe if t in prices.columns]
+        if not tickers:
+            return pd.Series(dtype=float)
 
         mom_20 = features["mom_20"].loc[date, tickers]
         mom_60 = features["mom_60"].loc[date, tickers]
@@ -30,8 +32,8 @@ class MomentumRotationStrategy:
         inv_vol = 1.0 / vol_20.replace(0, np.nan)
         inv_vol = inv_vol.replace([np.inf, -np.inf], np.nan)
 
-        def rank_norm(s: pd.Series) -> pd.Series:
-            return s.rank(pct=True).fillna(0.0)
+        def rank_norm(series: pd.Series) -> pd.Series:
+            return series.rank(pct=True).fillna(0.0)
 
         score = (
             self.config.weight_mom_20 * rank_norm(mom_20)

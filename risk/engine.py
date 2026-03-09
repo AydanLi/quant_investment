@@ -20,6 +20,9 @@ class RiskEngine:
         return {k: max(v, 0.0) / total for k, v in weights.items()}
 
     def scale_to_target_vol(self, date: pd.Timestamp, raw_weights: Dict[str, float], returns: pd.DataFrame) -> Dict[str, float]:
+        if not raw_weights:
+            return raw_weights
+
         tickers = [t for t in raw_weights if t in returns.columns]
         if not tickers:
             return raw_weights
@@ -53,10 +56,4 @@ class RiskEngine:
         }
         return self.normalize_weights(clipped)
 
-    def pre_trade_check(self, weights: Dict[str, float]) -> Tuple[bool, str]:
-        total = sum(weights.values())
-        if total <= 0.99 or total >= 1.01:
-            return False, f"Weights do not sum close to 1.0: {total:.4f}"
-        if any(v < -1e-9 for v in weights.values()):
-            return False, "Negative weights not allowed in v2 long-only system."
         return True, "OK"
