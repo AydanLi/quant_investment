@@ -34,4 +34,5 @@ class FeatureEngineer:
         features["vol_20"] = returns.rolling(20).std() * np.sqrt(252)
         features["ma_50"] = prices.rolling(50).mean()
         features["ma_200"] = prices.rolling(200).mean()
+        features["drawdown_200"] = prices / features["ma_200"] - 1.0
         return features
