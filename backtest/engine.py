@@ -9,7 +9,16 @@ from execution.broker import MockBroker
 
 
 class Backtester:
-    def __init__(self, config: Config, prices: pd.DataFrame, returns: pd.DataFrame, features: dict, regime_detector, strategy, risk_engine):
+    def __init__(
+        self,
+        config: Config,
+        prices: pd.DataFrame,
+        returns: pd.DataFrame,
+        features: dict,
+        regime_detector,
+        strategy,
+        risk_engine,
+    ):
         self.config = config
         self.prices = prices.copy()
         self.returns = returns.copy()
@@ -62,7 +71,10 @@ class Backtester:
                 if not ok:
                     raise ValueError(f"Pre-trade risk check failed on {date.date()}: {reason}")
 
-                turnover = sum(abs(target.get(k, 0.0) - current_weights.get(k, 0.0)) for k in set(target).union(current_weights))
+                turnover = sum(
+                    abs(target.get(k, 0.0) - current_weights.get(k, 0.0))
+                    for k in set(target).union(current_weights)
+                )
                 est_cost = turnover * (self.config.trading_cost_bps / 10000.0)
                 equity *= (1.0 - est_cost)
 
@@ -76,5 +88,13 @@ class Backtester:
                 "regime": regime,
                 "turnover": turnover,
             }
+
             for ticker in self.config.universe:
+                snapshot[f"w_{ticker}"] = current_weights.get(ticker, 0.0)
+
+            history.append(snapshot)
+            prev_date = date
+
+        portfolio = pd.DataFrame(history).set_index("date")
+        orders = pd.DataFrame(self.broker.order_log)
         return {"portfolio": portfolio, "orders": orders}
