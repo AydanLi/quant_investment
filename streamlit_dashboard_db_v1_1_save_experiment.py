@@ -160,11 +160,23 @@ def main() -> None:
         vix_high_threshold = st.slider("VIX High Threshold", 12.0, 40.0, 22.0, 1.0)
         trading_cost_bps = st.slider("Trading Cost (bps)", 0.0, 30.0, 5.0, 0.5)
 
+        auto_name = (
+            f"dashboard_{rebalance_frequency}"
+            f"_top{top_n}"
+            f"_mom{min_momentum_threshold:.2f}"
+            f"_vol{target_annual_vol:.2f}"
+            f"_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}"
+        )
+
+        use_auto_name = st.checkbox("自动生成实验名称", value=True)
+        final_scenario_name = auto_name if use_auto_name else scenario_name
+        st.caption(f"当前将保存为：{final_scenario_name}")
+
         if st.button("保存当前参数为新实验", type="primary", use_container_width=True):
             with st.spinner("正在回测并写入数据库..."):
                 try:
                     run_id = execute_experiment_and_save(
-                        scenario_name=scenario_name,
+                        scenario_name=final_scenario_name,
                         start_date=start_date,
                         rebalance_frequency=rebalance_frequency,
                         top_n=top_n,
