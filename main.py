@@ -1,4 +1,22 @@
 from __future__ import annotations
+
+from backtest.engine import Backtester
+from config.settings import Config
+from data.features import FeatureEngineer
+from data.loader import MarketDataLoader
+from report.reporter import ReportGenerator
+from risk.engine import RiskEngine
+from services.signal_service import SignalService
+from strategy.momentum_rotation import MomentumRotationStrategy
+from strategy.regime import RegimeDetector
+
+
+def run_backtest() -> None:
+    config = Config(
+        start_date="2018-01-01",
+        end_date=None,
+        rebalance_frequency="M",
+        top_n=3,
         min_momentum_threshold=0.0,
         target_annual_vol=0.12,
         max_asset_weight=0.40,
@@ -63,10 +81,4 @@ def run_signal_only() -> None:
     config = Config()
     service = SignalService(config)
     signal = service.generate_latest_allocation()
-    print("Latest signal:")
-    print(signal)
-
-
-if __name__ == "__main__":
-    run_backtest()
     # run_signal_only()
