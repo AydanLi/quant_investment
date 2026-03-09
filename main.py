@@ -81,4 +81,10 @@ def run_signal_only() -> None:
     config = Config()
     service = SignalService(config)
     signal = service.generate_latest_allocation()
+    print("Latest signal:")
+    print(signal)
+
+
+if __name__ == "__main__":
+    run_backtest()
     # run_signal_only()
