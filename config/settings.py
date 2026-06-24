@@ -45,3 +45,9 @@ class Config:
     trading_cost_bps: float = 5.0
 
     initial_capital: float = 100000.0
+
+    # Persistence layer. SQLite by default; swap to Postgres/MySQL by changing
+    # this URL and installing the matching driver, e.g.
+    #   postgresql+psycopg2://user:pass@host/quant
+    #   mysql+pymysql://user:pass@host/quant
+    db_url: str = "sqlite:///quant_research.db"
