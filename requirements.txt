@@ -3,3 +3,5 @@ numpy
 yfinance
 matplotlib
 streamlit
+sqlalchemy
+alembic

@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Alembic scratch databases used for schema verification
+_alembic_baseline_tmp.db*
+_verify_tmp.db*
+
+# SQLite sidecar files (WAL mode)
+*.db-wal
+*.db-shm
