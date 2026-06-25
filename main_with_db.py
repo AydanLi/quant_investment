@@ -7,7 +7,7 @@ from data.loader import MarketDataLoader
 from report.reporter import ReportGenerator
 from risk.engine import RiskEngine
 from services.signal_service import SignalService
-from storage.sqlite_store import SQLiteStore
+from storage.store import ResearchStore
 from strategy.momentum_rotation import MomentumRotationStrategy
 from strategy.regime import RegimeDetector
 
@@ -60,7 +60,7 @@ def run_backtest_and_save() -> None:
     latest_signal = signal_service.generate_latest_allocation()
 
     print("Saving to SQLite...")
-    store = SQLiteStore("quant_research.db")
+    store = ResearchStore()
     store.init_db()
 
     run_id = store.save_experiment_run(

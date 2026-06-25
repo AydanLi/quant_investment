@@ -1,5 +1,5 @@
-from storage.sqlite_store import SQLiteStore
+from storage.store import ResearchStore
 
-store = SQLiteStore("quant_research.db")
+store = ResearchStore()
 print(store.get_experiment_runs(5))
 store.close()

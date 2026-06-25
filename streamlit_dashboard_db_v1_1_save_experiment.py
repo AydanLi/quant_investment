@@ -10,7 +10,7 @@ from data.loader import MarketDataLoader
 from report.reporter import ReportGenerator
 from risk.engine import RiskEngine
 from services.signal_service import SignalService
-from storage.sqlite_store import SQLiteStore
+from storage.store import ResearchStore
 from strategy.momentum_rotation import MomentumRotationStrategy
 from strategy.regime import RegimeDetector
 
@@ -20,7 +20,7 @@ DB_PATH = "quant_research.db"
 
 @st.cache_data(show_spinner=False)
 def load_runs(limit: int) -> pd.DataFrame:
-    store = SQLiteStore(DB_PATH)
+    store = ResearchStore()
     try:
         df = store.get_experiment_runs(limit)
     finally:
@@ -30,7 +30,7 @@ def load_runs(limit: int) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def load_run_details(run_id: int):
-    store = SQLiteStore(DB_PATH)
+    store = ResearchStore()
     try:
         portfolio = store.get_run_portfolio(run_id)
         orders = store.get_run_orders(run_id)
@@ -112,18 +112,17 @@ def execute_experiment_and_save(
     signal_service = SignalService(config)
     latest_signal = signal_service.generate_latest_allocation()
 
-    store = SQLiteStore(DB_PATH)
+    store = ResearchStore()
     try:
         store.init_db()
-        run_id = store.save_experiment_run(
+        run_id = store.save_full_run(
             scenario_name=scenario_name,
             config=config,
             summary=summary,
+            portfolio=portfolio,
+            order_df=orders,
             latest_signal=latest_signal,
         )
-        store.save_portfolio_daily(run_id, portfolio)
-        store.save_orders(run_id, orders)
-        store.save_signals(run_id, latest_signal)
     finally:
         store.close()
 
@@ -237,7 +236,7 @@ def main() -> None:
         "vix_risk_off_threshold",
         "vix_high_threshold",
         "trading_cost_bps",
-        "run_time",
+        "created_at",
     ]
     param_df = pd.DataFrame(
         [{"Parameter": col, "Value": selected_row.get(col)} for col in param_cols]
@@ -318,7 +317,7 @@ def main() -> None:
         "annual_vol",
         "avg_turnover",
         "latest_regime",
-        "run_time",
+        "created_at",
     ]
     existing_compare_cols = [c for c in compare_cols if c in runs.columns]
     st.dataframe(runs[existing_compare_cols], use_container_width=True)

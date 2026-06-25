@@ -7,8 +7,15 @@ __pycache__/
 _alembic_baseline_tmp.db*
 _verify_tmp.db*
 
+# Runtime database (schema is Alembic-managed; build with `alembic upgrade head`).
+# No longer tracked in git as of the Phase 4 cutover.
+quant_research.db*
+
 # Generated migration artifact (reproducible via scripts/migrate_legacy_to_v2.py)
 quant_research_v2.db*
+
+# Legacy DB backup kept from the v2 cutover
+quant_research_legacy_backup.db*
 
 # SQLite sidecar files (WAL mode)
 *.db-wal
