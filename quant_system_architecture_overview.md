@@ -522,10 +522,9 @@ Engine 工厂。负责：
 
 ---
 
-## 9. 一句话总结
+## 9. 总结
 
 这套系统当前是一套：
-
-**基于 Python 的 ETF 动量轮动量化研究平台，具备 cache-first 数据获取、特征工程、市场状态识别、策略打分、风控、回测、信号生成、Streamlit 可视化，以及基于 SQLAlchemy + Alembic 的后端无关持久化层（experiment tracking、每日持仓权重历史、市场数据缓存）。**
+基于 Python 的 ETF 动量轮动量化研究平台，具备 cache-first 数据获取、特征工程、市场状态识别、策略打分、风控、回测、信号生成、Streamlit 可视化，以及基于 SQLAlchemy + Alembic 的后端无关持久化层（experiment tracking、每日持仓权重历史、市场数据缓存）。
 
 它已从"量化脚本"阶段升级到"可重现的个人研究平台"阶段，并为未来切换到 PostgreSQL 和接入实盘 broker 打好了基础。
