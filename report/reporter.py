@@ -14,17 +14,25 @@ class ReportGenerator:
     def summarize(self, portfolio: pd.DataFrame) -> pd.Series:
         equity_curve = portfolio["equity"]
         returns = portfolio["daily_return"]
+        initial_equity = float(self.config.initial_capital)
+        equity_with_initial = pd.concat(
+            [
+                pd.Series([initial_equity], dtype=float),
+                equity_curve.reset_index(drop=True),
+            ],
+            ignore_index=True,
+        )
 
         return pd.Series(
             {
-                "Start Equity": float(equity_curve.iloc[0]),
+                "Start Equity": initial_equity,
                 "End Equity": float(equity_curve.iloc[-1]),
-                "Total Return": float(equity_curve.iloc[-1] / equity_curve.iloc[0] - 1.0),
-                "CAGR": cagr(equity_curve),
+                "Total Return": float(equity_curve.iloc[-1] / initial_equity - 1.0),
+                "CAGR": cagr(equity_with_initial),
                 "Annual Vol": annualized_volatility(returns),
                 "Sharpe": sharpe_ratio(returns),
                 "Sortino": sortino_ratio(returns),
-                "Max Drawdown": max_drawdown(equity_curve),
+                "Max Drawdown": max_drawdown(equity_with_initial),
                 "Avg Turnover": float(portfolio["turnover"].mean()),
             }
         )

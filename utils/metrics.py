@@ -48,7 +48,7 @@ def cagr(equity_curve: pd.Series, periods_per_year: int = 252) -> float:
     if len(curve) < 2:
         return np.nan
     total_return = curve.iloc[-1] / curve.iloc[0]
-    years = len(curve) / periods_per_year
+    years = (len(curve) - 1) / periods_per_year
     if years <= 0:
         return np.nan
     return float(total_return ** (1 / years) - 1)

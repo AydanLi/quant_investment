@@ -19,3 +19,11 @@ def test_cagr_float_output():
     equity = pd.Series([100, 105, 110, 120])
     result = cagr(equity, periods_per_year=4)
     assert isinstance(result, float)
+
+
+def test_cagr_uses_elapsed_period_count():
+    equity = pd.Series([100.0, 110.0])
+
+    result = cagr(equity, periods_per_year=1)
+
+    assert abs(result - 0.10) < 1e-12

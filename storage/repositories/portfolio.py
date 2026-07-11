@@ -1,10 +1,11 @@
 """Daily portfolio state: equity curve plus per-asset weights.
 
-The backtest produces a DataFrame indexed by date with columns
-``equity, daily_return, regime, turnover`` and one ``w_<ticker>`` column per
-universe member. The old store dropped the weight columns entirely; here they
-are persisted in long format in ``portfolio_weights`` so the historical
-allocation can be reconstructed for any run.
+The backtest produces a DataFrame indexed by date with columns including
+``equity, gross_return, daily_return, regime, turnover, est_cost`` and one
+``w_<ticker>`` column per universe member. The old store dropped the weight
+columns entirely; here they are persisted in long format in
+``portfolio_weights`` so the historical allocation can be reconstructed for
+any run. ``daily_return`` and ``est_cost`` use net-return fraction units.
 """
 from __future__ import annotations
 

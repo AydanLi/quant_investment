@@ -50,17 +50,19 @@ class Backtester:
         prev_date = None
 
         for date in dates:
+            day_start_equity = equity
             if prev_date is not None:
-                daily_ret = 0.0
+                gross_return = 0.0
                 for ticker, weight in current_weights.items():
                     if ticker in self.returns.columns and pd.notna(self.returns.at[date, ticker]):
-                        daily_ret += weight * self.returns.at[date, ticker]
-                equity *= (1.0 + daily_ret)
+                        gross_return += weight * self.returns.at[date, ticker]
+                equity *= (1.0 + gross_return)
             else:
-                daily_ret = 0.0
+                gross_return = 0.0
 
             regime = self.regime_detector.classify(date, self.prices, self.features)
             turnover = 0.0
+            est_cost = 0.0
 
             if date in rebalance_dates:
                 target = self.strategy.target_weights(date, regime, self.prices, self.features)
@@ -78,15 +80,25 @@ class Backtester:
                 est_cost = turnover * (self.config.trading_cost_bps / 10000.0)
                 equity *= (1.0 - est_cost)
 
-                self.broker.submit_orders(date, current_weights, target)
+                self.broker.submit_orders(
+                    date,
+                    current_weights,
+                    target,
+                    prices=self.prices.loc[date],
+                    trading_cost_bps=self.config.trading_cost_bps,
+                )
                 current_weights = target
+
+            daily_return = equity / day_start_equity - 1.0
 
             snapshot = {
                 "date": date,
                 "equity": equity,
-                "daily_return": daily_ret,
+                "gross_return": gross_return,
+                "daily_return": daily_return,
                 "regime": regime,
                 "turnover": turnover,
+                "est_cost": est_cost,
             }
 
             for ticker in self.config.universe:
