@@ -8,6 +8,9 @@ import yfinance as yf
 from config.settings import Config
 
 _OHLCV = ["Open", "High", "Low", "Close", "Volume"]
+_START_BOUNDARY_TOLERANCE_DAYS = 4
+_END_FRESHNESS_TOLERANCE_DAYS = 7
+_MAX_CONSECUTIVE_MISSING_SESSIONS = 2
 _CACHE_TO_TITLE = {
     "open": "Open",
     "high": "High",
@@ -26,9 +29,10 @@ class MarketDataLoader:
     reproducible and avoids hammering the upstream API.
 
     Caching is best-effort: any cache read/write failure falls back to a plain
-    download, so the pipeline never breaks because of the cache. Pass
-    ``use_cache=False`` to bypass it entirely, or ``force_refresh=True`` to
-    re-download the full range and overwrite the cache.
+    download. Completeness is strict: all requested tickers must cover the
+    requested boundaries and must not contain an obvious multi-session gap.
+    Pass ``use_cache=False`` to bypass the cache entirely, or
+    ``force_refresh=True`` to re-download the full range and overwrite it.
     """
 
     def __init__(
@@ -67,7 +71,13 @@ class MarketDataLoader:
         )
 
         if self.repo is None:
-            return self._download_and_parse(tickers, self.config.start_date, self.config.end_date)
+            result = self._download_and_parse(
+                tickers, self.config.start_date, self.config.end_date
+            )
+            self._assert_complete(
+                result, tickers, self.config.start_date, self.config.end_date
+            )
+            return result
 
         # Inspect what the cache already holds for these tickers.
         try:
@@ -78,10 +88,16 @@ class MarketDataLoader:
                 tickers, self.config.start_date, self.config.end_date
             )
 
-        fully_cached = all(cov[0] is not None for cov in coverages.values())
+        has_all_tickers = all(
+            cov[0] is not None and cov[1] is not None for cov in coverages.values()
+        )
+        covers_requested_start = has_all_tickers and all(
+            self._covers_start(cov[0], self.config.start_date)
+            for cov in coverages.values()
+        )
 
-        if self.force_refresh or not fully_cached:
-            # Missing a ticker (or forced): refresh the whole range.
+        if self.force_refresh or not has_all_tickers or not covers_requested_start:
+            # Missing/truncated ticker history (or forced): refresh the full range.
             return self._download_parse_and_cache(
                 tickers, self.config.start_date, self.config.end_date
             )
@@ -92,9 +108,15 @@ class MarketDataLoader:
         if downloaded:
             self._cache_write(downloaded)
 
-        served = self._frames_from_cache(tickers, self.config.start_date, self.config.end_date)
-        if not served:
-            # Cache somehow yielded nothing usable -> fall back to a full download.
+        served = self._frames_from_cache(
+            tickers, self.config.start_date, self.config.end_date
+        )
+        if self._coverage_issues(
+            served, tickers, self.config.start_date, self.config.end_date
+        ):
+            # A stale tail, missing ticker, or obvious internal gap requires a
+            # full refresh. The strict validation in this path raises if the
+            # upstream download is still incomplete.
             return self._download_parse_and_cache(
                 tickers, self.config.start_date, self.config.end_date
             )
@@ -155,10 +177,116 @@ class MarketDataLoader:
         self, tickers: List[str], start: Optional[str], end: Optional[str]
     ) -> Dict[str, pd.DataFrame]:
         result = self._download_and_parse(tickers, start, end)
+        self._assert_complete(result, tickers, start, end)
         self._cache_write(result)
         return result
 
     # -- cache helpers ------------------------------------------------------- #
+    @staticmethod
+    def _normalized_timestamp(value: str) -> pd.Timestamp:
+        timestamp = pd.Timestamp(value)
+        if timestamp.tzinfo is not None:
+            timestamp = timestamp.tz_convert(None)
+        return timestamp.normalize()
+
+    @classmethod
+    def _normalized_index(cls, frame: pd.DataFrame) -> pd.DatetimeIndex:
+        index = pd.DatetimeIndex(pd.to_datetime(frame.index))
+        if index.tz is not None:
+            index = index.tz_convert(None)
+        return index.normalize().unique().sort_values()
+
+    @classmethod
+    def _covers_start(cls, cached_start: str, requested_start: Optional[str]) -> bool:
+        if requested_start is None:
+            return True
+        actual = cls._normalized_timestamp(cached_start)
+        requested = cls._normalized_timestamp(requested_start)
+        tolerance = pd.Timedelta(days=_START_BOUNDARY_TOLERANCE_DAYS)
+        return actual <= requested + tolerance
+
+    def _coverage_issues(
+        self,
+        frames: Dict[str, pd.DataFrame],
+        tickers: List[str],
+        start: Optional[str],
+        end: Optional[str],
+    ) -> List[str]:
+        issues: List[str] = []
+        indexes: Dict[str, pd.DatetimeIndex] = {}
+        start_boundary = (
+            self._normalized_timestamp(start) if start is not None else None
+        )
+        today = pd.Timestamp.now(tz="UTC").tz_localize(None).normalize()
+        end_target = self._normalized_timestamp(end) if end is not None else today
+        start_tolerance = pd.Timedelta(days=_START_BOUNDARY_TOLERANCE_DAYS)
+        end_tolerance = pd.Timedelta(days=_END_FRESHNESS_TOLERANCE_DAYS)
+
+        for ticker in tickers:
+            frame = frames.get(ticker)
+            if frame is None or frame.empty:
+                issues.append(f"{ticker}: missing ticker data")
+                continue
+            if "Close" not in frame.columns:
+                issues.append(f"{ticker}: missing Close column")
+                continue
+
+            index = self._normalized_index(frame)
+            if index.empty:
+                issues.append(f"{ticker}: empty date index")
+                continue
+            indexes[ticker] = index
+
+            if (
+                start_boundary is not None
+                and index[0] > start_boundary + start_tolerance
+            ):
+                issues.append(
+                    f"{ticker}: starts at {index[0].date()}, requested {start_boundary.date()}"
+                )
+            if index[-1] < end_target - end_tolerance:
+                issues.append(
+                    f"{ticker}: ends at {index[-1].date()}, target {end_target.date()}"
+                )
+
+        reference = indexes.get(self.config.benchmark)
+        if reference is None or reference.empty:
+            return issues
+        if start_boundary is not None:
+            reference = reference[reference >= start_boundary]
+        if end is not None:
+            reference = reference[reference < end_target]
+
+        for ticker, index in indexes.items():
+            if ticker == self.config.benchmark:
+                continue
+            available = set(index)
+            max_missing_run = 0
+            missing_run = 0
+            for date in reference:
+                if date in available:
+                    missing_run = 0
+                else:
+                    missing_run += 1
+                    max_missing_run = max(max_missing_run, missing_run)
+            if max_missing_run > _MAX_CONSECUTIVE_MISSING_SESSIONS:
+                issues.append(
+                    f"{ticker}: {max_missing_run} consecutive benchmark sessions missing"
+                )
+
+        return issues
+
+    def _assert_complete(
+        self,
+        frames: Dict[str, pd.DataFrame],
+        tickers: List[str],
+        start: Optional[str],
+        end: Optional[str],
+    ) -> None:
+        issues = self._coverage_issues(frames, tickers, start, end)
+        if issues:
+            raise ValueError("Incomplete market data: " + "; ".join(issues))
+
     def _cache_write(self, frames: Dict[str, pd.DataFrame]) -> None:
         if self.repo is None or not frames:
             return
