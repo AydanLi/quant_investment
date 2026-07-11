@@ -20,3 +20,6 @@ quant_research_legacy_backup.db*
 # SQLite sidecar files (WAL mode)
 *.db-wal
 *.db-shm
+
+# One-click Dashboard launcher runtime files
+.runtime/

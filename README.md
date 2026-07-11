@@ -41,6 +41,24 @@ install the matching driver — no code or schema changes are required.
 
 ## 3. Run
 
+### Windows one-click Dashboard
+
+After the virtual environment and dependencies are installed, double-click:
+
+```text
+Open Quant Dashboard.cmd
+```
+
+The launcher starts Streamlit in the background and opens
+`http://localhost:8501` in the default browser. Repeated clicks reuse the
+running Dashboard instead of starting duplicate processes. Startup logs and
+the process ID are written to the ignored `.runtime/` directory.
+
+If the launcher reports that the project Python is missing, create `.venv` and
+install `requirements.txt` before trying again.
+
+### Manual commands
+
 ```bash
 python main_with_db.py                                   # backtest + save a run to the database
 streamlit run streamlit_dashboard_db_v1_1_save_experiment.py   # browse history / save experiments
