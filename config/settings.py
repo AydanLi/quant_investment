@@ -51,3 +51,33 @@ class Config:
     #   postgresql+psycopg2://user:pass@host/quant
     #   mysql+pymysql://user:pass@host/quant
     db_url: str = "sqlite:///quant_research.db"
+
+    def validate_risk_constraints(self) -> None:
+        """Validate settings required to build a fully invested portfolio.
+
+        ``BIL`` is the system's cash-equivalent asset.  When it is available,
+        any capital that cannot be assigned without breaking the risky-asset
+        cap can remain in BIL.  Without BIL, the configured number of selected
+        assets must have enough aggregate capacity to reach 100% invested.
+        """
+        if not 0.0 < self.max_asset_weight <= 1.0:
+            raise ValueError("max_asset_weight must be in the interval (0, 1].")
+        if not 0.0 <= self.min_asset_weight <= self.max_asset_weight:
+            raise ValueError(
+                "min_asset_weight must be between 0 and max_asset_weight."
+            )
+        if not 0.0 <= self.risk_off_cash_weight <= 1.0:
+            raise ValueError("risk_off_cash_weight must be between 0 and 1.")
+        if self.top_n < 1:
+            raise ValueError("top_n must be at least 1.")
+
+        selectable_assets = min(self.top_n, len(self.universe))
+        has_cash_equivalent = "BIL" in self.universe
+        if (
+            not has_cash_equivalent
+            and selectable_assets * self.max_asset_weight < 1.0 - 1e-9
+        ):
+            raise ValueError(
+                "Risk constraints are infeasible without BIL: top_n multiplied "
+                "by max_asset_weight must be at least 1.0."
+            )
