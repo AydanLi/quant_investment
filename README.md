@@ -69,9 +69,15 @@ research baseline.
 python main_with_db.py                                   # backtest + save a run to the database
 streamlit run streamlit_dashboard_db_v1_1_save_experiment.py   # browse history / save experiments
 python -m scripts.validate_dynamic_factor_model          # rerun all model-admission gates
+python -m scripts.analyze_factor_attribution             # proxy-factor regression and attribution
 ```
 
 The admission command reads the local market-data cache without downloading or
 changing it. It compares identical dates and costs, reports annual walk-forward
 windows, parameter and start-date sensitivity, market regimes, crisis periods,
 turnover, costs, slippage, and signal independence.
+
+The factor-attribution command uses lagged 252-session regressions with no
+network dependency. It reports static exposures, Newey-West alpha statistics,
+one-day-ahead rolling attribution, and exact return reconciliation for both the
+sample-covariance baseline and the admitted dynamic-factor system.
