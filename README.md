@@ -14,7 +14,7 @@ A modular ETF rotation quant framework with:
 - Latest allocation signal service
 - Read-only factor diagnostics and exposure monitoring
 - Read-only Monte Carlo tail-risk monitoring
-- 87 automated unit and integration tests
+- 88 automated unit and integration tests
 
 Current architecture and system boundaries are documented in
 [`quant_system_architecture_overview.md`](quant_system_architecture_overview.md).
@@ -58,8 +58,11 @@ Open Quant Dashboard.cmd
 
 The launcher starts Streamlit in the background and opens
 `http://localhost:8501` in the default browser. Repeated clicks reuse the
-running Dashboard instead of starting duplicate processes. Startup logs and
-the process ID are written to the ignored `.runtime/` directory.
+running Dashboard instead of starting duplicate processes. It fingerprints the
+Dashboard and application Python sources; after a code change, the next click
+automatically replaces the stale managed process before opening the page.
+Startup logs, source state, and the process ID are written to the ignored
+`.runtime/` directory.
 
 If the launcher reports that the project Python is missing, create `.venv` and
 install `requirements.txt` before trying again.
@@ -130,7 +133,7 @@ python -m pip check
 alembic current
 ```
 
-The expected result for the 2026-07-15 project snapshot is 87 passing tests and
+The expected result for the 2026-07-15 project snapshot is 88 passing tests and
 Alembic revision `b91e2f08c4a1 (head)`. Project code emits no compatibility
 deprecation warnings in the current suite. A local pytest cache ACL warning may
 still appear on this Windows checkout and does not come from application code.

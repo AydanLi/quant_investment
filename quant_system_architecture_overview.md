@@ -47,7 +47,7 @@ User / researcher
 | `main.py` | Run a backtest and produce a local report | No experiment write; market cache may update |
 | `main_with_db.py` | Run and persist a complete experiment | Writes research DB |
 | `streamlit_dashboard_db_v1_1_save_experiment.py` | Primary interactive Dashboard | Reads runs; saves only after validation |
-| `Open Quant Dashboard.cmd` | Windows launcher for the primary Dashboard | Writes ignored `.runtime/` PID/log files |
+| `Open Quant Dashboard.cmd` | Windows launcher; restarts managed processes after source changes | Writes ignored `.runtime/` PID/log/source-state files |
 | `scripts/validate_dynamic_factor_model.py` | Reproduce model-admission gates | Read-only market cache |
 | `scripts/analyze_factor_attribution.py` | Factor regression and attribution | Read-only market cache |
 | `scripts/analyze_monte_carlo.py` | Paired Monte Carlo robustness analysis | Read-only market cache |
@@ -223,14 +223,16 @@ and rejects non-finite, negative, or internally inconsistent position values.
 
 As of 2026-07-15:
 
-- 87 pytest tests pass;
+- 88 pytest tests pass;
 - all active Python modules compile;
 - `pip check` reports no broken installed dependencies;
 - Alembic has one head and the local database is current;
 - Streamlit's application test executes the primary Dashboard with zero app
   exceptions and all six tabs present;
 - database Dashboard parameter tables normalize mixed values to strings before
-  Arrow serialization, and all active dataframes use `width="stretch"`.
+  Arrow serialization, and all active dataframes use `width="stretch"`;
+- the Windows launcher fingerprints active Python sources, replaces stale
+  managed processes, and reuses a healthy process when sources are unchanged.
 
 Coverage includes risk caps, cost accounting, cache completeness, missing-price
 return semantics, UTC market-data timestamps, dynamic covariance, admission
