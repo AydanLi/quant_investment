@@ -11,6 +11,7 @@ from data.features import FeatureEngineer
 from data.loader import MarketDataLoader
 from report.reporter import ReportGenerator
 from risk.engine import RiskEngine
+from services.dashboard_display import format_parameter_display_value
 from services.experiment_validation import validate_experiment_parameters
 from services.factor_monitor import FACTOR_LABELS, build_factor_monitor
 from services.monte_carlo_monitor import build_monte_carlo_monitor
@@ -420,7 +421,7 @@ def main() -> None:
         return
 
     st.subheader("最近实验记录")
-    st.dataframe(runs, use_container_width=True)
+    st.dataframe(runs, width="stretch")
 
     run_id_list = runs["id"].tolist()
     selected_run_id = st.selectbox("选择 run_id", options=run_id_list, index=0)
@@ -466,14 +467,16 @@ def main() -> None:
         [
             {
                 "Parameter": col,
-                "Value": selected_row.get(col)
-                if pd.notna(selected_row.get(col))
-                else config_snapshot.get(col),
+                "Value": format_parameter_display_value(
+                    selected_row.get(col)
+                    if pd.notna(selected_row.get(col))
+                    else config_snapshot.get(col)
+                ),
             }
             for col in param_cols
         ]
     )
-    st.dataframe(param_df, use_container_width=True)
+    st.dataframe(param_df, width="stretch")
 
     try:
         portfolio, orders, signals = load_run_details(int(selected_run_id))
@@ -521,7 +524,7 @@ def main() -> None:
         if orders.empty:
             st.info("该 run 没有订单记录。")
         else:
-            st.dataframe(orders, use_container_width=True)
+            st.dataframe(orders, width="stretch")
 
     with tab3:
         st.subheader("信号快照")
@@ -529,7 +532,7 @@ def main() -> None:
             st.info("该 run 没有 signals 数据。")
         else:
             signals = signals.copy()
-            st.dataframe(signals, use_container_width=True)
+            st.dataframe(signals, width="stretch")
             if {"ticker", "weight"}.issubset(signals.columns):
                 signal_chart = signals[["ticker", "weight"]].copy()
                 signal_chart = signal_chart.set_index("ticker")
@@ -571,7 +574,7 @@ def main() -> None:
                 st.subheader("最新暴露与历史区间")
                 st.dataframe(
                     monitor.exposure_table.reset_index(drop=True),
-                    use_container_width=True,
+                    width="stretch",
                 )
 
                 st.subheader("最近两年滚动因子暴露")
@@ -597,7 +600,7 @@ def main() -> None:
                     index=component_labels
                 ).rename("占比")
                 st.dataframe(
-                    risk_contribution.to_frame(), use_container_width=True
+                    risk_contribution.to_frame(), width="stretch"
                 )
 
                 if abs(regression.t_statistics["alpha"]) < 1.96:
@@ -669,7 +672,7 @@ def main() -> None:
                         )
                 st.dataframe(
                     distribution_display.drop(columns="单位"),
-                    use_container_width=True,
+                    width="stretch",
                 )
 
                 st.subheader("区块长度敏感性")
@@ -681,7 +684,7 @@ def main() -> None:
                 sensitivity_display["中位Sharpe"] = sensitivity_display[
                     "中位Sharpe"
                 ].map(lambda value: f"{value:.3f}")
-                st.dataframe(sensitivity_display, use_container_width=True)
+                st.dataframe(sensitivity_display, width="stretch")
                 st.caption(
                     "这里监控所选 run 自身的净收益分布；正式的同区间、"
                     "同成本基线比较继续使用研究准入脚本。"
@@ -689,11 +692,11 @@ def main() -> None:
 
     with tab6:
         st.subheader("portfolio_daily")
-        st.dataframe(portfolio, use_container_width=True)
+        st.dataframe(portfolio, width="stretch")
         st.subheader("orders")
-        st.dataframe(orders, use_container_width=True)
+        st.dataframe(orders, width="stretch")
         st.subheader("signals")
-        st.dataframe(signals, use_container_width=True)
+        st.dataframe(signals, width="stretch")
 
     st.subheader("实验横向比较")
     compare_cols = [
@@ -715,7 +718,7 @@ def main() -> None:
         "created_at",
     ]
     existing_compare_cols = [c for c in compare_cols if c in runs.columns]
-    st.dataframe(runs[existing_compare_cols], use_container_width=True)
+    st.dataframe(runs[existing_compare_cols], width="stretch")
 
 
 if __name__ == "__main__":

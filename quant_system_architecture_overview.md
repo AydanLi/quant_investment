@@ -222,12 +222,14 @@ and rejects non-finite, negative, or internally inconsistent position values.
 
 As of 2026-07-15:
 
-- 76 pytest tests pass;
+- 85 pytest tests pass;
 - all active Python modules compile;
 - `pip check` reports no broken installed dependencies;
 - Alembic has one head and the local database is current;
 - Streamlit's application test executes the primary Dashboard with zero app
-  exceptions and all six tabs present.
+  exceptions and all six tabs present;
+- database Dashboard parameter tables normalize mixed values to strings before
+  Arrow serialization, and all active dataframes use `width="stretch"`.
 
 Coverage includes risk caps, cost accounting, cache completeness, dynamic
 covariance, admission gates, factor attribution/monitoring, Monte Carlo
@@ -252,10 +254,9 @@ The platform currently supports local personal research. It does not provide:
 
 ### Immediate hardening
 
-1. remove active Streamlit/Arrow deprecations and require warning-free app tests;
-2. make `pct_change` and UTC timestamp semantics explicit;
-3. pin runtime and development dependencies;
-4. persist gross return and split cost components for new experiment runs.
+1. make `pct_change` and UTC timestamp semantics explicit;
+2. pin runtime and development dependencies;
+3. persist gross return and split cost components for new experiment runs.
 
 ### Research evolution
 

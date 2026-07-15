@@ -3,6 +3,7 @@ from __future__ import annotations
 import pandas as pd
 import streamlit as st
 
+from services.dashboard_display import format_parameter_display_value
 from storage.store import ResearchStore
 
 
@@ -64,7 +65,7 @@ def main() -> None:
         return
 
     st.subheader("最近实验记录")
-    st.dataframe(runs, use_container_width=True)
+    st.dataframe(runs, width="stretch")
 
     run_id_list = runs["id"].tolist()
     default_run_id = int(run_id_list[0])
@@ -107,9 +108,15 @@ def main() -> None:
         "created_at",
     ]
     param_df = pd.DataFrame(
-        [{"Parameter": col, "Value": selected_row.get(col)} for col in param_cols]
+        [
+            {
+                "Parameter": col,
+                "Value": format_parameter_display_value(selected_row.get(col)),
+            }
+            for col in param_cols
+        ]
     )
-    st.dataframe(param_df, use_container_width=True)
+    st.dataframe(param_df, width="stretch")
 
     try:
         portfolio, orders, signals = load_run_details(int(selected_run_id))
@@ -146,7 +153,7 @@ def main() -> None:
         if orders.empty:
             st.info("该 run 没有订单记录。")
         else:
-            st.dataframe(orders, use_container_width=True)
+            st.dataframe(orders, width="stretch")
 
     with tab3:
         st.subheader("信号快照")
@@ -154,7 +161,7 @@ def main() -> None:
             st.info("该 run 没有 signals 数据。")
         else:
             signals = signals.copy()
-            st.dataframe(signals, use_container_width=True)
+            st.dataframe(signals, width="stretch")
             if {"ticker", "weight"}.issubset(signals.columns):
                 signal_chart = signals[["ticker", "weight"]].copy()
                 signal_chart = signal_chart.set_index("ticker")
@@ -162,11 +169,11 @@ def main() -> None:
 
     with tab4:
         st.subheader("portfolio_daily")
-        st.dataframe(portfolio, use_container_width=True)
+        st.dataframe(portfolio, width="stretch")
         st.subheader("orders")
-        st.dataframe(orders, use_container_width=True)
+        st.dataframe(orders, width="stretch")
         st.subheader("signals")
-        st.dataframe(signals, use_container_width=True)
+        st.dataframe(signals, width="stretch")
 
     st.subheader("实验横向比较")
     compare_cols = [
@@ -188,7 +195,7 @@ def main() -> None:
         "created_at",
     ]
     existing_compare_cols = [c for c in compare_cols if c in runs.columns]
-    st.dataframe(runs[existing_compare_cols], use_container_width=True)
+    st.dataframe(runs[existing_compare_cols], width="stretch")
 
 
 if __name__ == "__main__":
