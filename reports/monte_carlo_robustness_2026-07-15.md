@@ -146,6 +146,29 @@ It must not be promoted directly into a position-sizing rule. A future
 simulation-derived overlay would be a different candidate and would need the
 full walk-forward admission process before affecting target weights.
 
+## Dashboard monitoring integration
+
+Monte Carlo is integrated as a second read-only Dashboard diagnostics tab. For
+the selected stored run it calculates, on demand and without a schema change:
+
+- 3,000 reproducible 252-session net-return paths;
+- one-year loss probability and 5% tail maximum drawdown;
+- median return, drawdown, Sharpe, turnover, and recorded cost;
+- 5%, median, and 95% equity-path bands;
+- 10, 20, and 40-session block-length sensitivity.
+
+The monitor uses each run's stored net `daily_return`, turnover, and combined
+`est_cost`. Legacy runs do not contain enough metadata to identify a safe
+same-cost risk-model baseline or split trading cost from slippage, so the
+Dashboard does not invent either value. The formal paired comparison remains
+the responsibility of `scripts.analyze_monte_carlo`.
+
+An integration smoke check on stored run 11 produced a `watch` state: the
+simulated one-year loss probability was 33.37%, the 5% tail maximum drawdown was
+-21.21%, median total return was 4.90%, median Sharpe was 0.434, and median
+recorded cost was 1.77%. The monitor reported both tail-risk warnings while
+retaining `affects_weights=False`.
+
 ## Reproduce
 
 ```powershell

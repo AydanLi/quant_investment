@@ -70,6 +70,12 @@ any stored run. It reads the existing portfolio and market-data cache, requires
 no database migration, and is deliberately isolated from signals, the risk
 engine, and target weights.
 
+The **Monte Carlo Monitor** tab generates 3,000 reproducible one-year net-return
+paths for the selected stored run. It shows loss probability, tail and median
+drawdown, return and Sharpe distributions, turnover, recorded total cost, path
+quantiles, and 10/20/40-day block sensitivity. It is also read-only and does not
+change strategy, risk, execution, or target-weight state.
+
 ### Manual commands
 
 ```bash

@@ -13,6 +13,7 @@ from report.reporter import ReportGenerator
 from risk.engine import RiskEngine
 from services.experiment_validation import validate_experiment_parameters
 from services.factor_monitor import FACTOR_LABELS, build_factor_monitor
+from services.monte_carlo_monitor import build_monte_carlo_monitor
 from services.signal_service import SignalService
 from storage.store import ResearchStore
 from strategy.momentum_rotation import MomentumRotationStrategy
@@ -107,6 +108,22 @@ def load_factor_monitor(run_id: int):
     finally:
         store.close()
     return build_factor_monitor(portfolio, prices)
+
+
+@st.cache_data(show_spinner=False)
+def load_monte_carlo_monitor(run_id: int):
+    store = ResearchStore()
+    try:
+        portfolio = store.get_run_portfolio(run_id)
+    finally:
+        store.close()
+    return build_monte_carlo_monitor(
+        portfolio,
+        simulations=3000,
+        horizon=252,
+        block_length=20,
+        seed=20260715 + int(run_id),
+    )
 
 
 def format_pct(x):
@@ -469,8 +486,15 @@ def main() -> None:
         portfolio["date"] = pd.to_datetime(portfolio["date"])
         portfolio = portfolio.sort_values("date")
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(
-        ["净值曲线", "订单日志", "信号快照", "因子监控", "原始数据"]
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+        [
+            "净值曲线",
+            "订单日志",
+            "信号快照",
+            "因子监控",
+            "蒙特卡洛监控",
+            "原始数据",
+        ]
     )
 
     with tab1:
@@ -582,6 +606,88 @@ def main() -> None:
                     )
 
     with tab5:
+        st.subheader("蒙特卡洛尾部风险监控")
+        st.info("当前为只读诊断层：模拟结果不会修改策略信号、风控参数或目标仓位。")
+        if portfolio.empty:
+            st.info("该 run 没有可用于蒙特卡洛监控的日收益数据。")
+        else:
+            try:
+                monte_carlo = load_monte_carlo_monitor(int(selected_run_id))
+            except Exception as exc:
+                st.warning(f"暂时无法生成蒙特卡洛监控：{exc}")
+            else:
+                c1, c2, c3, c4, c5 = st.columns(5)
+                c1.metric(
+                    f"未来{monte_carlo.horizon}日亏损概率",
+                    format_pct(monte_carlo.probability_of_loss),
+                )
+                c2.metric(
+                    "5%尾部最大回撤",
+                    format_pct(monte_carlo.tail_max_drawdown),
+                )
+                c3.metric(
+                    "中位最大回撤",
+                    format_pct(monte_carlo.median_max_drawdown),
+                )
+                c4.metric(
+                    "中位总收益",
+                    format_pct(monte_carlo.median_total_return),
+                )
+                c5.metric("中位 Sharpe", f"{monte_carlo.median_sharpe:.2f}")
+
+                if monte_carlo.status == "normal":
+                    st.success("当前模拟尾部风险未触发观察阈值。")
+                else:
+                    st.warning("当前蒙特卡洛状态：需要观察。")
+                    for message in monte_carlo.warnings:
+                        st.write(f"- {message}")
+
+                st.caption(
+                    f"使用 {monte_carlo.observations} 个历史观测、"
+                    f"{monte_carlo.simulations} 条路径、"
+                    f"{monte_carlo.block_length} 日区块；"
+                    f"模拟中位换手 {monte_carlo.median_turnover:.2f}，"
+                    f"中位估算成本 {monte_carlo.median_cost:.2%}。"
+                )
+
+                st.subheader("净值路径分位")
+                st.line_chart(monte_carlo.equity_quantiles)
+
+                st.subheader("模拟分布")
+                distribution_display = monte_carlo.distribution_table.copy()
+                for column in ("5%", "中位数", "95%"):
+                    distribution_display[column] = distribution_display[
+                        column
+                    ].astype(object)
+                for row_index, row in distribution_display.iterrows():
+                    for column in ("5%", "中位数", "95%"):
+                        value = float(row[column])
+                        distribution_display.at[row_index, column] = (
+                            f"{value:.2%}"
+                            if row["单位"] == "percent"
+                            else f"{value:.3f}"
+                        )
+                st.dataframe(
+                    distribution_display.drop(columns="单位"),
+                    use_container_width=True,
+                )
+
+                st.subheader("区块长度敏感性")
+                sensitivity_display = monte_carlo.sensitivity_table.copy()
+                for column in ("亏损概率", "5%尾部回撤", "中位总收益"):
+                    sensitivity_display[column] = sensitivity_display[column].map(
+                        lambda value: f"{value:.2%}"
+                    )
+                sensitivity_display["中位Sharpe"] = sensitivity_display[
+                    "中位Sharpe"
+                ].map(lambda value: f"{value:.3f}")
+                st.dataframe(sensitivity_display, use_container_width=True)
+                st.caption(
+                    "这里监控所选 run 自身的净收益分布；正式的同区间、"
+                    "同成本基线比较继续使用研究准入脚本。"
+                )
+
+    with tab6:
         st.subheader("portfolio_daily")
         st.dataframe(portfolio, use_container_width=True)
         st.subheader("orders")
