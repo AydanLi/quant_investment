@@ -213,15 +213,16 @@ research schema.
 snapshots separately from backtest state and mock orders. It intentionally has
 no order-submission method and is not a live broker integration.
 
-Input masking and numeric validity still require repository-level hardening.
-Until repository-level validation is fixed, callers must supply only pre-masked
-identifiers and validated non-negative positions.
+The import layer recursively rejects credential, token, and full-account fields.
+The repository accepts only the last four account-reference characters or an
+explicitly masked equivalent, stores only the normalized last four characters,
+and rejects non-finite, negative, or internally inconsistent position values.
 
 ## 8. Test and runtime health
 
 As of 2026-07-15:
 
-- 50 pytest tests pass;
+- 76 pytest tests pass;
 - all active Python modules compile;
 - `pip check` reports no broken installed dependencies;
 - Alembic has one head and the local database is current;
@@ -251,11 +252,10 @@ The platform currently supports local personal research. It does not provide:
 
 ### Immediate hardening
 
-1. enforce brokerage masking and numeric validity in the repository;
-2. remove active Streamlit/Arrow deprecations and require warning-free app tests;
-3. make `pct_change` and UTC timestamp semantics explicit;
-4. pin runtime and development dependencies;
-5. persist gross return and split cost components for new experiment runs.
+1. remove active Streamlit/Arrow deprecations and require warning-free app tests;
+2. make `pct_change` and UTC timestamp semantics explicit;
+3. pin runtime and development dependencies;
+4. persist gross return and split cost components for new experiment runs.
 
 ### Research evolution
 

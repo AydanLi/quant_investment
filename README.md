@@ -14,7 +14,7 @@ A modular ETF rotation quant framework with:
 - Latest allocation signal service
 - Read-only factor diagnostics and exposure monitoring
 - Read-only Monte Carlo tail-risk monitoring
-- 50 automated unit and integration tests
+- 76 automated unit and integration tests
 
 Current architecture and system boundaries are documented in
 [`quant_system_architecture_overview.md`](quant_system_architecture_overview.md).
@@ -95,8 +95,9 @@ Robinhood Individual-account positions can be mirrored as immutable snapshots
 in `brokerage_mirror_snapshots` and `brokerage_mirror_positions`. The mirror is
 isolated from execution and is designed for pre-masked account references; do
 not include login credentials, tokens, or full account identifiers in the input
-file. The CLI rejects long digit-only account references, but repository-level
-mask enforcement remains a P1 hardening item. Use
+file. The import command rejects sensitive fields at any nesting level, while
+the repository stores only the normalized last four account-reference
+characters and requires finite, non-negative position values. Use
 `python scripts/import_brokerage_snapshot.py snapshot.json` for normalized JSON
 exports; applying `alembic upgrade head` creates the required tables.
 
@@ -129,7 +130,7 @@ python -m pip check
 alembic current
 ```
 
-The expected result for the 2026-07-15 project snapshot is 50 passing tests and
+The expected result for the 2026-07-15 project snapshot is 76 passing tests and
 Alembic revision `b91e2f08c4a1 (head)`. Deprecation and Dashboard serialization
 warnings are known technical debt; they are not test failures but should be
 fixed before dependency upgrades.
