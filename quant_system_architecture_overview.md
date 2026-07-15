@@ -100,8 +100,9 @@ Config
 - 50/200-session moving averages;
 - distance/drawdown relative to the 200-session average.
 
-The implicit `pct_change()` fill behavior is a documented compatibility issue
-that should be resolved before the next Pandas upgrade.
+Return calculation explicitly uses `pct_change(fill_method=None)`. Missing
+prices therefore remain unknown instead of being silently forward-filled, and
+calculation resumes once two adjacent prices are valid.
 
 ### Regime detection
 
@@ -222,7 +223,7 @@ and rejects non-finite, negative, or internally inconsistent position values.
 
 As of 2026-07-15:
 
-- 85 pytest tests pass;
+- 87 pytest tests pass;
 - all active Python modules compile;
 - `pip check` reports no broken installed dependencies;
 - Alembic has one head and the local database is current;
@@ -231,12 +232,13 @@ As of 2026-07-15:
 - database Dashboard parameter tables normalize mixed values to strings before
   Arrow serialization, and all active dataframes use `width="stretch"`.
 
-Coverage includes risk caps, cost accounting, cache completeness, dynamic
-covariance, admission gates, factor attribution/monitoring, Monte Carlo
-analysis/monitoring, experiment validation, metrics, and brokerage snapshots.
+Coverage includes risk caps, cost accounting, cache completeness, missing-price
+return semantics, UTC market-data timestamps, dynamic covariance, admission
+gates, factor attribution/monitoring, Monte Carlo analysis/monitoring,
+experiment validation, metrics, and brokerage snapshots.
 
-Known warnings and reproduced bugs should remain part of the local project
-review process until they are converted into tracked fixes or issue records.
+Project code emits no compatibility deprecation warnings in the current test
+suite. The remaining local pytest cache warning is an environment ACL issue.
 
 ## 9. Current system boundaries
 
@@ -254,9 +256,8 @@ The platform currently supports local personal research. It does not provide:
 
 ### Immediate hardening
 
-1. make `pct_change` and UTC timestamp semantics explicit;
-2. pin runtime and development dependencies;
-3. persist gross return and split cost components for new experiment runs.
+1. pin runtime and development dependencies;
+2. persist gross return and split cost components for new experiment runs.
 
 ### Research evolution
 

@@ -14,7 +14,7 @@ A modular ETF rotation quant framework with:
 - Latest allocation signal service
 - Read-only factor diagnostics and exposure monitoring
 - Read-only Monte Carlo tail-risk monitoring
-- 85 automated unit and integration tests
+- 87 automated unit and integration tests
 
 Current architecture and system boundaries are documented in
 [`quant_system_architecture_overview.md`](quant_system_architecture_overview.md).
@@ -130,7 +130,7 @@ python -m pip check
 alembic current
 ```
 
-The expected result for the 2026-07-15 project snapshot is 85 passing tests and
-Alembic revision `b91e2f08c4a1 (head)`. The remaining market-data timestamp
-deprecation warnings are known technical debt; they are not test failures but
-should be fixed before dependency upgrades.
+The expected result for the 2026-07-15 project snapshot is 87 passing tests and
+Alembic revision `b91e2f08c4a1 (head)`. Project code emits no compatibility
+deprecation warnings in the current suite. A local pytest cache ACL warning may
+still appear on this Windows checkout and does not come from application code.

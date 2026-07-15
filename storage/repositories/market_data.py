@@ -7,7 +7,7 @@ dialect-portable upsert.
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping, Optional
 
 import pandas as pd
@@ -56,7 +56,7 @@ class MarketDataRepository(BaseRepository):
         Each frame is indexed by date with Title-case OHLCV columns. Returns the
         number of (ticker, date) rows written.
         """
-        fetched_at = datetime.utcnow()
+        fetched_at = datetime.now(timezone.utc)
         rows = []
         for ticker, frame in prices.items():
             if frame is None or frame.empty:

@@ -24,7 +24,9 @@ class FeatureEngineer:
         return price_df
 
     def make_returns_frame(self, prices: pd.DataFrame) -> pd.DataFrame:
-        return prices.pct_change().replace([np.inf, -np.inf], np.nan)
+        return prices.pct_change(fill_method=None).replace(
+            [np.inf, -np.inf], np.nan
+        )
 
     def compute_features(self, prices: pd.DataFrame, returns: pd.DataFrame) -> Dict[str, pd.DataFrame]:
         features: Dict[str, pd.DataFrame] = {}
