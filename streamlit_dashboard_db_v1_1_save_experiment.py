@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Union
+
 import pandas as pd
 import streamlit as st
 
@@ -9,6 +11,7 @@ from data.features import FeatureEngineer
 from data.loader import MarketDataLoader
 from report.reporter import ReportGenerator
 from risk.engine import RiskEngine
+from services.experiment_validation import validate_experiment_parameters
 from services.signal_service import SignalService
 from storage.store import ResearchStore
 from strategy.momentum_rotation import MomentumRotationStrategy
@@ -16,6 +19,58 @@ from strategy.regime import RegimeDetector
 
 
 DB_PATH = "quant_research.db"
+Numeric = Union[int, float]
+
+
+def synced_numeric_parameter(
+    label: str,
+    key: str,
+    *,
+    min_value: Numeric,
+    max_value: Numeric,
+    value: Numeric,
+    step: Numeric,
+    number_format: str,
+) -> Numeric:
+    """Render a slider and direct-entry box backed by synchronized state."""
+    slider_key = f"{key}_slider"
+    input_key = f"{key}_input"
+    if slider_key not in st.session_state:
+        st.session_state[slider_key] = value
+    if input_key not in st.session_state:
+        st.session_state[input_key] = value
+
+    def sync_from_slider() -> None:
+        st.session_state[input_key] = st.session_state[slider_key]
+
+    def sync_from_input() -> None:
+        candidate = st.session_state[input_key]
+        if pd.notna(candidate) and min_value <= candidate <= max_value:
+            st.session_state[slider_key] = candidate
+
+    st.markdown(f"**{label}**")
+    slider_col, input_col = st.columns([2, 1], gap="small")
+    with slider_col:
+        st.slider(
+            f"{label} slider",
+            min_value=min_value,
+            max_value=max_value,
+            step=step,
+            format=number_format,
+            key=slider_key,
+            on_change=sync_from_slider,
+            label_visibility="collapsed",
+        )
+    with input_col:
+        st.number_input(
+            f"{label} direct input",
+            step=step,
+            format=number_format,
+            key=input_key,
+            on_change=sync_from_input,
+            label_visibility="collapsed",
+        )
+    return st.session_state[input_key]
 
 
 @st.cache_data(show_spinner=False)
@@ -137,27 +192,111 @@ def main() -> None:
 
     with st.sidebar:
         st.header("数据库设置")
-        limit = st.slider("读取最近实验数量", min_value=5, max_value=100, value=20, step=5)
+        limit = int(
+            synced_numeric_parameter(
+                "读取最近实验数量",
+                "history_limit",
+                min_value=5,
+                max_value=100,
+                value=20,
+                step=5,
+                number_format="%d",
+            )
+        )
         st.write(f"当前数据库文件：`{DB_PATH}`")
 
         st.header("新实验参数")
         scenario_name = st.text_input("Scenario Name", value="dashboard_manual_run")
         start_date = st.text_input("Start Date", value="2018-01-01")
         rebalance_frequency = st.selectbox("Rebalance Frequency", ["D", "W", "M"], index=2)
-        top_n = st.slider("Top N Assets", min_value=1, max_value=6, value=3)
-        min_momentum_threshold = st.slider(
-            "Min Momentum Threshold",
-            min_value=-0.10,
-            max_value=0.20,
-            value=0.00,
-            step=0.01,
+        top_n = int(
+            synced_numeric_parameter(
+                "Top N Assets",
+                "top_n",
+                min_value=1,
+                max_value=6,
+                value=3,
+                step=1,
+                number_format="%d",
+            )
         )
-        target_annual_vol = st.slider("Target Annual Vol", 0.05, 0.30, 0.12, 0.01)
-        max_asset_weight = st.slider("Max Asset Weight", 0.10, 1.00, 0.40, 0.05)
-        risk_off_cash_weight = st.slider("Risk-Off Cash Weight", 0.00, 1.00, 0.50, 0.05)
-        vix_risk_off_threshold = st.slider("VIX Risk-Off Threshold", 15.0, 50.0, 28.0, 1.0)
-        vix_high_threshold = st.slider("VIX High Threshold", 12.0, 40.0, 22.0, 1.0)
-        trading_cost_bps = st.slider("Trading Cost (bps)", 0.0, 30.0, 5.0, 0.5)
+        min_momentum_threshold = float(
+            synced_numeric_parameter(
+                "Min Momentum Threshold",
+                "min_momentum_threshold",
+                min_value=-0.10,
+                max_value=0.20,
+                value=0.00,
+                step=0.01,
+                number_format="%.2f",
+            )
+        )
+        target_annual_vol = float(
+            synced_numeric_parameter(
+                "Target Annual Vol",
+                "target_annual_vol",
+                min_value=0.05,
+                max_value=0.30,
+                value=0.12,
+                step=0.01,
+                number_format="%.2f",
+            )
+        )
+        max_asset_weight = float(
+            synced_numeric_parameter(
+                "Max Asset Weight",
+                "max_asset_weight",
+                min_value=0.10,
+                max_value=1.00,
+                value=0.40,
+                step=0.05,
+                number_format="%.2f",
+            )
+        )
+        risk_off_cash_weight = float(
+            synced_numeric_parameter(
+                "Risk-Off Cash Weight",
+                "risk_off_cash_weight",
+                min_value=0.00,
+                max_value=1.00,
+                value=0.50,
+                step=0.05,
+                number_format="%.2f",
+            )
+        )
+        vix_risk_off_threshold = float(
+            synced_numeric_parameter(
+                "VIX Risk-Off Threshold",
+                "vix_risk_off_threshold",
+                min_value=15.0,
+                max_value=50.0,
+                value=28.0,
+                step=1.0,
+                number_format="%.1f",
+            )
+        )
+        vix_high_threshold = float(
+            synced_numeric_parameter(
+                "VIX High Threshold",
+                "vix_high_threshold",
+                min_value=12.0,
+                max_value=40.0,
+                value=22.0,
+                step=1.0,
+                number_format="%.1f",
+            )
+        )
+        trading_cost_bps = float(
+            synced_numeric_parameter(
+                "Trading Cost (bps)",
+                "trading_cost_bps",
+                min_value=0.0,
+                max_value=30.0,
+                value=5.0,
+                step=0.5,
+                number_format="%.1f",
+            )
+        )
 
         auto_name = (
             f"dashboard_{rebalance_frequency}"
@@ -171,7 +310,32 @@ def main() -> None:
         final_scenario_name = auto_name if use_auto_name else scenario_name
         st.caption(f"当前将保存为：{final_scenario_name}")
 
-        if st.button("保存当前参数为新实验", type="primary", use_container_width=True):
+        validation_errors = validate_experiment_parameters(
+            history_limit=limit,
+            scenario_name=final_scenario_name,
+            start_date=start_date,
+            rebalance_frequency=rebalance_frequency,
+            top_n=top_n,
+            min_momentum_threshold=min_momentum_threshold,
+            target_annual_vol=target_annual_vol,
+            max_asset_weight=max_asset_weight,
+            risk_off_cash_weight=risk_off_cash_weight,
+            vix_risk_off_threshold=vix_risk_off_threshold,
+            vix_high_threshold=vix_high_threshold,
+            trading_cost_bps=trading_cost_bps,
+        )
+        if validation_errors:
+            st.error(
+                "请修正以下参数：\n\n"
+                + "\n".join(f"- {message}" for message in validation_errors)
+            )
+
+        if st.button(
+            "保存当前参数为新实验",
+            type="primary",
+            width="stretch",
+            disabled=bool(validation_errors),
+        ):
             with st.spinner("正在回测并写入数据库..."):
                 try:
                     run_id = execute_experiment_and_save(
@@ -192,8 +356,9 @@ def main() -> None:
                 except Exception as exc:
                     st.error(f"保存失败：{exc}")
 
+    effective_limit = limit if 5 <= limit <= 100 else 20
     try:
-        runs = load_runs(limit)
+        runs = load_runs(effective_limit)
     except Exception as exc:
         st.error(f"读取数据库失败：{exc}")
         return
