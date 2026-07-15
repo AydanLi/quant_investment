@@ -61,6 +61,11 @@ The launcher starts Streamlit in the background and opens
 running Dashboard instead of starting duplicate processes. It fingerprints the
 Dashboard and application Python sources; after a code change, the next click
 automatically replaces the stale managed process before opening the page.
+
+Double-click `Open Robinhood Mirror.cmd` to open the separate read-only
+Robinhood mirror at `http://localhost:8502`. It displays the local position
+snapshot and the latest optimization result, reuses an existing healthy mirror
+process, and has no order-submission capability.
 Startup logs, source state, and the process ID are written to the ignored
 `.runtime/` directory.
 
