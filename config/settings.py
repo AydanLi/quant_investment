@@ -43,6 +43,12 @@ class Config:
     min_asset_weight: float = 0.00
     risk_off_cash_weight: float = 0.50
     trading_cost_bps: float = 5.0
+    slippage_bps: float = 2.0
+
+    # Admitted risk model. ``sample`` preserves the pre-admission baseline.
+    risk_model: str = "dynamic_factor"
+    ewma_half_life_days: int = 20
+    pca_stress_multiplier: float = 1.50
 
     initial_capital: float = 100000.0
 
@@ -70,6 +76,16 @@ class Config:
             raise ValueError("risk_off_cash_weight must be between 0 and 1.")
         if self.top_n < 1:
             raise ValueError("top_n must be at least 1.")
+        if self.trading_cost_bps < 0.0:
+            raise ValueError("trading_cost_bps cannot be negative.")
+        if self.slippage_bps < 0.0:
+            raise ValueError("slippage_bps cannot be negative.")
+        if self.risk_model not in {"sample", "dynamic_factor"}:
+            raise ValueError("risk_model must be 'sample' or 'dynamic_factor'.")
+        if self.ewma_half_life_days < 1:
+            raise ValueError("ewma_half_life_days must be at least 1.")
+        if self.pca_stress_multiplier < 1.0:
+            raise ValueError("pca_stress_multiplier must be at least 1.0.")
 
         selectable_assets = min(self.top_n, len(self.universe))
         has_cash_equivalent = "BIL" in self.universe

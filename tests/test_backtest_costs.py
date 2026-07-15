@@ -44,6 +44,7 @@ def _run_cost_backtest():
         top_n=1,
         max_asset_weight=1.0,
         trading_cost_bps=10.0,
+        slippage_bps=5.0,
         initial_capital=1000.0,
     )
     backtester = Backtester(
@@ -66,13 +67,15 @@ def test_backtest_daily_return_matches_equity_after_costs():
     second = portfolio.iloc[1]
 
     assert abs(first["gross_return"]) < 1e-12
-    assert abs(first["est_cost"] - 0.002) < 1e-12
-    assert abs(first["daily_return"] + 0.002) < 1e-12
-    assert abs(first["equity"] - 998.0) < 1e-9
+    assert abs(first["est_trading_cost"] - 0.002) < 1e-12
+    assert abs(first["est_slippage"] - 0.001) < 1e-12
+    assert abs(first["est_cost"] - 0.003) < 1e-12
+    assert abs(first["daily_return"] + 0.003) < 1e-12
+    assert abs(first["equity"] - 997.0) < 1e-9
 
-    expected_second_return = (1.0 + 0.01) * (1.0 - 0.002) - 1.0
+    expected_second_return = (1.0 + 0.01) * (1.0 - 0.003) - 1.0
     assert abs(second["gross_return"] - 0.01) < 1e-12
-    assert abs(second["est_cost"] - 0.002) < 1e-12
+    assert abs(second["est_cost"] - 0.003) < 1e-12
     assert abs(second["daily_return"] - expected_second_return) < 1e-12
 
     previous_equity = config.initial_capital
@@ -89,7 +92,9 @@ def test_broker_orders_capture_prices_and_costs():
 
     assert len(orders) == 4
     assert orders["price"].notna().all()
-    assert abs(orders["est_cost"].sum() - 0.004) < 1e-12
+    assert abs(orders["est_trading_cost"].sum() - 0.004) < 1e-12
+    assert abs(orders["est_slippage"].sum() - 0.002) < 1e-12
+    assert abs(orders["est_cost"].sum() - 0.006) < 1e-12
     order_costs = orders.groupby("date")["est_cost"].sum()
     for date, cost in order_costs.items():
         assert abs(cost - portfolio.at[date, "est_cost"]) < 1e-12
@@ -104,4 +109,4 @@ def test_report_uses_initial_capital_and_net_equity_curve():
     assert summary["Start Equity"] == config.initial_capital
     expected_total_return = portfolio["equity"].iloc[-1] / config.initial_capital - 1.0
     assert abs(summary["Total Return"] - expected_total_return) < 1e-12
-    assert abs(summary["Max Drawdown"] + 0.002) < 1e-12
+    assert abs(summary["Max Drawdown"] + 0.003) < 1e-12

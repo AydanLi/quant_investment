@@ -23,6 +23,10 @@ def run_backtest_and_save() -> None:
         max_asset_weight=0.40,
         risk_off_cash_weight=0.50,
         trading_cost_bps=5.0,
+        slippage_bps=2.0,
+        risk_model="dynamic_factor",
+        ewma_half_life_days=20,
+        pca_stress_multiplier=1.50,
     )
 
     print("Loading data...")

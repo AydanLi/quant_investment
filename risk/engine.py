@@ -6,12 +6,17 @@ import numpy as np
 import pandas as pd
 
 from config.settings import Config
+from risk.covariance import DynamicFactorRiskModel
 
 
 class RiskEngine:
     def __init__(self, config: Config):
         config.validate_risk_constraints()
         self.config = config
+        self.dynamic_factor_model = DynamicFactorRiskModel(
+            half_life_days=config.ewma_half_life_days,
+            pca_stress_multiplier=config.pca_stress_multiplier,
+        )
 
     @staticmethod
     def normalize_weights(weights: Dict[str, float]) -> Dict[str, float]:
@@ -28,12 +33,20 @@ class RiskEngine:
         if not tickers:
             return raw_weights
 
-        hist = returns[tickers].loc[:date].tail(60).dropna(how="all")
-        if len(hist) < 20:
-            return raw_weights
+        history = returns[tickers].loc[:date]
+        if self.config.risk_model == "dynamic_factor":
+            try:
+                estimate = self.dynamic_factor_model.estimate(history)
+            except ValueError:
+                return raw_weights
+            cov = estimate.covariance
+        else:
+            hist = history.tail(60).dropna(how="all")
+            if len(hist) < 20:
+                return raw_weights
+            cov = hist.cov().values * 252
 
         w = np.array([raw_weights[t] for t in tickers])
-        cov = hist.cov().values * 252
         if not np.isfinite(cov).all():
             return raw_weights
 

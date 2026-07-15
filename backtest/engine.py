@@ -63,6 +63,8 @@ class Backtester:
             regime = self.regime_detector.classify(date, self.prices, self.features)
             turnover = 0.0
             est_cost = 0.0
+            est_trading_cost = 0.0
+            est_slippage = 0.0
 
             if date in rebalance_dates:
                 target = self.strategy.target_weights(date, regime, self.prices, self.features)
@@ -77,7 +79,11 @@ class Backtester:
                     abs(target.get(k, 0.0) - current_weights.get(k, 0.0))
                     for k in set(target).union(current_weights)
                 )
-                est_cost = turnover * (self.config.trading_cost_bps / 10000.0)
+                est_trading_cost = turnover * (
+                    self.config.trading_cost_bps / 10000.0
+                )
+                est_slippage = turnover * (self.config.slippage_bps / 10000.0)
+                est_cost = est_trading_cost + est_slippage
                 equity *= (1.0 - est_cost)
 
                 self.broker.submit_orders(
@@ -86,6 +92,7 @@ class Backtester:
                     target,
                     prices=self.prices.loc[date],
                     trading_cost_bps=self.config.trading_cost_bps,
+                    slippage_bps=self.config.slippage_bps,
                 )
                 current_weights = target
 
@@ -98,6 +105,8 @@ class Backtester:
                 "daily_return": daily_return,
                 "regime": regime,
                 "turnover": turnover,
+                "est_trading_cost": est_trading_cost,
+                "est_slippage": est_slippage,
                 "est_cost": est_cost,
             }
 

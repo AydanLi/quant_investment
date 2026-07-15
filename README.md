@@ -5,6 +5,7 @@ A modular ETF rotation quant framework with:
 - Feature engineering
 - Regime detection
 - Momentum rotation strategy
+- Admitted EWMA + PCA dynamic-factor risk model
 - Risk engine
 - Backtesting engine
 - Mock broker execution
@@ -57,9 +58,20 @@ the process ID are written to the ignored `.runtime/` directory.
 If the launcher reports that the project Python is missing, create `.venv` and
 install `requirements.txt` before trying again.
 
+The Dashboard charges trading costs and slippage separately. The production
+risk model uses a 20-day EWMA half-life and stresses the dominant PCA factor by
+1.5x; the former 60-day sample covariance remains available as the reproducible
+research baseline.
+
 ### Manual commands
 
 ```bash
 python main_with_db.py                                   # backtest + save a run to the database
 streamlit run streamlit_dashboard_db_v1_1_save_experiment.py   # browse history / save experiments
+python -m scripts.validate_dynamic_factor_model          # rerun all model-admission gates
 ```
+
+The admission command reads the local market-data cache without downloading or
+changing it. It compares identical dates and costs, reports annual walk-forward
+windows, parameter and start-date sensitivity, market regimes, crisis periods,
+turnover, costs, slippage, and signal independence.

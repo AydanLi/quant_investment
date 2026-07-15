@@ -17,6 +17,7 @@ def _valid_parameters():
         "vix_risk_off_threshold": 28.0,
         "vix_high_threshold": 22.0,
         "trading_cost_bps": 5.0,
+        "slippage_bps": 2.0,
         "today": date(2026, 7, 11),
     }
 
@@ -50,6 +51,7 @@ def test_future_date_and_out_of_range_numbers_are_reported():
         max_asset_weight=1.1,
         risk_off_cash_weight=-0.1,
         trading_cost_bps=31.0,
+        slippage_bps=31.0,
     )
 
     errors = validate_experiment_parameters(**parameters)
@@ -61,6 +63,7 @@ def test_future_date_and_out_of_range_numbers_are_reported():
     assert any("Max Asset Weight" in error for error in errors)
     assert any("Risk-Off Cash Weight" in error for error in errors)
     assert any("Trading Cost" in error for error in errors)
+    assert any("Slippage" in error for error in errors)
 
 
 def test_non_finite_values_and_invalid_vix_order_are_reported():

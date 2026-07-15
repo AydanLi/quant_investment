@@ -121,6 +121,7 @@ def execute_experiment_and_save(
     vix_risk_off_threshold: float,
     vix_high_threshold: float,
     trading_cost_bps: float,
+    slippage_bps: float,
 ) -> int:
     config = Config(
         start_date=start_date,
@@ -134,6 +135,10 @@ def execute_experiment_and_save(
         vix_risk_off_threshold=vix_risk_off_threshold,
         vix_high_threshold=vix_high_threshold,
         trading_cost_bps=trading_cost_bps,
+        slippage_bps=slippage_bps,
+        risk_model="dynamic_factor",
+        ewma_half_life_days=20,
+        pca_stress_multiplier=1.50,
     )
 
     loader = MarketDataLoader(config)
@@ -297,6 +302,20 @@ def main() -> None:
                 number_format="%.1f",
             )
         )
+        slippage_bps = float(
+            synced_numeric_parameter(
+                "Slippage (bps)",
+                "slippage_bps",
+                min_value=0.0,
+                max_value=30.0,
+                value=2.0,
+                step=0.5,
+                number_format="%.1f",
+            )
+        )
+        st.caption(
+            "已准入风险模型：EWMA(20日半衰期) + PCA第一因子1.5倍压力。"
+        )
 
         auto_name = (
             f"dashboard_{rebalance_frequency}"
@@ -323,6 +342,7 @@ def main() -> None:
             vix_risk_off_threshold=vix_risk_off_threshold,
             vix_high_threshold=vix_high_threshold,
             trading_cost_bps=trading_cost_bps,
+            slippage_bps=slippage_bps,
         )
         if validation_errors:
             st.error(
@@ -350,6 +370,7 @@ def main() -> None:
                         vix_risk_off_threshold=vix_risk_off_threshold,
                         vix_high_threshold=vix_high_threshold,
                         trading_cost_bps=trading_cost_bps,
+                        slippage_bps=slippage_bps,
                     )
                     st.cache_data.clear()
                     st.success(f"保存成功，run_id = {run_id}")
@@ -401,10 +422,25 @@ def main() -> None:
         "vix_risk_off_threshold",
         "vix_high_threshold",
         "trading_cost_bps",
+        "slippage_bps",
+        "risk_model",
+        "ewma_half_life_days",
+        "pca_stress_multiplier",
         "created_at",
     ]
+    config_snapshot = selected_row.get("config_json")
+    if not isinstance(config_snapshot, dict):
+        config_snapshot = {}
     param_df = pd.DataFrame(
-        [{"Parameter": col, "Value": selected_row.get(col)} for col in param_cols]
+        [
+            {
+                "Parameter": col,
+                "Value": selected_row.get(col)
+                if pd.notna(selected_row.get(col))
+                else config_snapshot.get(col),
+            }
+            for col in param_cols
+        ]
     )
     st.dataframe(param_df, use_container_width=True)
 

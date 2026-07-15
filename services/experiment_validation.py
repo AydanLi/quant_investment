@@ -45,6 +45,7 @@ def validate_experiment_parameters(
     vix_risk_off_threshold: float,
     vix_high_threshold: float,
     trading_cost_bps: float,
+    slippage_bps: float,
     today: Optional[date] = None,
 ) -> List[str]:
     """Return user-facing validation errors for Dashboard experiment inputs."""
@@ -115,6 +116,7 @@ def validate_experiment_parameters(
         40.0,
     )
     _validate_number(errors, "Trading Cost (bps)", trading_cost_bps, 0.0, 30.0)
+    _validate_number(errors, "Slippage (bps)", slippage_bps, 0.0, 30.0)
 
     high_vix = _finite_number(vix_high_threshold)
     risk_off_vix = _finite_number(vix_risk_off_threshold)
