@@ -13,7 +13,11 @@ A modular ETF rotation quant framework with:
 - Reporting
 - Latest allocation signal service
 - Read-only factor diagnostics and exposure monitoring
-- Basic unit tests
+- Read-only Monte Carlo tail-risk monitoring
+- 50 automated unit and integration tests
+
+Current architecture and system boundaries are documented in
+[`quant_system_architecture_overview.md`](quant_system_architecture_overview.md).
 
 ## 1. Install
 
@@ -89,8 +93,10 @@ python -m scripts.analyze_monte_carlo                    # paired block-bootstra
 
 Robinhood Individual-account positions can be mirrored as immutable snapshots
 in `brokerage_mirror_snapshots` and `brokerage_mirror_positions`. The mirror is
-isolated from execution and stores only a masked account reference, never login
-credentials, tokens, or the full account number. Use
+isolated from execution and is designed for pre-masked account references; do
+not include login credentials, tokens, or full account identifiers in the input
+file. The CLI rejects long digit-only account references, but repository-level
+mask enforcement remains a P1 hardening item. Use
 `python scripts/import_brokerage_snapshot.py snapshot.json` for normalized JSON
 exports; applying `alembic upgrade head` creates the required tables.
 
@@ -108,3 +114,22 @@ The Monte Carlo command resamples identical net-return blocks for the baseline
 and current system. It reports paired Sharpe, drawdown, return, turnover, cost,
 block-length, start-date, regime, and crisis distributions. It is a robustness
 diagnostic only and does not generate signals or change target weights.
+
+## 4. Validate
+
+`pytest` is currently a development dependency and is not yet included in the
+unpinned runtime `requirements.txt` file. In a fresh environment, install it
+explicitly before running the suite:
+
+```bash
+python -m pip install pytest
+python -m pytest -q
+python -m compileall -q backtest config data execution report research risk services storage strategy tests utils
+python -m pip check
+alembic current
+```
+
+The expected result for the 2026-07-15 project snapshot is 50 passing tests and
+Alembic revision `b91e2f08c4a1 (head)`. Deprecation and Dashboard serialization
+warnings are known technical debt; they are not test failures but should be
+fixed before dependency upgrades.

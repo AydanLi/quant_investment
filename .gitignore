@@ -23,3 +23,7 @@ quant_research_legacy_backup.db*
 
 # One-click Dashboard launcher runtime files
 .runtime/
+
+# Local project review and progress notes
+CHANGELOG.md
+PROJECT_STATUS.md

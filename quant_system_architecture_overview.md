@@ -1,530 +1,272 @@
-# Quant System Architecture Overview
+# Quant System architecture overview
 
-下面是当前量化研究平台的整体架构总览，包括：
-- 系统分层图
-- 数据流图
-- 关键模块职责
-- 当前版本边界
-- 后续升级方向
+Updated: 2026-07-15
 
----
+This document describes the active architecture of the local ETF-rotation
+research platform. Files under `DNU/` are legacy references and are not part of
+the supported runtime path.
 
-## 1. 系统分层图
+## 1. System map
 
 ```text
-┌──────────────────────────────────────────────────────────────┐
-│                        Presentation Layer                    │
-│  Streamlit Dashboards                                        │
-│  - streamlit_dashboard_v1.py                                 │
-│  - streamlit_dashboard_v1_1.py                               │
-│  - streamlit_dashboard_v1_2.py                               │
-│  - streamlit_dashboard_db.py                                 │
-│  - streamlit_dashboard_db_v1_1_save_experiment.py            │
-└──────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌──────────────────────────────────────────────────────────────┐
-│                        Application Layer                     │
-│  Entry Points / Services                                     │
-│  - main.py                                                   │
-│  - main_with_db.py                                           │
-│  - services/signal_service.py                                │
-│                                                              │
-│  Responsibilities:                                           │
-│  - Coordinate modules                                        │
-│  - Run backtest                                              │
-│  - Generate latest signal                                    │
-│  - Save experiment results                                   │
-└──────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌──────────────────────────────────────────────────────────────┐
-│                         Research Layer                       │
-│  Strategy / Risk / Backtest / Report                         │
-│  - strategy/regime.py                                        │
-│  - strategy/momentum_rotation.py                             │
-│  - risk/engine.py                                            │
-│  - backtest/engine.py                                        │
-│  - report/reporter.py                                        │
-│  - utils/metrics.py                                          │
-│                                                              │
-│  Responsibilities:                                           │
-│  - Detect market regime                                      │
-│  - Rank tradable assets                                      │
-│  - Build target portfolio                                    │
-│  - Apply risk constraints                                    │
-│  - Simulate portfolio evolution                              │
-│  - Compute performance metrics                               │
-└──────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌──────────────────────────────────────────────────────────────┐
-│                           Data Layer                         │
-│  Market Data + Features                                      │
-│  - data/loader.py  (cache-aware, Phase 5)                    │
-│  - data/features.py                                          │
-│                                                              │
-│  Responsibilities:                                           │
-│  - Read from market_data cache first                         │
-│  - Download raw market data via yfinance if missing          │
-│  - Build price frame                                         │
-│  - Compute momentum / vol / MA / drawdown features           │
-└──────────────────────────────────────────────────────────────┘
-                              │
-                ┌─────────────┴─────────────┐
-                ▼                           ▼
-┌───────────────────────────────┐   ┌──────────────────────────────────────────┐
-│      External Data Source     │   │          Persistence Layer               │
-│  yfinance / market prices     │   │  SQLAlchemy + Alembic                    │
-│  (fallback when not cached)   │   │  storage/db.py      ← engine factory     │
-│                               │   │  storage/schema.py  ← table definitions  │
-│                               │   │  storage/store.py   ← ResearchStore      │
-│                               │   │    (facade over all repositories)        │
-│                               │   │  storage/repositories/                   │
-│                               │   │    ├── experiment.py                     │
-│                               │   │    ├── portfolio.py                      │
-│                               │   │    ├── order.py                          │
-│                               │   │    ├── signal.py                         │
-│                               │   │    └── market_data.py  (Phase 5)         │
-└───────────────────────────────┘   └──────────────────────────────────────────┘
-                                                │
-                                                ▼
-                                  ┌──────────────────────────────┐
-                                  │  SQLite / PostgreSQL / MySQL  │
-                                  │  Tables:                      │
-                                  │  - experiment_runs            │
-                                  │  - portfolio_daily            │
-                                  │  - portfolio_weights  (v2 新) │
-                                  │  - orders                     │
-                                  │  - signals                    │
-                                  │  - market_data        (v2 新) │
-                                  └──────────────────────────────┘
+User / researcher
+      |
+      +--> main.py --------------------------> backtest + local report
+      +--> main_with_db.py ------------------> backtest + persistence
+      +--> Open Quant Dashboard.cmd ---------> primary Streamlit Dashboard
+      +--> scripts/*.py ---------------------> research and import commands
+                                                   |
+                                                   v
+  +------------------------ Application / service layer ---------------------+
+  | signal_service | experiment_validation | factor_monitor | MC monitor     |
+  +-------------------------------------------------------------------------+
+               |                         |                       |
+               v                         v                       v
+  +------ Strategy / risk ------+  +---- Research ----+  +-- Read-only mirror --+
+  | regime | momentum | risk    |  | admission        |  | normalized JSON      |
+  | dynamic covariance         |  | factor attribution|  | brokerage snapshots  |
+  | backtest | mock execution  |  | Monte Carlo      |  | no order methods      |
+  +-----------------------------+  +------------------+  +----------------------+
+               |                         |                       |
+               +-------------------------+-----------------------+
+                                         v
+  +-------------------------- Persistence layer -----------------------------+
+  | ResearchStore + SQLAlchemy repositories + Alembic schema                 |
+  | experiments | portfolio | weights | orders | signals | market data        |
+  | brokerage mirror snapshots and positions                                 |
+  +-------------------------------------------------------------------------+
+                                         |
+                                         v
+                               SQLite (current local DB)
 ```
 
----
+## 2. Supported entry points
 
-## 2. 数据流图
-
-```text
-[1] User starts run
-    ├─ python main.py
-    ├─ python main_with_db.py
-    └─ Streamlit dashboard button click
-
-                │
-                ▼
-[2] Load configuration
-    └─ config/settings.py  (dataclass with full param set)
-
-                │
-                ▼
-[3] Load market data  (cache-first, Phase 5)
-    └─ data/loader.py
-       ├─ Check market_data table via MarketDataRepository
-       ├─ If coverage OK → return cached OHLCV
-       └─ If missing / force_refresh → download from yfinance
-                                     → write to market_data cache
-                                     → return OHLCV
-
-                │
-                ▼
-[4] Build research features
-    └─ data/features.py
-       - mom_20 / mom_60 / mom_120
-       - vol_20
-       - ma_50 / ma_200
-       - drawdown_200
-
-                │
-                ▼
-[5] Detect market regime
-    └─ strategy/regime.py
-       Output:
-       - bull_trend
-       - neutral
-       - risk_off
-       - bear_high_vol
-
-                │
-                ▼
-[6] Generate strategy weights
-    └─ strategy/momentum_rotation.py
-       - asset scoring (momentum composite + inverse-vol)
-       - top_n selection
-       - defensive overlay (risk_off / bear_high_vol)
-
-                │
-                ▼
-[7] Apply risk controls
-    └─ risk/engine.py
-       - target vol scaling
-       - max weight constraint
-       - weight normalization
-       - pre-trade checks
-
-                │
-                ▼
-[8] Simulate portfolio / orders
-    └─ backtest/engine.py
-       + execution/broker.py (MockBroker)
-       Output:
-       - portfolio DataFrame (equity, daily_return, regime,
-         turnover, est_cost, w_* per-asset columns)
-       - orders DataFrame
-
-                │
-                ▼
-[9] Generate outputs
-    ├─ report/reporter.py
-    │  - summary metrics
-    │  - latest allocation snapshot
-    │  - equity curve
-    └─ services/signal_service.py
-       - current signal only (no full backtest)
-
-                │
-        ┌───────┴────────┐
-        ▼                ▼
-[10A] Display            [10B] Persist  (main_with_db.py only)
-      Streamlit                ResearchStore.save_full_run()
-      dashboards               ├─ ExperimentRepository  → experiment_runs
-                               ├─ PortfolioRepository   → portfolio_daily
-                               │                        → portfolio_weights
-                               ├─ OrderRepository       → orders
-                               └─ SignalRepository      → signals
-
-                               │
-                               ▼
-[11] Query historical runs later
-     └─ Streamlit dashboards read directly from DB
-        via ResearchStore / repositories
-```
-
----
-
-## 3. 关键模块职责
-
-### 3.1 `config/settings.py`
-统一管理实验参数。
-
-负责内容：
-- 标的池（universe）
-- benchmark / fear gauge
-- 调仓频率（rebalance_frequency）
-- 因子权重（mom_20 / 60 / 120 权重，低波动权重）
-- risk-off 参数（防御仓位比例）
-- target vol / 权重约束
-- 交易成本（bps）
-- `db_url`（数据库连接字符串，可切换后端）
-
-作用：
-- 参数与逻辑分离
-- 方便回测实验和 dashboard 调参
-- `db_url` 一行换掉即可从 SQLite 升到 PostgreSQL
-
----
-
-### 3.2 `data/loader.py`
-原始行情入口，Phase 5 后增加 cache-first 逻辑。
-
-负责内容：
-1. 根据 tickers 检查 `market_data` 表中的覆盖情况
-2. 若 cache 命中 → 直接返回 OHLCV，不打 yfinance
-3. 若 cache 缺失或 `force_refresh=True` → 从 yfinance 拉取 → 写入 cache
-4. 兜底：cache 写入失败时降级为直接下载（不阻断主流程）
-
-好处：
-- 同一日期范围的回测完全可重现（不依赖 yfinance 实时可用性）
-- 避免重复打 API
-
----
-
-### 3.3 `data/features.py`
-研究特征工厂。
-
-当前输出：
-- 短中长期动量（mom_20 / mom_60 / mom_120）
-- 20 日波动率（年化）
-- 50 / 200 日均线
-- 相对 200 日均线偏离（drawdown_200）
-
-作用：给 regime 和 strategy 提供统一输入。
-
----
-
-### 3.4 `strategy/regime.py`
-市场状态识别器。
-
-当前逻辑依赖：
-- benchmark vs 200DMA
-- VIX threshold
-- 相对 200DMA 的 drawdown
-
-输出：`bull_trend` / `neutral` / `risk_off` / `bear_high_vol`
-
----
-
-### 3.5 `strategy/momentum_rotation.py`
-策略权重生成器。
-
-负责内容：
-- 对资产综合打分（动量 + 低波动合成）
-- 选 top_n
-- 根据 regime 做防御调整（risk_off 加现金，bear_high_vol 降权益）
-
----
-
-### 3.6 `risk/engine.py`
-风控硬约束层。
-
-负责内容：
-- 波动率目标控制（scale_to_target_vol）
-- 单资产权重限制（enforce_weight_limits, 默认 40%）
-- 权重归一化
-- pre-trade 检查（sum ≈ 1.0，无负值）
-
----
-
-### 3.7 `execution/broker.py`
-模拟执行层（MockBroker）。
-
-当前内容：
-- 生成订单日志（side, weight_change, price, est_cost）
-- 不进行真实下单
-
-作用：让回测和未来实盘接口解耦。
-
----
-
-### 3.8 `backtest/engine.py`
-回测引擎。
-
-负责内容：
-- 逐日推进时间（从暖机期结束到 end_date）
-- 在调仓日：计算目标权重 → 应用风控 → 生成 orders
-- 每日：按当前权重累计收益，扣除交易成本
-- 输出 portfolio DataFrame（含 w_* 每日持仓列）和 orders DataFrame
-
----
-
-### 3.9 `report/reporter.py` + `utils/metrics.py`
-结果解释层。
-
-当前指标：
-- Start / End Equity、Total Return、CAGR
-- Annual Vol、Sharpe、Sortino
-- Max Drawdown、Avg Turnover
-
----
-
-### 3.10 `services/signal_service.py`
-实时建议层。
-
-用途：在不跑完整回测时快速生成最新权重建议，供 dashboard 展示或未来定时任务复用。
-
----
-
-### 3.11 Persistence Layer（v2 重构）
-
-#### `storage/db.py`
-Engine 工厂。负责：
-- 根据 `db_url` 创建 SQLAlchemy Engine（SQLite / PostgreSQL / MySQL）
-- 启用 WAL 日志（SQLite）和外键约束
-- 提供全局单例 engine
-
-#### `storage/schema.py`
-权威表定义（Alembic 从此处消费）。含：
-- `experiment_runs`、`portfolio_daily`、`portfolio_weights`、`orders`、`signals`、`market_data`
-
-#### `storage/store.py` — ResearchStore
-统一门面（Facade），应用层唯一的持久化入口。
-
-核心方法：
-- `save_full_run(config, portfolio, orders, signal_date)` → `run_id`
-  - 写 experiment_runs（config_json + config_hash + 汇总指标）
-  - 写 portfolio_daily（每日净值 + regime + turnover）
-  - 写 portfolio_weights（每日各资产权重，长格式）
-  - 写 orders（调仓订单）
-  - 写 signals（最新仓位快照）
-- 提供查询接口（list_runs、get_run、…）
-
-#### `storage/repositories/`
-5 个后端无关的 Repository，各自负责单张表：
-
-| Repository | 表 | 核心方法 |
+| Entry point | Purpose | State changes |
 |---|---|---|
-| ExperimentRepository | experiment_runs | insert / list / get_by_id |
-| PortfolioRepository | portfolio_daily + portfolio_weights | insert_daily / insert_weights / get_equity_curve / get_weights |
-| OrderRepository | orders | insert / get_by_run |
-| SignalRepository | signals | insert / get_latest |
-| MarketDataRepository | market_data | upsert_bars / get_bars / coverage_check |
+| `main.py` | Run a backtest and produce a local report | No experiment write; market cache may update |
+| `main_with_db.py` | Run and persist a complete experiment | Writes research DB |
+| `streamlit_dashboard_db_v1_1_save_experiment.py` | Primary interactive Dashboard | Reads runs; saves only after validation |
+| `Open Quant Dashboard.cmd` | Windows launcher for the primary Dashboard | Writes ignored `.runtime/` PID/log files |
+| `scripts/validate_dynamic_factor_model.py` | Reproduce model-admission gates | Read-only market cache |
+| `scripts/analyze_factor_attribution.py` | Factor regression and attribution | Read-only market cache |
+| `scripts/analyze_monte_carlo.py` | Paired Monte Carlo robustness analysis | Read-only market cache |
+| `scripts/import_brokerage_snapshot.py` | Import a normalized brokerage snapshot | Writes mirror tables only |
 
-设计原则：
-- 对外只暴露 pandas DataFrame，不把 SQL 泄漏到应用层
-- 通用 upsert 逻辑（SQLite / PostgreSQL / MySQL native + 通用兜底）
-- 批量写入防 bind-parameter 超限（每批 ≤ 900 行）
+`streamlit_dashboard_db.py` is a legacy lightweight database view. New product
+work should target the primary Dashboard named above.
 
----
+## 3. Core application flow
 
-### 3.12 `alembic/` + `alembic.ini`
-数据库 schema 版本管理。
+```text
+Config
+  -> MarketDataLoader / MarketDataRepository
+  -> FeatureEngineer
+  -> RegimeDetector
+  -> MomentumRotationStrategy
+  -> RiskEngine
+       -> sample covariance (research baseline), or
+       -> EWMA + stressed PCA covariance (production default)
+  -> Backtester
+       -> daily gross return
+       -> turnover
+       -> trading cost + slippage
+       -> daily net return and equity
+       -> MockBroker order log
+  -> ReportGenerator / SignalService
+  -> optional ResearchStore persistence
+```
 
-负责内容：
-- `alembic upgrade head` 建表或升级
-- `alembic/versions/` 存储迁移脚本历史
+### Validation boundaries
 
-作用：
-- 换后端（SQLite → PostgreSQL）时只需改 URL 再 `upgrade head`
-- 后续加字段无需手写 DDL
+- `Config.validate_risk_constraints()` rejects infeasible or invalid risk and
+  cost settings.
+- `RiskEngine.pre_trade_check()` validates final target weights before mock
+  execution.
+- Dashboard inputs are centrally validated before save.
+- Backtest tests reconcile net daily returns with equity and implementation
+  costs.
+- Market-data loader rejects incomplete, stale, or internally gapped cache
+  coverage rather than silently shortening a test.
 
----
+## 4. Strategy and risk layers
 
-### 3.13 `scripts/migrate_legacy_to_v2.py`
-一次性 ETL 脚本（不重复使用）。
+### Feature engineering
 
-用途：将旧 SQLiteStore 手写表中的历史数据迁移到 v2 schema。
-注意：仅保留了旧 schema 有的字段；per-day weights 和 market_data 无法回填（旧版本未存储）。
+`data/features.py` produces:
 
----
+- 20/60/120-session momentum;
+- 20-session annualized volatility;
+- 50/200-session moving averages;
+- distance/drawdown relative to the 200-session average.
 
-### 3.14 Streamlit Dashboards
+The implicit `pct_change()` fill behavior is a documented compatibility issue
+that should be resolved before the next Pandas upgrade.
 
-| 文件 | 版本特点 |
+### Regime detection
+
+`strategy/regime.py` assigns one of:
+
+- `bull_trend`;
+- `neutral`;
+- `risk_off`;
+- `bear_high_vol`.
+
+### Portfolio construction
+
+`strategy/momentum_rotation.py` ranks the configured universe and produces a
+target portfolio. `risk/engine.py` then applies target-volatility scaling,
+non-cash asset caps, BIL-aware feasibility, normalization, and pre-trade checks.
+
+### Covariance models
+
+- `risk_model="dynamic_factor"` is the admitted production default: a 20-day
+  EWMA estimate with a 1.50x stress on the dominant PCA eigenvalue.
+- `risk_model="sample"` preserves the former 60-day sample covariance as the
+  reproducible baseline.
+
+The admission result is documented in
+`reports/dynamic_factor_model_admission_2026-07-15.md`.
+
+## 5. Research and admission layer
+
+`research/model_admission.py` performs the production gates:
+
+- identical comparison dates and costs;
+- out-of-sample Sharpe and maximum drawdown;
+- annual walk-forward windows;
+- costs, slippage, and turnover;
+- parameter perturbation;
+- different starting dates;
+- bull, bear, sideways, risk-off, and crisis periods;
+- correlation with the original momentum signal.
+
+`research/factor_attribution.py` provides static and lagged rolling proxy-factor
+regression with Newey-West alpha statistics and exact return reconciliation.
+
+`research/monte_carlo.py` provides reproducible paired circular-block bootstrap
+analysis. The same sampled rows are used for the baseline and candidate, and
+stored net returns are not charged a second time.
+
+Research reports live under `reports/`. Passing as a diagnostic does not permit
+a model to change weights.
+
+## 6. Dashboard and monitoring
+
+The primary Dashboard has six tabs:
+
+1. equity curve;
+2. order log;
+3. signal snapshot;
+4. factor monitoring;
+5. Monte Carlo monitoring;
+6. raw stored data.
+
+### Factor Monitor
+
+`services/factor_monitor.py` reads a stored run plus cached proxy ETF prices and
+shows rolling exposures, return/risk contribution, alpha statistics, historical
+percentile warnings, and rolling out-of-sample explanatory power.
+
+### Monte Carlo Monitor
+
+`services/monte_carlo_monitor.py` generates 3,000 deterministic 252-session
+paths for the selected stored run. It shows loss probability, tail drawdown,
+return, Sharpe, turnover, recorded cost, equity bands, and 10/20/40-session
+block sensitivity.
+
+Both result objects set `affects_weights=False`. They do not call strategy,
+risk, execution, or target-weight mutation code.
+
+## 7. Persistence layer
+
+### ResearchStore and repositories
+
+`storage/store.py` is the application facade over:
+
+| Repository | Tables / responsibility |
 |---|---|
-| `streamlit_dashboard_v1.py` | 基础展示版 |
-| `streamlit_dashboard_v1_1.py` | 增加策略解释和更多参数 |
-| `streamlit_dashboard_v1_2.py` | 增加双场景参数对比实验 |
-| `streamlit_dashboard_db.py` | 直接从 DB 读取历史实验 |
-| `streamlit_dashboard_db_v1_1_save_experiment.py` | 界面一键保存当前参数为新实验 |
+| `experiments.py` | Experiment metadata, config snapshot/hash, summary |
+| `portfolio.py` | Daily portfolio state and long-form daily weights |
+| `orders.py` | Mock order history |
+| `signals.py` | Latest allocation snapshot per run |
+| `market_data.py` | Shared cache-first OHLCV bars and coverage checks |
 
----
+### Database tables
 
-## 4. 数据库 Schema
+- `experiment_runs`;
+- `portfolio_daily`;
+- `portfolio_weights`;
+- `orders`;
+- `signals`;
+- `market_data`;
+- `brokerage_mirror_snapshots`;
+- `brokerage_mirror_positions`.
 
-### `experiment_runs`
-- PK: `id`
-- `config_json`（完整参数快照）、`config_hash`（SHA-256，用于去重）
-- 提升字段：start_date / end_date / benchmark / rebalance_frequency / top_n 等
-- 汇总指标：start_equity / end_equity / total_return / cagr / annual_vol / sharpe / sortino / max_drawdown / avg_turnover
-- 元数据：scenario_name / latest_signal_date / latest_regime / status / notes / tags
+Alembic is authoritative for schema changes. The current revision is
+`b91e2f08c4a1`, which adds the two brokerage mirror tables on top of the initial
+research schema.
 
-### `portfolio_daily`
-- FK → experiment_runs（CASCADE DELETE）
-- 一行 = 一个 run 的一天：date / equity / daily_return / regime / turnover / est_cost
-- Unique: (run_id, date)
+### Brokerage mirror boundary
 
-### `portfolio_weights`（v2 新增）
-- FK → experiment_runs
-- 长格式：(run_id, date, ticker, weight)
-- Unique: (run_id, date, ticker)
-- 作用：完整还原任意历史 run 的每日持仓
+`storage/repositories/brokerage_mirror.py` stores immutable external position
+snapshots separately from backtest state and mock orders. It intentionally has
+no order-submission method and is not a live broker integration.
 
-### `orders`
-- FK → experiment_runs
-- 调仓订单日志：order_date / ticker / side / weight_change / price / est_cost
+Input masking and numeric validity still require repository-level hardening.
+Until repository-level validation is fixed, callers must supply only pre-masked
+identifiers and validated non-negative positions.
 
-### `signals`
-- 最新仓位快照：(run_id, signal_date, ticker, weight, regime)
+## 8. Test and runtime health
 
-### `market_data`（v2 新增，Phase 5）
-- 共享 OHLCV 缓存，PK: (ticker, date)
-- 字段：open / high / low / close / volume / auto_adjusted / source / fetched_at
-- Upsert：重新拉取同一根 bar 时原地更新
+As of 2026-07-15:
 
----
+- 50 pytest tests pass;
+- all active Python modules compile;
+- `pip check` reports no broken installed dependencies;
+- Alembic has one head and the local database is current;
+- Streamlit's application test executes the primary Dashboard with zero app
+  exceptions and all six tabs present.
 
-## 5. 当前系统已经具备的能力
+Coverage includes risk caps, cost accounting, cache completeness, dynamic
+covariance, admission gates, factor attribution/monitoring, Monte Carlo
+analysis/monitoring, experiment validation, metrics, and brokerage snapshots.
 
-### 5.1 研究能力
-- ETF 轮动策略回测（2018 至今）
-- 市场状态识别（4 种 regime）
-- 参数实验与对比
-- 策略解释与最新信号输出
+Known warnings and reproduced bugs should remain part of the local project
+review process until they are converted into tracked fixes or issue records.
 
-### 5.2 工程能力
-- 多层模块化结构（config / data / strategy / risk / backtest / report / storage）
-- 后端无关持久化（SQLite / PostgreSQL / MySQL 切换只改 URL）
-- Schema 版本管理（Alembic）
-- 市场数据缓存（可重现、省 API 调用）
-- 批量写入 + upsert 防冲突
-- 单元测试（metrics / risk_engine / loader_cache）
+## 9. Current system boundaries
 
-### 5.3 产品能力
-- Streamlit 可视化与参数面板
-- 对比实验
-- 历史实验管理（按 run_id 查询、对比）
-- 从 dashboard 一键保存实验
-- 每日持仓权重历史（portfolio_weights）
+The platform currently supports local personal research. It does not provide:
 
----
+- live broker authentication or order routing;
+- automatic position reconciliation;
+- scheduled research or signal delivery;
+- centralized operational telemetry and alert delivery;
+- multi-user authorization;
+- institutional market data or low-latency execution;
+- permission for factor or Monte Carlo diagnostics to alter holdings.
 
-## 6. 当前系统边界
+## 10. Recommended evolution
 
-### 已做到
-- 个人量化研究平台
-- 可跑、可看、可调、可存、可重现
+### Immediate hardening
 
-### 尚未做到
-- 实盘 broker 接入（MockBroker only）
-- 自动定时任务
-- Walk-forward / out-of-sample 验证框架
-- 多策略组合框架
-- 机构级数据源
-- 高频 / 低延迟架构
-- 正式日志监控告警系统
-- 完整测试覆盖率
+1. enforce brokerage masking and numeric validity in the repository;
+2. remove active Streamlit/Arrow deprecations and require warning-free app tests;
+3. make `pct_change` and UTC timestamp semantics explicit;
+4. pin runtime and development dependencies;
+5. persist gross return and split cost components for new experiment runs.
 
----
+### Research evolution
 
-## 7. 当前测试逻辑
+1. continue accumulating unseen monitoring observations;
+2. add a candidate only when it has a causal or independently testable signal;
+3. repeat the complete admission process before any candidate changes weights;
+4. keep diagnostic output separate from production target generation.
 
-### 7.1 单元测试
-目录：`tests/`
+### Product evolution
 
-现有测试：
-- `test_metrics.py` — 指标计算准确性
-- `test_risk_engine.py` — 权重归一化、裁剪、pre-trade 检查
-- `test_loader_cache.py` — cache 命中 / 旁路逻辑（无网络依赖，Phase 5 新增）
-
-### 7.2 研究测试（通过 dashboard 和回测）
-- 参数对比与结果合理性
-- regime 分布观察
-- 是否过度持有 BIL
-- 是否出现异常回测曲线
-
-### 7.3 集成测试（非正式）
-- 回测 → dashboard → 数据库 闭环
-- dashboard 保存实验后能否按 run_id 查询
-- 新旧 schema 数据是否迁移完整
-
----
-
-## 8. 后续最自然的升级方向
-
-### v1.x 研究强化
-- run 标签 / 备注 / 收藏 / 删除废实验
-- 数据库 dashboard 支持筛选与排序
-- 自动跳转到刚生成的 run_id
-
-### v2.x 工程强化
-- Streamlit 参数实验自动批量跑
-- Walk-forward / out-of-sample 验证
-- 更丰富因子库
-- 切换到 PostgreSQL（仅改 `db_url`）
-- Broker API 接入（替换 MockBroker）
-- 定时任务 / 自动信号推送
-
-### v3.x 产品化
-- 多策略组合
-- 实时信号流水线
-- 风险告警系统
-- 用户权限 / 云部署
-
----
-
-## 9. 总结
-
-这套系统当前是一套：
-基于 Python 的 ETF 动量轮动量化研究平台，具备 cache-first 数据获取、特征工程、市场状态识别、策略打分、风控、回测、信号生成、Streamlit 可视化，以及基于 SQLAlchemy + Alembic 的后端无关持久化层（experiment tracking、每日持仓权重历史、市场数据缓存）。
-
-它已从"量化脚本"阶段升级到"可重现的个人研究平台"阶段，并为未来切换到 PostgreSQL 和接入实盘 broker 打好了基础。
+1. move to PostgreSQL before multi-user/service deployment;
+2. add authentication, audit trails, scheduler, and notifications;
+3. add broker reconciliation before considering live execution;
+4. treat order submission as a separately permissioned subsystem.
