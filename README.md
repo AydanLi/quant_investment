@@ -11,6 +11,7 @@ A modular ETF rotation quant framework with:
 - Mock broker execution
 - Reporting
 - Latest allocation signal service
+- Read-only factor diagnostics and exposure monitoring
 - Basic unit tests
 
 ## 1. Install
@@ -62,6 +63,12 @@ The Dashboard charges trading costs and slippage separately. The production
 risk model uses a 20-day EWMA half-life and stresses the dominant PCA factor by
 1.5x; the former 60-day sample covariance remains available as the reproducible
 research baseline.
+
+The **Factor Monitor** tab calculates lagged rolling exposures, return
+attribution, risk contribution, and historical-percentile alerts on demand for
+any stored run. It reads the existing portfolio and market-data cache, requires
+no database migration, and is deliberately isolated from signals, the risk
+engine, and target weights.
 
 ### Manual commands
 

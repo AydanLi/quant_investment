@@ -12,6 +12,7 @@ from data.loader import MarketDataLoader
 from report.reporter import ReportGenerator
 from risk.engine import RiskEngine
 from services.experiment_validation import validate_experiment_parameters
+from services.factor_monitor import FACTOR_LABELS, build_factor_monitor
 from services.signal_service import SignalService
 from storage.store import ResearchStore
 from strategy.momentum_rotation import MomentumRotationStrategy
@@ -93,6 +94,19 @@ def load_run_details(run_id: int):
     finally:
         store.close()
     return portfolio, orders, signals
+
+
+@st.cache_data(show_spinner=False)
+def load_factor_monitor(run_id: int):
+    store = ResearchStore()
+    try:
+        portfolio = store.get_run_portfolio(run_id)
+        prices = store.market_data.get_close_frame(
+            ["SPY", "QQQ", "IWM", "TLT", "GLD", "XLE", "XLV", "BIL"]
+        )
+    finally:
+        store.close()
+    return build_factor_monitor(portfolio, prices)
 
 
 def format_pct(x):
@@ -450,16 +464,20 @@ def main() -> None:
         st.error(f"读取 run 详情失败：{exc}")
         return
 
-    tab1, tab2, tab3, tab4 = st.tabs(["净值曲线", "订单日志", "信号快照", "原始数据"])
+    if not portfolio.empty:
+        portfolio = portfolio.copy()
+        portfolio["date"] = pd.to_datetime(portfolio["date"])
+        portfolio = portfolio.sort_values("date")
+
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(
+        ["净值曲线", "订单日志", "信号快照", "因子监控", "原始数据"]
+    )
 
     with tab1:
         st.subheader("净值曲线")
         if portfolio.empty:
             st.info("该 run 没有 portfolio_daily 数据。")
         else:
-            portfolio = portfolio.copy()
-            portfolio["date"] = pd.to_datetime(portfolio["date"])
-            portfolio = portfolio.sort_values("date")
             chart_df = portfolio[["date", "equity"]].set_index("date")
             st.line_chart(chart_df)
 
@@ -494,6 +512,76 @@ def main() -> None:
                 st.bar_chart(signal_chart)
 
     with tab4:
+        st.subheader("因子诊断与监控")
+        st.info("当前为只读诊断层：不会修改策略信号、风险引擎或目标仓位。")
+        if portfolio.empty:
+            st.info("该 run 没有可用于因子归因的日收益数据。")
+        else:
+            try:
+                monitor = load_factor_monitor(int(selected_run_id))
+            except Exception as exc:
+                st.warning(f"暂时无法生成因子监控：{exc}")
+            else:
+                summary = monitor.rolling_summary
+                regression = monitor.static_regression
+                residual_share = regression.variance_contribution.get(
+                    "residual", float("nan")
+                )
+                m1, m2, m3, m4, m5 = st.columns(5)
+                m1.metric("滚动 OOS R²", format_pct(summary["oos_r_squared"]))
+                m2.metric(
+                    "年化回归 Alpha",
+                    format_pct(regression.coefficients["alpha"] * 252.0),
+                )
+                m3.metric("Alpha t 值", f"{regression.t_statistics['alpha']:.2f}")
+                m4.metric("残差风险占比", format_pct(residual_share))
+                m5.metric("归因观测数", str(summary["observations"]))
+
+                if monitor.status == "normal":
+                    st.success("当前因子暴露处于本次实验的历史正常区间。")
+                else:
+                    st.warning("当前监控状态：需要观察。")
+                    for message in monitor.warnings:
+                        st.write(f"- {message}")
+
+                st.subheader("最新暴露与历史区间")
+                st.dataframe(
+                    monitor.exposure_table.reset_index(drop=True),
+                    use_container_width=True,
+                )
+
+                st.subheader("最近两年滚动因子暴露")
+                exposure_chart = monitor.rolling_attribution.exposures[
+                    list(FACTOR_LABELS)
+                ].rename(columns=FACTOR_LABELS)
+                st.line_chart(exposure_chart.tail(504))
+
+                component_labels = {
+                    "cash": "现金基线",
+                    "alpha": "回归 Alpha",
+                    "residual": "回归残差",
+                    **FACTOR_LABELS,
+                }
+                st.subheader("年化算术收益贡献")
+                return_contribution = monitor.return_contribution.rename(
+                    index=component_labels
+                ).rename("贡献")
+                st.bar_chart(return_contribution)
+
+                st.subheader("收益波动风险贡献")
+                risk_contribution = monitor.risk_contribution.rename(
+                    index=component_labels
+                ).rename("占比")
+                st.dataframe(
+                    risk_contribution.to_frame(), use_container_width=True
+                )
+
+                if abs(regression.t_statistics["alpha"]) < 1.96:
+                    st.caption(
+                        "当前 Alpha 未达到 |t| ≥ 1.96，不能视为统计显著的独立超额收益。"
+                    )
+
+    with tab5:
         st.subheader("portfolio_daily")
         st.dataframe(portfolio, use_container_width=True)
         st.subheader("orders")

@@ -1,9 +1,9 @@
 # Factor regression and return attribution test
 
-Run date: 2026-07-15  
-Cached data: 2018-01-02 through 2026-07-10  
-Analysis period: 2022-01-03 through 2026-07-10  
-Compared systems: sample-covariance baseline and admitted dynamic-factor system  
+Run date: 2026-07-15
+Cached data: 2018-01-02 through 2026-07-10
+Analysis period: 2022-01-03 through 2026-07-10
+Compared systems: sample-covariance baseline and admitted dynamic-factor system
 Costs in both systems: 5 bps trading cost + 2 bps slippage
 
 ## Decision
@@ -129,6 +129,28 @@ The next possible strategy experiment is a factor-exposure cap, especially on
 combined equity-market and growth exposure. That overlay must be implemented as
 a separate candidate and pass the full walk-forward production-admission gates
 before it is allowed to change live weights.
+
+## Dashboard monitoring integration
+
+The model is integrated as an on-demand, read-only Dashboard layer. It reads a
+stored run's daily portfolio returns and cached proxy-ETF prices, then displays:
+
+- rolling out-of-sample explanatory power;
+- latest exposure versus that run's historical 10th, 50th, and 90th
+  percentiles;
+- annualized arithmetic return contribution;
+- variance contribution and residual risk;
+- alpha significance and data-quality warnings.
+
+The integration exposes `affects_weights=False` and does not call the strategy,
+risk engine, broker, or target-weight code. Existing runs work without a schema
+migration.
+
+An integration smoke check on stored run 11 produced 1,795 rolling observations
+and 46.82% out-of-sample R-squared. Duration exposure was below that run's own
+historical 10th percentile, so the Dashboard correctly reported `watch` while
+leaving all positions unchanged. This alert is an observation, not a trading
+instruction.
 
 ## Reproduce
 
