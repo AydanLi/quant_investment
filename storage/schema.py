@@ -198,6 +198,46 @@ market_data = Table(
     Index("ix_market_data_ticker_date", "ticker", "date"),
 )
 
+# Read-only snapshots imported from an external brokerage.  This is deliberately
+# separate from backtest portfolio state and the mock-broker order tables.
+brokerage_mirror_snapshots = Table(
+    "brokerage_mirror_snapshots",
+    metadata,
+    Column("id", Integer, primary_key=True),
+    Column("provider", String(40), nullable=False),
+    Column("account_ref", String(40), nullable=False),
+    Column("account_type", String(40), nullable=False),
+    Column("captured_at", DateTime, nullable=False),
+    Column("position_count", Integer, nullable=False),
+    Index(
+        "ix_brokerage_mirror_snapshots_provider_account_ref_captured_at",
+        "provider",
+        "account_ref",
+        "captured_at",
+    ),
+)
+
+brokerage_mirror_positions = Table(
+    "brokerage_mirror_positions",
+    metadata,
+    Column("id", Integer, primary_key=True),
+    Column(
+        "snapshot_id",
+        Integer,
+        ForeignKey("brokerage_mirror_snapshots.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("symbol", String(20), nullable=False),
+    Column("quantity", Float, nullable=False),
+    Column("average_buy_price", Float),
+    Column("shares_available_for_sells", Float, nullable=False),
+    Column("position_type", String(20), nullable=False),
+    UniqueConstraint(
+        "snapshot_id", "symbol", name="uq_brokerage_mirror_positions_snapshot_symbol"
+    ),
+    Index("ix_brokerage_mirror_positions_snapshot_id", "snapshot_id"),
+)
+
 
 __all__ = [
     "metadata",
@@ -207,4 +247,6 @@ __all__ = [
     "orders",
     "signals",
     "market_data",
+    "brokerage_mirror_snapshots",
+    "brokerage_mirror_positions",
 ]

@@ -9,6 +9,7 @@ A modular ETF rotation quant framework with:
 - Risk engine
 - Backtesting engine
 - Mock broker execution
+- Read-only external brokerage position snapshots
 - Reporting
 - Latest allocation signal service
 - Read-only factor diagnostics and exposure monitoring
@@ -85,6 +86,13 @@ python -m scripts.validate_dynamic_factor_model          # rerun all model-admis
 python -m scripts.analyze_factor_attribution             # proxy-factor regression and attribution
 python -m scripts.analyze_monte_carlo                    # paired block-bootstrap robustness analysis
 ```
+
+Robinhood Individual-account positions can be mirrored as immutable snapshots
+in `brokerage_mirror_snapshots` and `brokerage_mirror_positions`. The mirror is
+isolated from execution and stores only a masked account reference, never login
+credentials, tokens, or the full account number. Use
+`python scripts/import_brokerage_snapshot.py snapshot.json` for normalized JSON
+exports; applying `alembic upgrade head` creates the required tables.
 
 The admission command reads the local market-data cache without downloading or
 changing it. It compares identical dates and costs, reports annual walk-forward
