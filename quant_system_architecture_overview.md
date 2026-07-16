@@ -49,7 +49,7 @@ User / researcher
 | `streamlit_dashboard_db_v1_1_save_experiment.py` | Primary interactive Dashboard | Reads runs; saves only after validation |
 | `Open Quant Dashboard.cmd` | Windows launcher; restarts managed processes after source changes | Writes ignored `.runtime/` PID/log/source-state files |
 | `robinhood_mirror_dashboard.py` | Read-only mirror and strict-result viewer | Reads mirror tables and ignored result JSON |
-| `Open Robinhood Mirror.cmd` | Windows launcher for the mirror viewer | Writes ignored `.runtime/` PID/log files |
+| `Open Robinhood Mirror.cmd` | Source-aware Windows launcher for the mirror viewer | Writes ignored `.runtime/` PID/log/source-state files |
 | `scripts/optimize_mirrored_portfolio.py` | Strict mirror walk-forward protocol | Reads cache by default; writes ignored CSV/JSON |
 | `scripts/validate_dynamic_factor_model.py` | Reproduce model-admission gates | Read-only market cache |
 | `scripts/analyze_factor_attribution.py` | Factor regression and attribution | Read-only market cache |
@@ -239,7 +239,7 @@ raising a division error.
 
 As of 2026-07-16:
 
-- 111 pytest tests pass;
+- 112 pytest tests pass;
 - all active Python modules compile;
 - `pip check` reports no broken installed dependencies;
 - Alembic has one head and the local database is current;
@@ -247,14 +247,16 @@ As of 2026-07-16:
   exceptions and all six tabs present;
 - database Dashboard parameter tables normalize mixed values to strings before
   Arrow serialization, and all active dataframes use `width="stretch"`;
-- the Windows launcher fingerprints active Python sources, replaces stale
-  managed processes, and reuses a healthy process when sources are unchanged.
+- both Windows launchers fingerprint their active Python sources, replace only
+  verified stale managed processes, reject unmanaged port occupants, and reuse
+  a healthy process when sources are unchanged.
 
 Coverage includes risk caps, cost accounting, cache completeness, missing-price
 return semantics, UTC market-data timestamps, dynamic covariance, admission
 gates, mirror holdout isolation and privacy, factor attribution/monitoring,
 Monte Carlo analysis/monitoring, mirror-result integrity and freshness,
-experiment validation, metrics, and brokerage snapshots.
+experiment validation, launcher source-state behavior, metrics, and brokerage
+snapshots.
 
 Project code emits no compatibility deprecation warnings in the current test
 suite. The remaining local pytest cache warning is an environment ACL issue.

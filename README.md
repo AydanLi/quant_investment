@@ -70,7 +70,10 @@ internally inconsistent output is blocked. Results must be timezone-aware, no
 more than seven days old, contain finite holdout metrics and normalized target
 weights, and preserve the recorded admission decision. Invalid or zero recorded
 cost basis is displayed safely without dividing by zero. The mirror reuses an
-existing healthy process and has no order-submission capability.
+existing healthy process only while its application-source fingerprint is
+unchanged. After a source change, the next launch replaces only the verified
+managed project-Python process before serving the page. It refuses to take over
+an unmanaged service on the same port and has no order-submission capability.
 Startup logs, source state, and the process ID are written to the ignored
 `.runtime/` directory.
 
@@ -153,7 +156,7 @@ python -m pip check
 alembic current
 ```
 
-The expected result for the 2026-07-16 project snapshot is 111 passing tests and
+The expected result for the 2026-07-16 project snapshot is 112 passing tests and
 Alembic revision `b91e2f08c4a1 (head)`. Project code emits no compatibility
 deprecation warnings in the current suite. A local pytest cache ACL warning may
 still appear on this Windows checkout and does not come from application code.
