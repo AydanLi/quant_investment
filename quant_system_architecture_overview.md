@@ -241,7 +241,9 @@ raising a division error.
 
 As of 2026-07-16:
 
-- 114 pytest tests pass;
+- CPython 3.14.3 and all 63 locked runtime/test packages match the validated
+  Windows environment contract;
+- 116 pytest tests pass;
 - all active Python modules compile;
 - `pip check` reports no broken installed dependencies;
 - Alembic has one head and the local database is current;
@@ -258,7 +260,8 @@ return semantics, UTC market-data timestamps, dynamic covariance, admission
 gates, mirror holdout isolation and privacy, factor attribution/monitoring,
 Monte Carlo analysis/monitoring, mirror-result integrity and freshness,
 experiment validation, migration preservation/reversibility, launcher
-source-state behavior, metrics, and brokerage snapshots.
+source-state behavior, dependency root/lock completeness, environment drift,
+metrics, and brokerage snapshots.
 
 Project code emits no compatibility deprecation warnings in the current test
 suite. The remaining local pytest cache warning is an environment ACL issue.

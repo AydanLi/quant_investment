@@ -14,16 +14,36 @@ A modular ETF rotation quant framework with:
 - Latest allocation signal service
 - Read-only factor diagnostics and exposure monitoring
 - Read-only Monte Carlo tail-risk monitoring
-- 98 automated unit and integration tests
+- 116 automated unit and integration tests
 
 Current architecture and system boundaries are documented in
 [`quant_system_architecture_overview.md`](quant_system_architecture_overview.md).
 
 ## 1. Install
 
-```bash
-pip install -r requirements.txt
+The validated Windows toolchain is CPython 3.14.3, recorded in
+`.python-version`. Confirm `py -3.14 --version` reports that patch version, then
+create the environment and install runtime dependencies through the complete
+constraint lock:
+
+```powershell
+py -3.14 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt -c constraints.lock
 ```
+
+For development and tests, use the separate development entry point:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt -c constraints.lock
+.\.venv\Scripts\python.exe -m scripts.check_environment
+```
+
+`requirements.txt` and `requirements-dev.txt` contain exact direct pins;
+`constraints.lock` fixes the complete 63-package runtime and test dependency
+closure validated by this project. The environment check rejects Python or
+package-version drift, incomplete locks, and stale lock entries. Dependency
+updates should change the roots and lock together, followed by the full
+validation suite.
 
 ## 2. Database setup
 
@@ -78,7 +98,7 @@ Startup logs, source state, and the process ID are written to the ignored
 `.runtime/` directory.
 
 If the launcher reports that the project Python is missing, create `.venv` and
-install `requirements.txt` before trying again.
+install `requirements.txt` with `-c constraints.lock` before trying again.
 
 The Dashboard charges trading costs and slippage separately. The production
 risk model uses a 20-day EWMA half-life and stresses the dominant PCA factor by
@@ -151,19 +171,19 @@ diagnostic only and does not generate signals or change target weights.
 
 ## 4. Validate
 
-`pytest` is currently a development dependency and is not yet included in the
-unpinned runtime `requirements.txt` file. In a fresh environment, install it
-explicitly before running the suite:
+Install `requirements-dev.txt` with `constraints.lock` before running the suite.
+The environment check fails early when Python, direct pins, or any transitive
+dependency differs from the validated contract:
 
 ```bash
-python -m pip install pytest
+python -m scripts.check_environment
 python -m pytest -q
-python -m compileall -q backtest config data execution report research risk services storage strategy tests utils
+python -m compileall -q backtest config data execution report research risk scripts services storage strategy tests utils
 python -m pip check
 alembic current
 ```
 
-The expected result for the 2026-07-16 project snapshot is 114 passing tests and
+The expected result for the 2026-07-16 project snapshot is 116 passing tests and
 Alembic revision `d4c91f7a2e6b (head)`. Project code emits no compatibility
 deprecation warnings in the current suite. A local pytest cache ACL warning may
 still appear on this Windows checkout and does not come from application code.
