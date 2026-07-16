@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pandas as pd
@@ -24,6 +25,19 @@ from storage.repositories.brokerage_mirror import BrokerageMirrorRepository
 OPTIMIZATION_PATH = Path(".runtime/mirror_optimization.json")
 
 
+def mirror_db_url() -> str:
+    return os.environ.get("QUANT_MIRROR_DB_URL", "sqlite:///quant_research.db")
+
+
+def optimization_path() -> Path:
+    return Path(
+        os.environ.get(
+            "QUANT_MIRROR_OPTIMIZATION_PATH",
+            str(OPTIMIZATION_PATH),
+        )
+    )
+
+
 def main() -> None:
     st.set_page_config(page_title="Robinhood Read-Only Mirror", layout="wide")
     st.title("Robinhood Read-Only Mirror")
@@ -35,17 +49,21 @@ def main() -> None:
         "Read-only research surface. Diagnostic allocations are not trade "
         "instructions and this application cannot submit orders."
     )
-    positions = BrokerageMirrorRepository(get_engine()).get_latest("robinhood", "0908")
+    positions = BrokerageMirrorRepository(get_engine(mirror_db_url())).get_latest(
+        "robinhood",
+        "0908",
+    )
     if positions.empty:
         st.error("No Robinhood mirror snapshot is available.")
         return
 
     optimization = {}
     optimization_error = ""
-    if OPTIMIZATION_PATH.exists():
+    result_path = optimization_path()
+    if result_path.exists():
         try:
             optimization = json.loads(
-                OPTIMIZATION_PATH.read_text(encoding="utf-8")
+                result_path.read_text(encoding="utf-8")
             )
         except (OSError, json.JSONDecodeError) as exc:
             optimization_error = f"Optimization result cannot be read: {exc}"

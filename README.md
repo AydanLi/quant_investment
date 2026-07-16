@@ -187,7 +187,13 @@ python -m pip check
 alembic current
 ```
 
-The expected result for the 2026-07-16 project snapshot is 122 passing tests and
+The expected result for the 2026-07-16 project snapshot is 132 passing tests and
 Alembic revision `d4c91f7a2e6b (head)`. Project code emits no compatibility
 deprecation warnings in the current suite. A local pytest cache ACL warning may
 still appear on this Windows checkout and does not come from application code.
+
+Mirror Dashboard end-to-end tests use temporary SQLite databases and temporary
+optimization JSON through `QUANT_MIRROR_DB_URL` and
+`QUANT_MIRROR_OPTIMIZATION_PATH`. Production launches do not set these variables
+and continue to use `quant_research.db` and
+`.runtime/mirror_optimization.json`.
