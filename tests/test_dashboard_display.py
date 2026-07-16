@@ -31,6 +31,7 @@ def test_database_dashboards_do_not_use_deprecated_container_width_argument():
     dashboard_paths = [
         project_root / "streamlit_dashboard_db.py",
         project_root / "streamlit_dashboard_db_v1_1_save_experiment.py",
+        project_root / "robinhood_mirror_dashboard.py",
     ]
 
     for dashboard_path in dashboard_paths:

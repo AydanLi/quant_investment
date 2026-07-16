@@ -14,7 +14,7 @@ A modular ETF rotation quant framework with:
 - Latest allocation signal service
 - Read-only factor diagnostics and exposure monitoring
 - Read-only Monte Carlo tail-risk monitoring
-- 88 automated unit and integration tests
+- 98 automated unit and integration tests
 
 Current architecture and system boundaries are documented in
 [`quant_system_architecture_overview.md`](quant_system_architecture_overview.md).
@@ -64,8 +64,9 @@ automatically replaces the stale managed process before opening the page.
 
 Double-click `Open Robinhood Mirror.cmd` to open the separate read-only
 Robinhood mirror at `http://localhost:8502`. It displays the local position
-snapshot and the latest optimization result, reuses an existing healthy mirror
-process, and has no order-submission capability.
+snapshot and only a version 2 strict walk-forward result for that same snapshot.
+Legacy single-split or stale-snapshot output is blocked. The mirror reuses an
+existing healthy process and has no order-submission capability.
 Startup logs, source state, and the process ID are written to the ignored
 `.runtime/` directory.
 
@@ -97,7 +98,17 @@ streamlit run streamlit_dashboard_db_v1_1_save_experiment.py   # browse history 
 python -m scripts.validate_dynamic_factor_model          # rerun all model-admission gates
 python -m scripts.analyze_factor_attribution             # proxy-factor regression and attribution
 python -m scripts.analyze_monte_carlo                    # paired block-bootstrap robustness analysis
+python -m scripts.optimize_mirrored_portfolio            # strict local-cache mirror walk-forward
 ```
+
+The mirror optimizer uses expanding pre-holdout validation folds and evaluates
+one frozen candidate in the final untouched holdout. Its safe default reads
+only the local cache. The optional `--allow-external-symbol-disclosure` flag
+sends the mirrored ticker list to Yahoo Finance and requires informed approval.
+Results remain diagnostic because the signal is still momentum-derived and the
+historical universe comes from today's snapshot; neither gate authorizes
+position changes. See
+[`reports/mirror_walk_forward_protocol_2026-07-15.md`](reports/mirror_walk_forward_protocol_2026-07-15.md).
 
 Robinhood Individual-account positions can be mirrored as immutable snapshots
 in `brokerage_mirror_snapshots` and `brokerage_mirror_positions`. The mirror is
@@ -138,7 +149,7 @@ python -m pip check
 alembic current
 ```
 
-The expected result for the 2026-07-15 project snapshot is 88 passing tests and
+The expected result for the 2026-07-15 project snapshot is 98 passing tests and
 Alembic revision `b91e2f08c4a1 (head)`. Project code emits no compatibility
 deprecation warnings in the current suite. A local pytest cache ACL warning may
 still appear on this Windows checkout and does not come from application code.

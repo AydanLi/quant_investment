@@ -48,6 +48,9 @@ User / researcher
 | `main_with_db.py` | Run and persist a complete experiment | Writes research DB |
 | `streamlit_dashboard_db_v1_1_save_experiment.py` | Primary interactive Dashboard | Reads runs; saves only after validation |
 | `Open Quant Dashboard.cmd` | Windows launcher; restarts managed processes after source changes | Writes ignored `.runtime/` PID/log/source-state files |
+| `robinhood_mirror_dashboard.py` | Read-only mirror and strict-result viewer | Reads mirror tables and ignored result JSON |
+| `Open Robinhood Mirror.cmd` | Windows launcher for the mirror viewer | Writes ignored `.runtime/` PID/log files |
+| `scripts/optimize_mirrored_portfolio.py` | Strict mirror walk-forward protocol | Reads cache by default; writes ignored CSV/JSON |
 | `scripts/validate_dynamic_factor_model.py` | Reproduce model-admission gates | Read-only market cache |
 | `scripts/analyze_factor_attribution.py` | Factor regression and attribution | Read-only market cache |
 | `scripts/analyze_monte_carlo.py` | Paired Monte Carlo robustness analysis | Read-only market cache |
@@ -219,11 +222,19 @@ The repository accepts only the last four account-reference characters or an
 explicitly masked equivalent, stores only the normalized last four characters,
 and rejects non-finite, negative, or internally inconsistent position values.
 
+Mirror optimization ranks 96 predeclared variants only on expanding validation
+folds before a final untouched holdout. It uses the production system as the
+same-date, same-cost baseline and reports turnover, cost, parameter, start-date,
+regime, and crisis diagnostics. Because it reuses momentum and conditions the
+historical universe on today's snapshot, its independent-information and
+historical-universe gates remain false and it cannot authorize position changes.
+Legacy single-split and stale-snapshot results are blocked by the mirror viewer.
+
 ## 8. Test and runtime health
 
 As of 2026-07-15:
 
-- 88 pytest tests pass;
+- 98 pytest tests pass;
 - all active Python modules compile;
 - `pip check` reports no broken installed dependencies;
 - Alembic has one head and the local database is current;
@@ -236,8 +247,9 @@ As of 2026-07-15:
 
 Coverage includes risk caps, cost accounting, cache completeness, missing-price
 return semantics, UTC market-data timestamps, dynamic covariance, admission
-gates, factor attribution/monitoring, Monte Carlo analysis/monitoring,
-experiment validation, metrics, and brokerage snapshots.
+gates, mirror holdout isolation and privacy, factor attribution/monitoring,
+Monte Carlo analysis/monitoring, experiment validation, metrics, and brokerage
+snapshots.
 
 Project code emits no compatibility deprecation warnings in the current test
 suite. The remaining local pytest cache warning is an environment ACL issue.
