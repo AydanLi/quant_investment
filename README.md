@@ -127,6 +127,13 @@ characters and requires finite, non-negative position values. Use
 `python scripts/import_brokerage_snapshot.py snapshot.json` for normalized JSON
 exports; applying `alembic upgrade head` creates the required tables.
 
+New experiment rows persist the complete daily implementation audit in
+`portfolio_daily`: gross return, net daily return, turnover, estimated trading
+cost, estimated slippage, and their existing combined cost. The component
+columns are nullable by design, so records created before migration
+`d4c91f7a2e6b` remain explicitly unknown instead of being reconstructed from
+assumptions.
+
 The admission command reads the local market-data cache without downloading or
 changing it. It compares identical dates and costs, reports annual walk-forward
 windows, parameter and start-date sensitivity, market regimes, crisis periods,
@@ -156,7 +163,7 @@ python -m pip check
 alembic current
 ```
 
-The expected result for the 2026-07-16 project snapshot is 112 passing tests and
-Alembic revision `b91e2f08c4a1 (head)`. Project code emits no compatibility
+The expected result for the 2026-07-16 project snapshot is 114 passing tests and
+Alembic revision `d4c91f7a2e6b (head)`. Project code emits no compatibility
 deprecation warnings in the current suite. A local pytest cache ACL warning may
 still appear on this Windows checkout and does not come from application code.

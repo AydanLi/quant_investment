@@ -191,7 +191,7 @@ risk, execution, or target-weight mutation code.
 | Repository | Tables / responsibility |
 |---|---|
 | `experiments.py` | Experiment metadata, config snapshot/hash, summary |
-| `portfolio.py` | Daily portfolio state and long-form daily weights |
+| `portfolio.py` | Daily gross/net returns, cost components, state, and long-form weights |
 | `orders.py` | Mock order history |
 | `signals.py` | Latest allocation snapshot per run |
 | `market_data.py` | Shared cache-first OHLCV bars and coverage checks |
@@ -208,8 +208,10 @@ risk, execution, or target-weight mutation code.
 - `brokerage_mirror_positions`.
 
 Alembic is authoritative for schema changes. The current revision is
-`b91e2f08c4a1`, which adds the two brokerage mirror tables on top of the initial
-research schema.
+`d4c91f7a2e6b`, which adds nullable daily gross-return, estimated trading-cost,
+and estimated-slippage columns after the brokerage mirror revision. New runs
+persist all components; pre-migration rows remain `NULL` in those fields so the
+system does not fabricate historical attribution.
 
 ### Brokerage mirror boundary
 
@@ -239,7 +241,7 @@ raising a division error.
 
 As of 2026-07-16:
 
-- 112 pytest tests pass;
+- 114 pytest tests pass;
 - all active Python modules compile;
 - `pip check` reports no broken installed dependencies;
 - Alembic has one head and the local database is current;
@@ -255,8 +257,8 @@ Coverage includes risk caps, cost accounting, cache completeness, missing-price
 return semantics, UTC market-data timestamps, dynamic covariance, admission
 gates, mirror holdout isolation and privacy, factor attribution/monitoring,
 Monte Carlo analysis/monitoring, mirror-result integrity and freshness,
-experiment validation, launcher source-state behavior, metrics, and brokerage
-snapshots.
+experiment validation, migration preservation/reversibility, launcher
+source-state behavior, metrics, and brokerage snapshots.
 
 Project code emits no compatibility deprecation warnings in the current test
 suite. The remaining local pytest cache warning is an environment ACL issue.
