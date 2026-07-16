@@ -219,6 +219,12 @@ system does not fabricate historical attribution.
 snapshots separately from backtest state and mock orders. It intentionally has
 no order-submission method and is not a live broker integration.
 
+The Mirror Dashboard exposes three read-only layers: recorded positions,
+current-versus-diagnostic allocation comparison, and the complete admission
+gate audit. It shows snapshot/result UTC timestamps, result age, source identity,
+holdout metrics, failed gates, and authorization state. Allocation differences
+are explicitly labeled diagnostic and never routed into execution code.
+
 The import layer recursively rejects credential, token, and full-account fields.
 The repository accepts only the last four account-reference characters or an
 explicitly masked equivalent, stores only the normalized last four characters,
@@ -243,7 +249,7 @@ As of 2026-07-16:
 
 - CPython 3.14.3 and all 63 locked runtime/test packages match the validated
   Windows environment contract;
-- 116 pytest tests pass;
+- 122 pytest tests pass;
 - all active Python modules compile;
 - `pip check` reports no broken installed dependencies;
 - Alembic has one head and the local database is current;
@@ -261,7 +267,7 @@ gates, mirror holdout isolation and privacy, factor attribution/monitoring,
 Monte Carlo analysis/monitoring, mirror-result integrity and freshness,
 experiment validation, migration preservation/reversibility, launcher
 source-state behavior, dependency root/lock completeness, environment drift,
-metrics, and brokerage snapshots.
+Mirror UI view models, metrics, and brokerage snapshots.
 
 Project code emits no compatibility deprecation warnings in the current test
 suite. The remaining local pytest cache warning is an environment ACL issue.

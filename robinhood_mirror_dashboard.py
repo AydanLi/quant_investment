@@ -11,6 +11,12 @@ from services.mirror_optimization import (
     normalize_cost_basis_weights,
     optimization_result_error,
 )
+from services.mirror_dashboard import (
+    build_admission_gate_table,
+    build_allocation_comparison,
+    format_result_age,
+    format_timestamp_utc,
+)
 from storage.db import get_engine
 from storage.repositories.brokerage_mirror import BrokerageMirrorRepository
 
@@ -21,7 +27,14 @@ OPTIMIZATION_PATH = Path(".runtime/mirror_optimization.json")
 def main() -> None:
     st.set_page_config(page_title="Robinhood Read-Only Mirror", layout="wide")
     st.title("Robinhood Read-Only Mirror")
-    st.caption("Individual account ••••0908 · Local snapshot only · Order submission disabled")
+    st.caption(
+        "Individual account ••••0908 · Local snapshot only · "
+        "Order submission disabled"
+    )
+    st.info(
+        "Read-only research surface. Diagnostic allocations are not trade "
+        "instructions and this application cannot submit orders."
+    )
     positions = BrokerageMirrorRepository(get_engine()).get_latest("robinhood", "0908")
     if positions.empty:
         st.error("No Robinhood mirror snapshot is available.")
@@ -80,10 +93,53 @@ def main() -> None:
     c2.metric("Recorded cost basis", recorded_cost_label)
     c3.metric("Snapshot", f"#{current_snapshot_id}")
     c4.metric("Account", "••••0908")
+    st.caption(
+        "Snapshot captured: "
+        + format_timestamp_utc(positions["captured_at"].iloc[0])
+    )
 
-    tab1, tab2 = st.tabs(["Current mirror", "Optimized test allocation"])
+    if optimization:
+        admission_label = "Admitted" if optimization["admitted"] else "Not admitted"
+        authorization_label = (
+            "Authorized"
+            if optimization["position_changes_authorized"]
+            else "Blocked"
+        )
+        r1, r2, r3, r4 = st.columns(4)
+        r1.metric("Result integrity", "Valid")
+        r2.metric(
+            "Result age",
+            format_result_age(optimization["generated_at"]),
+        )
+        r3.metric("Admission", admission_label)
+        r4.metric("Position changes", authorization_label)
+        st.caption(
+            "Result generated: "
+            f"{format_timestamp_utc(optimization['generated_at'])} · "
+            f"Signal date: {optimization['latest_signal_date']} · "
+            f"Source: {optimization['source_fingerprint'][:12]}…"
+        )
+        if not optimization["position_changes_authorized"]:
+            st.warning(
+                "Position changes are blocked. This result remains diagnostic "
+                "until every admission gate passes and separate authorization "
+                "is implemented."
+            )
+
+    tab1, tab2, tab3 = st.tabs(
+        ["Current mirror", "Diagnostic comparison", "Admission audit"]
+    )
     with tab1:
-        view = positions[["symbol", "quantity", "average_buy_price", "shares_available_for_sells", "cost_basis", "cost_basis_weight"]].sort_values("cost_basis", ascending=False)
+        view = positions[
+            [
+                "symbol",
+                "quantity",
+                "average_buy_price",
+                "shares_available_for_sells",
+                "cost_basis",
+                "cost_basis_weight",
+            ]
+        ].sort_values("cost_basis", ascending=False)
         st.dataframe(
             view,
             width="stretch",
@@ -91,10 +147,21 @@ def main() -> None:
             column_config={
                 "symbol": "Symbol",
                 "quantity": st.column_config.NumberColumn("Quantity", format="%.6f"),
-                "average_buy_price": st.column_config.NumberColumn("Average cost", format="$%.2f"),
-                "shares_available_for_sells": st.column_config.NumberColumn("Sellable", format="%.6f"),
-                "cost_basis": st.column_config.NumberColumn("Recorded cost", format="$%.2f"),
-                "cost_basis_weight": st.column_config.ProgressColumn("Cost-basis weight", min_value=0.0, max_value=1.0, format="%.2%%"),
+                "average_buy_price": st.column_config.NumberColumn(
+                    "Average cost", format="$%.2f"
+                ),
+                "shares_available_for_sells": st.column_config.NumberColumn(
+                    "Sellable", format="%.6f"
+                ),
+                "cost_basis": st.column_config.NumberColumn(
+                    "Recorded cost", format="$%.2f"
+                ),
+                "cost_basis_weight": st.column_config.ProgressColumn(
+                    "Cost-basis weight",
+                    min_value=0.0,
+                    max_value=1.0,
+                    format="%.2%%",
+                ),
             },
         )
 
@@ -117,22 +184,87 @@ def main() -> None:
                 "Final holdout turnover",
                 f"{best['test_annual_turnover']:.2f}x",
             )
-            target = pd.DataFrame(sorted(optimization["latest_weights"].items(), key=lambda item: item[1], reverse=True), columns=["symbol", "target_weight"])
+            comparison = build_allocation_comparison(
+                positions,
+                optimization["latest_weights"],
+            )
+            st.subheader("Current versus diagnostic allocation")
+            st.caption(
+                "Diagnostic delta is a research comparison only; it is not a "
+                "recommended order or authorized rebalance."
+            )
+            st.bar_chart(
+                comparison.set_index("symbol")[
+                    ["current_weight", "diagnostic_target"]
+                ]
+            )
             st.dataframe(
-                target,
+                comparison,
                 width="stretch",
                 hide_index=True,
-                column_config={"symbol": "Symbol", "target_weight": st.column_config.ProgressColumn("Test target", min_value=0.0, max_value=1.0, format="%.2%%")},
+                column_config={
+                    "symbol": "Symbol",
+                    "current_weight": st.column_config.ProgressColumn(
+                        "Current cost-basis weight",
+                        min_value=0.0,
+                        max_value=1.0,
+                        format="%.2%%",
+                    ),
+                    "diagnostic_target": st.column_config.ProgressColumn(
+                        "Diagnostic target",
+                        min_value=0.0,
+                        max_value=1.0,
+                        format="%.2%%",
+                    ),
+                    "diagnostic_delta": st.column_config.NumberColumn(
+                        "Diagnostic delta", format="%+.2%%"
+                    ),
+                    "absolute_delta": None,
+                },
             )
             st.caption(
-                f"Method: {optimization['methodology']} · "
-                f"Admitted: {optimization['admitted']}"
+                f"Selected diagnostic parameters: {best['rebalance_frequency']} "
+                f"rebalance · top {best['top_n']} · momentum floor "
+                f"{best['min_momentum_threshold']:.2%} · target volatility "
+                f"{best['target_annual_vol']:.2%} · maximum asset weight "
+                f"{best['max_asset_weight']:.2%}"
             )
-            if not optimization.get("position_changes_authorized", False):
-                st.warning(
-                    "Diagnostic result only. Admission gates do not authorize "
-                    "position changes, and this mirror cannot place orders."
-                )
+
+    with tab3:
+        if not optimization:
+            st.info(
+                "A valid strict walk-forward result is required before the "
+                "admission audit can be displayed."
+            )
+        else:
+            gate_table = build_admission_gate_table(optimization["admission"])
+            passed_count = int(gate_table["passed"].sum())
+            failed = gate_table.loc[~gate_table["passed"], "gate"].tolist()
+            a1, a2, a3 = st.columns(3)
+            a1.metric("Gates passed", f"{passed_count}/{len(gate_table)}")
+            a2.metric(
+                "Selection used holdout",
+                str(optimization["admission"]["selection_uses_holdout"]),
+            )
+            a3.metric(
+                "Position changes",
+                "Authorized"
+                if optimization["position_changes_authorized"]
+                else "Blocked",
+            )
+            st.dataframe(
+                gate_table[["gate", "status"]],
+                width="stretch",
+                hide_index=True,
+                column_config={"gate": "Admission gate", "status": "Result"},
+            )
+            if failed:
+                st.warning("Failed gates: " + "; ".join(failed))
+            st.caption(
+                f"Method: {optimization['methodology']} · "
+                f"Selected candidate: "
+                f"{optimization['admission']['selected_label']}"
+            )
 
 
 if __name__ == "__main__":

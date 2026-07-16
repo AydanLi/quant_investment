@@ -85,6 +85,10 @@ automatically replaces the stale managed process before opening the page.
 Double-click `Open Robinhood Mirror.cmd` to open the separate read-only
 Robinhood mirror at `http://localhost:8502`. It displays the local position
 snapshot and only a version 2 strict walk-forward result for that same snapshot.
+The three read-only views show current positions, current-versus-diagnostic
+allocation deltas, and every admission gate. Snapshot/result timestamps, result
+age, source fingerprint, holdout metrics, failed gates, and position-change
+authorization are visible without presenting the diagnostic delta as an order.
 Legacy single-split, stale-snapshot, source-mismatched, expired, incomplete, or
 internally inconsistent output is blocked. Results must be timezone-aware, no
 more than seven days old, contain finite holdout metrics and normalized target
@@ -183,7 +187,7 @@ python -m pip check
 alembic current
 ```
 
-The expected result for the 2026-07-16 project snapshot is 116 passing tests and
+The expected result for the 2026-07-16 project snapshot is 122 passing tests and
 Alembic revision `d4c91f7a2e6b (head)`. Project code emits no compatibility
 deprecation warnings in the current suite. A local pytest cache ACL warning may
 still appear on this Windows checkout and does not come from application code.
