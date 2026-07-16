@@ -228,13 +228,18 @@ same-date, same-cost baseline and reports turnover, cost, parameter, start-date,
 regime, and crisis diagnostics. Because it reuses momentum and conditions the
 historical universe on today's snapshot, its independent-information and
 historical-universe gates remain false and it cannot authorize position changes.
-Legacy single-split and stale-snapshot results are blocked by the mirror viewer.
+The mirror viewer additionally binds output to the current optimizer-source
+fingerprint and snapshot capture time, enforces a seven-day freshness window,
+and rejects missing or non-finite holdout metrics, invalid target-weight totals,
+holdout selection leakage, and inconsistent admission/authorization flags.
+Zero or invalid recorded cost basis degrades to zero display weights instead of
+raising a division error.
 
 ## 8. Test and runtime health
 
-As of 2026-07-15:
+As of 2026-07-16:
 
-- 98 pytest tests pass;
+- 111 pytest tests pass;
 - all active Python modules compile;
 - `pip check` reports no broken installed dependencies;
 - Alembic has one head and the local database is current;
@@ -248,8 +253,8 @@ As of 2026-07-15:
 Coverage includes risk caps, cost accounting, cache completeness, missing-price
 return semantics, UTC market-data timestamps, dynamic covariance, admission
 gates, mirror holdout isolation and privacy, factor attribution/monitoring,
-Monte Carlo analysis/monitoring, experiment validation, metrics, and brokerage
-snapshots.
+Monte Carlo analysis/monitoring, mirror-result integrity and freshness,
+experiment validation, metrics, and brokerage snapshots.
 
 Project code emits no compatibility deprecation warnings in the current test
 suite. The remaining local pytest cache warning is an environment ACL issue.

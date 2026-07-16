@@ -75,7 +75,19 @@ The Robinhood mirror Dashboard rejects:
 
 - legacy single-split output;
 - output that does not use the strict methodology;
-- output generated from a different mirror snapshot.
+- output generated from a different mirror snapshot or optimizer-source
+  fingerprint;
+- output that predates the snapshot, is more than five minutes in the future,
+  or is more than seven days old;
+- incomplete or non-finite holdout metrics, negative turnover, malformed target
+  weights, or weights that do not sum to one;
+- holdout-dependent selection and inconsistent gate, admission, or
+  position-authorization flags.
+
+The positions table also treats a zero, negative, or non-finite recorded cost
+basis as unavailable and displays zero cost-basis weights rather than dividing
+by an invalid total. These checks affect display eligibility only; they do not
+alter optimizer output, snapshots, or holdings.
 
 ## Data privacy and reproduction
 
@@ -95,10 +107,11 @@ The actual evaluation above was generated after that approval was provided.
 
 ## Verification
 
-- 10 focused offline tests cover holdout isolation, expanding folds, cost
+- 23 focused offline test cases cover holdout isolation, expanding folds, cost
   equality, independent-information and universe-integrity gates, parameter
-  perturbations, pre-validation universe filtering, local-cache privacy, and
-  legacy/stale result blocking.
+  perturbations, pre-validation universe filtering, local-cache privacy,
+  result schema/source/freshness/number/weight/admission integrity, and safe
+  zero-cost-basis display inputs.
 - The current schema version 2 result matches the source fingerprint and mirror
   snapshot and renders with zero Streamlit application errors or exceptions.
 - No brokerage snapshot or order state is modified by the protocol.

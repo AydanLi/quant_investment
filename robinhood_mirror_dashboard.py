@@ -6,7 +6,11 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-from services.mirror_optimization import optimization_result_error
+from services.mirror_optimization import (
+    calculate_optimizer_source_fingerprint,
+    normalize_cost_basis_weights,
+    optimization_result_error,
+)
 from storage.db import get_engine
 from storage.repositories.brokerage_mirror import BrokerageMirrorRepository
 
@@ -34,9 +38,22 @@ def main() -> None:
             optimization_error = f"Optimization result cannot be read: {exc}"
             optimization = {}
     current_snapshot_id = int(positions["snapshot_id"].iloc[0])
+    expected_source_fingerprint = None
+    if optimization:
+        try:
+            expected_source_fingerprint = calculate_optimizer_source_fingerprint(
+                Path.cwd()
+            )
+        except OSError as exc:
+            optimization_error = (
+                f"Current optimizer source cannot be fingerprinted: {exc}"
+            )
+            optimization = {}
     validation_error = optimization_result_error(
         optimization,
         current_snapshot_id,
+        expected_source_fingerprint=expected_source_fingerprint,
+        snapshot_captured_at=positions["captured_at"].iloc[0],
     )
     if validation_error:
         optimization_error = validation_error
@@ -45,12 +62,22 @@ def main() -> None:
         st.error(optimization_error)
     positions = positions.copy()
     positions["cost_basis"] = positions["quantity"] * positions["average_buy_price"]
-    total_cost = float(positions["cost_basis"].sum())
-    positions["cost_basis_weight"] = positions["cost_basis"] / total_cost
+    cost_basis_weights, total_cost, valid_total_cost = normalize_cost_basis_weights(
+        positions["cost_basis"]
+    )
+    positions["cost_basis_weight"] = cost_basis_weights
+    if valid_total_cost:
+        recorded_cost_label = f"${total_cost:,.2f}"
+    else:
+        recorded_cost_label = "N/A"
+        st.warning(
+            "Recorded cost basis is zero or invalid; cost-basis weights are "
+            "shown as zero."
+        )
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Positions", str(len(positions)))
-    c2.metric("Recorded cost basis", f"${total_cost:,.2f}")
+    c2.metric("Recorded cost basis", recorded_cost_label)
     c3.metric("Snapshot", f"#{current_snapshot_id}")
     c4.metric("Account", "••••0908")
 

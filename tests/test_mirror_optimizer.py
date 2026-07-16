@@ -1,7 +1,10 @@
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 
 from scripts import optimize_mirrored_portfolio as optimizer
+from services.mirror_optimization import calculate_optimizer_source_fingerprint
 
 
 def test_candidate_grid_has_96_unique_predeclared_variants():
@@ -10,6 +13,14 @@ def test_candidate_grid_has_96_unique_predeclared_variants():
     assert len(candidates) == 96
     assert len(set(candidates)) == 96
     assert all(parameters["top_n"] in {3, 5, 8} for parameters in candidates.values())
+
+
+def test_dashboard_and_optimizer_source_fingerprints_match():
+    project_root = Path(__file__).resolve().parents[1]
+
+    assert calculate_optimizer_source_fingerprint(
+        project_root
+    ) == optimizer._source_fingerprint(project_root)
 
 
 def test_universe_filter_uses_only_information_before_validation(monkeypatch):
