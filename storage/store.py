@@ -16,10 +16,12 @@ from config.settings import Config
 from storage.db import create_all, get_engine
 from storage.repositories import (
     ExperimentRepository,
+    GovernanceRepository,
     MarketDataRepository,
     OrderRepository,
     PortfolioRepository,
     SignalRepository,
+    TrustedMarketDataRepository,
 )
 
 
@@ -37,6 +39,11 @@ class ResearchStore:
         self.orders = OrderRepository(engine=engine)
         self.signals = SignalRepository(engine=engine)
         self.market_data = MarketDataRepository(engine=engine)
+        self.trusted_market_data = TrustedMarketDataRepository(engine=engine)
+        self.governance = GovernanceRepository(engine=engine)
+        # ResearchStore never writes live orders. Paper/live execution uses an
+        # explicitly environment-scoped ExecutionRepository in a separate
+        # runtime boundary.
 
     # -- schema / lifecycle -------------------------------------------------- #
     def init_db(self) -> None:

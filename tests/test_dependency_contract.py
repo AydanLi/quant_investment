@@ -9,6 +9,8 @@ RUNTIME_PACKAGES = {
     "matplotlib",
     "numpy",
     "pandas",
+    "pandas-market-calendars",
+    "requests",
     "sqlalchemy",
     "streamlit",
     "yfinance",

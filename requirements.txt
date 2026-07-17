@@ -3,6 +3,8 @@ alembic==1.18.4
 matplotlib==3.10.8
 numpy==2.4.2
 pandas==2.3.3
+pandas-market-calendars==5.4.0
+requests==2.32.5
 sqlalchemy==2.0.51
 streamlit==1.55.0
 yfinance==1.2.0

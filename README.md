@@ -1,23 +1,26 @@
-# Quant System v2.1
+# Quant System v3
 
 A modular ETF rotation quant framework with:
-- Market data loading
+- Tiingo/Yahoo/CBOE raw-data ingestion with immutable snapshots
 - Feature engineering
 - Regime detection
 - Momentum rotation strategy
-- Admitted EWMA + PCA dynamic-factor risk model
+- Sample-covariance baseline plus separately gated dynamic-risk candidates
 - Risk engine
 - Backtesting engine
-- Mock broker execution
+- T+1 quantity/cash ledger and human-approved paper OMS
+- Connection-blocked IBKR adapter boundary
 - Read-only external brokerage position snapshots
 - Reporting
 - Latest allocation signal service
 - Read-only factor diagnostics and exposure monitoring
 - Read-only Monte Carlo tail-risk monitoring
-- 116 automated unit and integration tests
+- Automated unit, integration, migration, leakage, risk, and OMS tests
 
 Current architecture and system boundaries are documented in
 [`quant_system_architecture_overview.md`](quant_system_architecture_overview.md).
+Operational procedures are in
+[`docs/upgrade_v3_runbook.md`](docs/upgrade_v3_runbook.md).
 
 ## 1. Install
 
@@ -39,11 +42,28 @@ For development and tests, use the separate development entry point:
 ```
 
 `requirements.txt` and `requirements-dev.txt` contain exact direct pins;
-`constraints.lock` fixes the complete 63-package runtime and test dependency
+`constraints.lock` fixes the complete 68-package runtime and test dependency
 closure validated by this project. The environment check rejects Python or
 package-version drift, incomplete locks, and stale lock entries. Dependency
 updates should change the roots and lock together, followed by the full
 validation suite.
+
+### Trusted data credential
+
+Never place a real token in the repository or command line. Validate provider
+access with a hidden prompt, then build the full snapshot only after the schema
+is current:
+
+```powershell
+.\.venv\Scripts\python.exe -m scripts.validate_data_sources
+.\.venv\Scripts\alembic.exe upgrade head
+.\.venv\Scripts\python.exe -m scripts.build_trusted_snapshot
+```
+
+The smoke/build commands report `BLOCKED` instead of suppressing stale data,
+corporate-action conflicts, or source differences above 20 bp. Provider quota
+failures are reported as `provider_rate_limit` and never trigger a Yahoo
+fallback. A blocked snapshot is auditable but cannot generate orders.
 
 ## 2. Database setup
 
@@ -55,7 +75,9 @@ clone with:
 alembic upgrade head            # create the schema (all tables) at the latest revision
 ```
 
-This produces an empty database. To also import research runs from a legacy
+This produces an empty database at v3 head. Existing rows without a v3 dataset
+snapshot are retained but marked `invalid_data_v1` and excluded from admission.
+To also import research runs from a legacy
 `SQLiteStore` database, run the one-off migration:
 
 ```bash
@@ -104,10 +126,10 @@ Startup logs, source state, and the process ID are written to the ignored
 If the launcher reports that the project Python is missing, create `.venv` and
 install `requirements.txt` with `-c constraints.lock` before trying again.
 
-The Dashboard charges trading costs and slippage separately. The production
-risk model uses a 20-day EWMA half-life and stresses the dominant PCA factor by
-1.5x; the former 60-day sample covariance remains available as the reproducible
-research baseline.
+The Dashboard charges trading costs, slippage, and impact separately. Sample
+covariance is the reproducible default. The dynamic risk model is not admitted
+by default; only the six preregistered half-life/stress combinations may be
+evaluated after the core strategy is frozen.
 
 The **Factor Monitor** tab calculates lagged rolling exposures, return
 attribution, risk contribution, and historical-percentile alerts on demand for
@@ -126,9 +148,9 @@ change strategy, risk, execution, or target-weight state.
 ```bash
 python main_with_db.py                                   # backtest + save a run to the database
 streamlit run streamlit_dashboard_db_v1_1_save_experiment.py   # browse history / save experiments
-python -m scripts.validate_dynamic_factor_model          # rerun all model-admission gates
-python -m scripts.analyze_factor_attribution             # proxy-factor regression and attribution
-python -m scripts.analyze_monte_carlo                    # paired block-bootstrap robustness analysis
+python -m scripts.validate_dynamic_factor_model --snapshot-id <id> --strategy-version <version>
+python -m scripts.analyze_factor_attribution --snapshot-id <id>
+python -m scripts.analyze_monte_carlo --snapshot-id <id>
 python -m scripts.optimize_mirrored_portfolio            # strict local-cache mirror walk-forward
 ```
 
@@ -158,15 +180,16 @@ columns are nullable by design, so records created before migration
 `d4c91f7a2e6b` remain explicitly unknown instead of being reconstructed from
 assumptions.
 
-The admission command reads the local market-data cache without downloading or
-changing it. It compares identical dates and costs, reports annual walk-forward
+The admission and diagnostic commands read immutable trusted snapshot rows,
+never the legacy `market_data` cache. They compare identical dates and costs,
+report annual walk-forward
 windows, parameter and start-date sensitivity, market regimes, crisis periods,
 turnover, costs, slippage, and signal independence.
 
 The factor-attribution command uses lagged 252-session regressions with no
 network dependency. It reports static exposures, Newey-West alpha statistics,
 one-day-ahead rolling attribution, and exact return reconciliation for both the
-sample-covariance baseline and the admitted dynamic-factor system.
+sample-covariance baseline and a separately evaluated dynamic-factor candidate.
 
 The Monte Carlo command resamples identical net-return blocks for the baseline
 and current system. It reports paired Sharpe, drawdown, return, turnover, cost,
@@ -187,8 +210,8 @@ python -m pip check
 alembic current
 ```
 
-The expected result for the 2026-07-16 project snapshot is 132 passing tests and
-Alembic revision `d4c91f7a2e6b (head)`. Project code emits no compatibility
+The expected result is a fully passing suite and Alembic revision
+`c8e3f1047a92 (head)`. Project code emits no compatibility
 deprecation warnings in the current suite. A local pytest cache ACL warning may
 still appear on this Windows checkout and does not come from application code.
 

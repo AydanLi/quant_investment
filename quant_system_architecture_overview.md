@@ -1,307 +1,209 @@
-# Quant System architecture overview
+# Quant System v3 architecture overview
 
-Updated: 2026-07-15
+Updated: 2026-07-17
 
-This document describes the active architecture of the local ETF-rotation
-research platform. Files under `DNU/` are legacy references and are not part of
-the supported runtime path.
+The active platform is a research and paper-execution system for a long-only,
+cash-account ETF rotation strategy. It is **not live-admitted**. Legacy
+`market_data` rows and all experiments without an immutable v3 dataset snapshot
+remain available for audit, but cannot enter rankings or admission decisions.
 
 ## 1. System map
 
 ```text
-User / researcher
-      |
-      +--> main.py --------------------------> backtest + local report
-      +--> main_with_db.py ------------------> backtest + persistence
-      +--> Open Quant Dashboard.cmd ---------> primary Streamlit Dashboard
-      +--> scripts/*.py ---------------------> research and import commands
-                                                   |
-                                                   v
-  +------------------------ Application / service layer ---------------------+
-  | signal_service | experiment_validation | factor_monitor | MC monitor     |
-  +-------------------------------------------------------------------------+
-               |                         |                       |
-               v                         v                       v
-  +------ Strategy / risk ------+  +---- Research ----+  +-- Read-only mirror --+
-  | regime | momentum | risk    |  | admission        |  | normalized JSON      |
-  | dynamic covariance         |  | factor attribution|  | brokerage snapshots  |
-  | backtest | mock execution  |  | Monte Carlo      |  | no order methods      |
-  +-----------------------------+  +------------------+  +----------------------+
-               |                         |                       |
-               +-------------------------+-----------------------+
-                                         v
-  +-------------------------- Persistence layer -----------------------------+
-  | ResearchStore + SQLAlchemy repositories + Alembic schema                 |
-  | experiments | portfolio | weights | orders | signals | market data        |
-  | brokerage mirror snapshots and positions                                 |
-  +-------------------------------------------------------------------------+
-                                         |
-                                         v
-                               SQLite (current local DB)
+Tiingo raw ETF bars/actions ----+
+Yahoo raw bars/actions ---------+--> dual-source quality gate
+CBOE VIX / Yahoo VIX -----------+          |
+NYSE calendar ------------------+          v
+                                     immutable DatasetSnapshot
+                                               |
+                       +-----------------------+----------------------+
+                       |                                              |
+                       v                                              v
+             point-in-time features                         UniverseVersion
+                       |                                    quarterly approval
+                       v                                              |
+             135-candidate protocol <--------------------------------+
+                       |
+             nested expanding windows
+                       |
+                 StrategyVersion (frozen)
+                       |
+        +--------------+----------------+
+        |                               |
+        v                               v
+ T+1 quantity/cash backtest       SignalDecision
+ costs + settlement + risk       DIAGNOSTIC/ACTIONABLE/
+        |                         BLOCKED/HALTED
+        v                               |
+ AdmissionRun                           v
+                                T+1 pre-trade verification
+                                       |
+                                human-approved paper OMS
+                                       |
+                                IBKR adapter boundary
 ```
 
-## 2. Supported entry points
+The Robinhood mirror, factor monitor, and Monte Carlo monitor remain read-only
+diagnostics. They cannot call the paper/live OMS.
 
-| Entry point | Purpose | State changes |
-|---|---|---|
-| `main.py` | Run a backtest and produce a local report | No experiment write; market cache may update |
-| `main_with_db.py` | Run and persist a complete experiment | Writes research DB |
-| `streamlit_dashboard_db_v1_1_save_experiment.py` | Primary interactive Dashboard | Reads runs; saves only after validation |
-| `Open Quant Dashboard.cmd` | Windows launcher; restarts managed processes after source changes | Writes ignored `.runtime/` PID/log/source-state files |
-| `robinhood_mirror_dashboard.py` | Read-only mirror and strict-result viewer | Reads mirror tables and ignored result JSON |
-| `Open Robinhood Mirror.cmd` | Source-aware Windows launcher for the mirror viewer | Writes ignored `.runtime/` PID/log/source-state files |
-| `scripts/optimize_mirrored_portfolio.py` | Strict mirror walk-forward protocol | Reads cache by default; writes ignored CSV/JSON |
-| `scripts/validate_dynamic_factor_model.py` | Reproduce model-admission gates | Read-only market cache |
-| `scripts/analyze_factor_attribution.py` | Factor regression and attribution | Read-only market cache |
-| `scripts/analyze_monte_carlo.py` | Paired Monte Carlo robustness analysis | Read-only market cache |
-| `scripts/import_brokerage_snapshot.py` | Import a normalized brokerage snapshot | Writes mirror tables only |
+## 2. Trusted data boundary
 
-`streamlit_dashboard_db.py` is a legacy lightweight database view. New product
-work should target the primary Dashboard named above.
+`data/providers.py` separates three provider capabilities: raw OHLCV, corporate
+actions, and security metadata. The Tiingo credential is accepted only from
+process memory/environment and is sent in the authorization header, never as a
+URL parameter. Provider failures never silently switch sources.
 
-## 3. Core application flow
+`data/trusted_loader.py` performs a full-history refresh and stores:
 
-```text
-Config
-  -> MarketDataLoader / MarketDataRepository
-  -> FeatureEngineer
-  -> RegimeDetector
-  -> MomentumRotationStrategy
-  -> RiskEngine
-       -> sample covariance (research baseline), or
-       -> EWMA + stressed PCA covariance (production default)
-  -> Backtester
-       -> daily gross return
-       -> turnover
-       -> trading cost + slippage
-       -> daily net return and equity
-       -> MockBroker order log
-  -> ReportGenerator / SignalService
-  -> optional ResearchStore persistence
-```
+- raw provider bars without vendor back-adjustment;
+- explicit dividends and splits;
+- provider metadata and every detected revision;
+- a content-hashed, immutable copy of all bars/actions used by a result;
+- the quality report and source provenance.
 
-### Validation boundaries
+Local total-return OHLC is rebuilt by `data/adjustments.py`. This removes the
+old incremental adjusted-price stitching problem. `data/calendar.py` makes the
+NYSE calendar authoritative; VIX-only dates cannot enter ETF return or
+execution calendars.
 
-- `Config.validate_risk_constraints()` rejects infeasible or invalid risk and
-  cost settings.
-- `RiskEngine.pre_trade_check()` validates final target weights before mock
-  execution.
-- Dashboard inputs are centrally validated before save.
-- Backtest tests reconcile net daily returns with equity and implementation
-  costs.
-- Market-data loader rejects incomplete, stale, or internally gapped cache
-  coverage rather than silently shortening a test.
+Executable quality rules are:
 
-## 4. Strategy and risk layers
+- 0 stale NYSE sessions for actionable data;
+- 1 stale session is diagnostic only; 2 or more block;
+- raw close differences above 5 bp warn and above 20 bp block;
+- dividend/split conflicts block (provider display rounding is tolerated only
+  within the documented decimal precision);
+- ETF raw returns over 10% require a second source or corporate action;
+- VIX is exempt from the ETF 10% rule but remains subject to CBOE/Yahoo close
+  comparison.
 
-### Feature engineering
+The seed universe is the fixed 25-symbol list in `config/universe.py`. Risk ETFs
+need 756 sessions, 60-session median dollar volume of at least $25 million,
+price of at least $5, at least 98% completeness, and no leveraged/inverse flag.
+Membership is calculated point in time and frozen by quarter. New proposals are
+drafts until manually approved and never backfilled.
 
-`data/features.py` produces:
+## 3. Strategy, backtest, and risk
 
-- 20/60/120-session momentum;
-- 20-session annualized volatility;
-- 50/200-session moving averages;
-- distance/drawdown relative to the 200-session average.
+The admitted execution sequence is always:
 
-Return calculation explicitly uses `pct_change(fill_method=None)`. Missing
-prices therefore remain unknown instead of being silently forward-filled, and
-calculation resumes once two adjacent prices are valid.
+1. calculate a signal after the T close;
+2. execute at the T+1 raw open plus modeled costs;
+3. mark quantities at each close and let weights drift naturally.
 
-### Regime detection
+`backtest/ledger.py` stores fractional quantities, settled cash, signed T+1
+cash settlements, and an order-level audit. Missing prices for active holdings
+block valuation. Cash, quantities, costs, and NAV reconcile exactly in tests.
 
-`strategy/regime.py` assigns one of:
+Costs are charged per dollar of one-sided turnover. Research runs use 2/7/20 bp
+scenarios. A square-root impact term starts at 0.1% ADV, orders above 1% ADV are
+blocked, and risk-off execution has a minimum 20 bp pre-impact cost.
 
-- `bull_trend`;
-- `neutral`;
-- `risk_off`;
-- `bear_high_vol`.
+Risk assets have target weights from 10% through 35%. Positions below 10% after
+volatility scaling leave the portfolio and residual capital goes to BIL. If BIL
+is unavailable, residual goes to `CASH_USD`; other risk positions are never
+re-expanded. BIL and `CASH_USD` are exempt from the 35% cap. The ledger retains
+the greater of 0.5% NAV and $25 as operational cash.
 
-### Portfolio construction
+Operational controls include:
 
-`strategy/momentum_rotation.py` ranks the configured universe and produces a
-target portfolio. `risk/engine.py` then applies target-volatility scaling,
-non-cash asset caps, BIL-aware feasibility, normalization, and pre-trade checks.
+- 15% high-water drawdown: draft T+1 liquidation to `CASH_USD`, then require
+  reconciliation, incident recording, the next monthly rebalance, and human
+  authorization before re-entry;
+- 5% daily loss: temporary halt without automatic liquidation;
+- risk-weight drift above 35%: warning; above 40%: review state that blocks new
+  buys while preserving risk-reducing sells;
+- negative cash, leverage, short/unknown holdings, material account mismatch,
+  stale data, wide spreads, and oversized orders: pre-trade block.
 
-### Covariance models
+The report distinguishes the 15% trigger from realized post-trigger drawdown,
+which can be worse after gaps and slippage.
 
-- `risk_model="dynamic_factor"` is the admitted production default: a 20-day
-  EWMA estimate with a 1.50x stress on the dominant PCA eigenvalue.
-- `risk_model="sample"` preserves the former 60-day sample covariance as the
-  reproducible baseline.
+## 4. Research governance
 
-The admission result is documented in
-`reports/dynamic_factor_model_admission_2026-07-15.md`.
+`research/protocol.py` defines exactly 135 core candidates:
 
-## 5. Research and admission layer
+- five momentum/low-volatility weighting sets;
+- `top_n` of 3, 4, or 5;
+- target volatility of 8%, 10%, or 12%;
+- defensive, baseline, or slow regime parameters.
 
-`research/model_admission.py` performs the production gates:
+Monthly frequency, T+1 execution, the ETF seed pool, 10%-35% bounds, and cost
+scenarios are not searchable. Daily/weekly Dashboard configurations are stored
+as `exploratory_only`.
 
-- identical comparison dates and costs;
-- out-of-sample Sharpe and maximum drawdown;
-- annual walk-forward windows;
-- costs, slippage, and turnover;
-- parameter perturbation;
-- different starting dates;
-- bull, bear, sideways, risk-off, and crisis periods;
-- correlation with the original momentum signal.
+`research/nested_walk_forward.py` uses 12-month outer tests after at least five
+years of training. Parameter choice is repeated inside every outer training
+sample using annual expanding folds. Evaluators receive sliced data only; no
+full-sample portfolio or feature object is cut after calculation. Every success
+and failure is persisted. Final freeze-date selection evaluates all 135
+candidates and records neighbor and start-date robustness.
 
-`research/factor_attribution.py` provides static and lagged rolling proxy-factor
-regression with Newey-West alpha statistics and exact return reconciliation.
+Historical gates cover median excess Sharpe, BIL outperformance, positive outer
+windows, 20 bp costs, neighboring parameters, start dates, stop overshoot and
+stop frequency. Replacing a repaired baseline additionally requires at least
+0.05 excess-Sharpe improvement and a 10% drawdown improvement.
 
-`research/monte_carlo.py` provides reproducible paired circular-block bootstrap
-analysis. The same sampled rows are used for the baseline and candidate, and
-stored net returns are not charged a second time.
+The risk model is a separate stage. Sample covariance is the default. Only the
+six preregistered combinations `half-life {20,40,60} x stress {1.0,1.5}` may be
+evaluated, and only after the core strategy is frozen. No old 20-day/1.5 model
+is treated as admitted by default.
 
-Research reports live under `reports/`. Passing as a diagnostic does not permit
-a model to change weights.
+## 5. Signals and execution
 
-## 6. Dashboard and monitoring
+`services/signal_service.py` emits one `SignalDecision` containing strategy,
+universe and dataset versions; signal/data timestamps; next execution session;
+target/current weights and dollar differences; estimated cost; quality issues;
+and risk state.
 
-The primary Dashboard has six tabs:
+Only a month-end decision generated after 20:30 ET with current trusted data and
+approved/frozen versions can be `ACTIONABLE`. The following morning,
+`execution/pretrade.py` rechecks account state, reconciliation, quotes, data and
+risk. `execution/oms.py` does not draft the initial limit orders before 09:35 ET.
 
-1. equity curve;
-2. order log;
-3. signal snapshot;
-4. factor monitoring;
-5. Monte Carlo monitoring;
-6. raw stored data.
+The OMS enforces:
 
-### Factor Monitor
+- `DRAFT -> APPROVED -> SUBMITTED -> PARTIAL/FILLED/CANCELED/REJECTED`;
+- deterministic client IDs and idempotent persistence;
+- sell-first ordering and broker-reported cash limits;
+- explicit human approval before every submission;
+- a 20 bp initial limit, cancellation after five minutes, and a second human
+  approval for repricing up to 40 bp;
+- cancellation/review after a partial fill remains open ten minutes;
+- fractional orders only when the adapter confirms support.
 
-`services/factor_monitor.py` reads a stored run plus cached proxy ETF prices and
-shows rolling exposures, return/risk contribution, alpha statistics, historical
-percentile warnings, and rolling out-of-sample explanatory power.
+Research, paper, and live execution records are environment-scoped. The IBKR
+adapter is intentionally connection-blocked until the user supplies account
+entity/region, paper permissions, market-data/fractional entitlements,
+commission plan, and TWS/Gateway settings. Constructing it cannot connect or
+submit an order.
 
-### Monte Carlo Monitor
+## 6. Persistence and reproducibility
 
-`services/monte_carlo_monitor.py` generates 3,000 deterministic 252-session
-paths for the selected stored run. It shows loss probability, tail drawdown,
-return, Sharpe, turnover, recorded cost, equity bands, and 10/20/40-session
-block sensitivity.
+Alembic revision `f7a2c9e4b301` adds trusted raw bars, actions, revisions,
+immutable snapshot payloads, universe/strategy versions, admission runs and all
+candidate trials, order intents/fills, reconciliation, and risk incidents. Old
+tables are retained. Legacy experiment rows without a dataset snapshot are
+marked `invalid_data_v1` and `admissible=0`.
+Revision `c8e3f1047a92` adds average entry cost and gross/net realized P&L to
+backtest orders so trade win rate and profit factor are calculated from actual
+closed quantities instead of placeholders.
 
-Both result objects set `affects_weights=False`. They do not call strategy,
-risk, execution, or target-weight mutation code.
+Any admissible result must identify:
 
-## 7. Persistence layer
+- code commit;
+- immutable dataset snapshot;
+- universe version;
+- strategy/protocol version;
+- all attempted candidate outcomes.
 
-### ResearchStore and repositories
+## 7. Admission status
 
-`storage/store.py` is the application facade over:
+Engineering completion does not grant trading admission. A frozen version must
+then complete at least 12 months, 12 rebalances, and 30 fills in paper trading,
+with no unresolved authorization/reconciliation incidents, median
+implementation shortfall no greater than 7 bp, 95th percentile no greater than
+20 bp, and no 15% portfolio halt. Only then may a $10,000 IBKR cash account be
+considered for individually approved live orders.
 
-| Repository | Tables / responsibility |
-|---|---|
-| `experiments.py` | Experiment metadata, config snapshot/hash, summary |
-| `portfolio.py` | Daily gross/net returns, cost components, state, and long-form weights |
-| `orders.py` | Mock order history |
-| `signals.py` | Latest allocation snapshot per run |
-| `market_data.py` | Shared cache-first OHLCV bars and coverage checks |
-
-### Database tables
-
-- `experiment_runs`;
-- `portfolio_daily`;
-- `portfolio_weights`;
-- `orders`;
-- `signals`;
-- `market_data`;
-- `brokerage_mirror_snapshots`;
-- `brokerage_mirror_positions`.
-
-Alembic is authoritative for schema changes. The current revision is
-`d4c91f7a2e6b`, which adds nullable daily gross-return, estimated trading-cost,
-and estimated-slippage columns after the brokerage mirror revision. New runs
-persist all components; pre-migration rows remain `NULL` in those fields so the
-system does not fabricate historical attribution.
-
-### Brokerage mirror boundary
-
-`storage/repositories/brokerage_mirror.py` stores immutable external position
-snapshots separately from backtest state and mock orders. It intentionally has
-no order-submission method and is not a live broker integration.
-
-The Mirror Dashboard exposes three read-only layers: recorded positions,
-current-versus-diagnostic allocation comparison, and the complete admission
-gate audit. It shows snapshot/result UTC timestamps, result age, source identity,
-holdout metrics, failed gates, and authorization state. Allocation differences
-are explicitly labeled diagnostic and never routed into execution code.
-
-The import layer recursively rejects credential, token, and full-account fields.
-The repository accepts only the last four account-reference characters or an
-explicitly masked equivalent, stores only the normalized last four characters,
-and rejects non-finite, negative, or internally inconsistent position values.
-
-Mirror optimization ranks 96 predeclared variants only on expanding validation
-folds before a final untouched holdout. It uses the production system as the
-same-date, same-cost baseline and reports turnover, cost, parameter, start-date,
-regime, and crisis diagnostics. Because it reuses momentum and conditions the
-historical universe on today's snapshot, its independent-information and
-historical-universe gates remain false and it cannot authorize position changes.
-The mirror viewer additionally binds output to the current optimizer-source
-fingerprint and snapshot capture time, enforces a seven-day freshness window,
-and rejects missing or non-finite holdout metrics, invalid target-weight totals,
-holdout selection leakage, and inconsistent admission/authorization flags.
-Zero or invalid recorded cost basis degrades to zero display weights instead of
-raising a division error.
-
-## 8. Test and runtime health
-
-As of 2026-07-16:
-
-- CPython 3.14.3 and all 63 locked runtime/test packages match the validated
-  Windows environment contract;
-- 132 pytest tests pass;
-- all active Python modules compile;
-- `pip check` reports no broken installed dependencies;
-- Alembic has one head and the local database is current;
-- Streamlit's application test executes the primary Dashboard with zero app
-  exceptions and all six tabs present;
-- database Dashboard parameter tables normalize mixed values to strings before
-  Arrow serialization, and all active dataframes use `width="stretch"`;
-- both Windows launchers fingerprint their active Python sources, replace only
-  verified stale managed processes, reject unmanaged port occupants, and reuse
-  a healthy process when sources are unchanged.
-
-Coverage includes risk caps, cost accounting, cache completeness, missing-price
-return semantics, UTC market-data timestamps, dynamic covariance, admission
-gates, mirror holdout isolation and privacy, factor attribution/monitoring,
-Monte Carlo analysis/monitoring, mirror-result integrity and freshness,
-experiment validation, migration preservation/reversibility, launcher
-source-state behavior, dependency root/lock completeness, environment drift,
-Mirror UI view models, an isolated 10-case Mirror Streamlit scenario matrix,
-metrics, and brokerage snapshots.
-
-Project code emits no compatibility deprecation warnings in the current test
-suite. The remaining local pytest cache warning is an environment ACL issue.
-
-## 9. Current system boundaries
-
-The platform currently supports local personal research. It does not provide:
-
-- live broker authentication or order routing;
-- automatic position reconciliation;
-- scheduled research or signal delivery;
-- centralized operational telemetry and alert delivery;
-- multi-user authorization;
-- institutional market data or low-latency execution;
-- permission for factor or Monte Carlo diagnostics to alter holdings.
-
-## 10. Recommended evolution
-
-### Immediate hardening
-
-1. pin runtime and development dependencies;
-2. persist gross return and split cost components for new experiment runs.
-
-### Research evolution
-
-1. continue accumulating unseen monitoring observations;
-2. add a candidate only when it has a causal or independently testable signal;
-3. repeat the complete admission process before any candidate changes weights;
-4. keep diagnostic output separate from production target generation.
-
-### Product evolution
-
-1. move to PostgreSQL before multi-user/service deployment;
-2. add authentication, audit trails, scheduler, and notifications;
-3. add broker reconciliation before considering live execution;
-4. treat order submission as a separately permissioned subsystem.
+See `docs/upgrade_v3_runbook.md` for operation and recovery procedures.

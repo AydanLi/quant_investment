@@ -25,8 +25,8 @@ def test_enforce_weight_limits_does_not_reexpand_capped_assets():
 
     assert abs(sum(result.values()) - 1.0) < 1e-9
     assert abs(result["SPY"] - 0.4) < 1e-9
-    assert abs(result["QQQ"] - 0.4) < 1e-9
-    assert abs(result["BIL"] - 0.2) < 1e-9
+    assert abs(result["QQQ"] - 0.2) < 1e-9
+    assert abs(result["BIL"] - 0.4) < 1e-9
 
 
 def test_bil_is_exempt_from_risk_asset_cap():
@@ -78,36 +78,30 @@ def test_pre_trade_check_rejects_non_finite_weights():
     assert "NaN or infinite" in reason
 
 
-def test_enforce_weight_limits_raises_when_no_cash_capacity_exists():
+def test_enforce_weight_limits_uses_internal_cash_when_bil_is_unavailable():
     engine = RiskEngine(
         Config(universe=["SPY", "QQQ", "IWM"], top_n=3, max_asset_weight=0.4)
     )
 
-    try:
-        engine.enforce_weight_limits({"SPY": 1.0})
-    except ValueError as exc:
-        assert "infeasible without BIL" in str(exc)
-    else:
-        raise AssertionError("Expected infeasible target to raise ValueError")
+    result = engine.enforce_weight_limits({"SPY": 1.0})
+
+    assert result == {"SPY": 0.4, "CASH_USD": 0.6}
 
 
-def test_enforce_weight_limits_raises_for_empty_target_without_bil():
+def test_enforce_weight_limits_uses_internal_cash_for_empty_target_without_bil():
     engine = RiskEngine(
         Config(universe=["SPY", "QQQ", "IWM"], top_n=3, max_asset_weight=0.4)
     )
 
-    try:
-        engine.enforce_weight_limits({})
-    except ValueError as exc:
-        assert "zero weights" in str(exc)
-    else:
-        raise AssertionError("Expected empty target without BIL to raise ValueError")
+    assert engine.enforce_weight_limits({}) == {"CASH_USD": 1.0}
 
 
-def test_risk_engine_rejects_infeasible_config_without_bil():
-    try:
-        RiskEngine(Config(universe=["SPY", "QQQ"], top_n=2, max_asset_weight=0.4))
-    except ValueError as exc:
-        assert "top_n multiplied by max_asset_weight" in str(exc)
-    else:
-        raise AssertionError("Expected infeasible risk config to raise ValueError")
+def test_risk_engine_accepts_config_without_bil_because_internal_cash_exists():
+    engine = RiskEngine(
+        Config(universe=["SPY", "QQQ"], top_n=2, max_asset_weight=0.4)
+    )
+
+    result = engine.enforce_weight_limits({"SPY": 0.6, "QQQ": 0.4})
+    assert result["SPY"] == 0.4
+    assert result["QQQ"] == 0.4
+    assert abs(result["CASH_USD"] - 0.2) < 1e-12

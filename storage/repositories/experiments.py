@@ -80,9 +80,27 @@ class ExperimentRepository(BaseRepository):
         status: str = "complete",
         notes: Optional[str] = None,
         tags: Optional[str] = None,
+        dataset_snapshot_id: int | None = None,
+        universe_version: str | None = None,
+        strategy_version: str | None = None,
+        admissible: bool = False,
+        invalidated_reason: str | None = None,
     ) -> int:
         """Insert one experiment_runs row; returns the new run id."""
         config_dict, config_hash = serialize_config(config)
+
+        frequency = config_dict.get("rebalance_frequency")
+        if frequency in {"D", "W"}:
+            status = "exploratory_only"
+            admissible = False
+        if dataset_snapshot_id is None:
+            status = "invalid_data_v1"
+            admissible = False
+            invalidated_reason = invalidated_reason or "No trusted dataset snapshot."
+        strategy_version = strategy_version or config_dict.get("strategy_version")
+        universe_version = universe_version or config_dict.get("universe_version")
+        if strategy_version in {None, "UNFROZEN"}:
+            admissible = False
 
         values: dict[str, Any] = {
             "scenario_name": scenario_name,
@@ -93,6 +111,11 @@ class ExperimentRepository(BaseRepository):
             "status": status,
             "notes": notes,
             "tags": tags,
+            "dataset_snapshot_id": dataset_snapshot_id,
+            "universe_version": universe_version,
+            "strategy_version": strategy_version,
+            "admissible": int(admissible),
+            "invalidated_reason": invalidated_reason,
         }
         for field in _PROMOTED_CONFIG_FIELDS:
             values[field] = config_dict.get(field)

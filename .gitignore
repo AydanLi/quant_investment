@@ -2,6 +2,11 @@
 __pycache__/
 *.py[cod]
 .venv/
+.env
+.env.*
+!.env.example
+.secrets/
+.pytest-tmp-*/
 
 # Alembic scratch databases used for schema verification
 _alembic_baseline_tmp.db*
@@ -16,6 +21,7 @@ quant_research_v2.db*
 
 # Legacy DB backup kept from the v2 cutover
 quant_research_legacy_backup.db*
+quant_research_before_v3_*.db*
 
 # SQLite sidecar files (WAL mode)
 *.db-wal

@@ -8,7 +8,9 @@ import streamlit as st
 from backtest.engine import Backtester
 from config.settings import Config
 from data.features import FeatureEngineer
-from data.loader import MarketDataLoader
+from data.trusted_loader import TrustedMarketDataLoader
+from data.providers import FredRiskFreeProvider, ProviderError
+from report.benchmarks import build_benchmark_returns
 from report.reporter import ReportGenerator
 from risk.engine import RiskEngine
 from services.dashboard_display import format_parameter_display_value
@@ -173,11 +175,13 @@ def execute_experiment_and_save(
         pca_stress_multiplier=1.50,
     )
 
-    loader = MarketDataLoader(config)
+    loader = TrustedMarketDataLoader(config)
     data = loader.load()
 
     fe = FeatureEngineer(data, config)
     prices = fe.make_price_frame()
+    execution_prices = fe.make_open_frame().reindex(prices.index)
+    median_dollar_volume = fe.make_median_dollar_volume_frame().reindex(prices.index)
     returns = fe.make_returns_frame(prices)
     features = fe.compute_features(prices, returns)
 
@@ -193,15 +197,29 @@ def execute_experiment_and_save(
         regime_detector=regime_detector,
         strategy=strategy,
         risk_engine=risk_engine,
+        execution_prices=execution_prices,
+        median_dollar_volume=median_dollar_volume,
     )
     results = bt.run()
     portfolio = results["portfolio"]
     orders = results["orders"]
 
     reporter = ReportGenerator(config)
-    summary = reporter.summarize(portfolio)
+    try:
+        risk_free = FredRiskFreeProvider().fetch_daily_returns(
+            config.start_date, config.end_date
+        )
+    except ProviderError:
+        risk_free = None
+    summary = reporter.summarize(
+        portfolio,
+        risk_free_returns=risk_free,
+        benchmark_returns=build_benchmark_returns(prices),
+        orders=orders,
+        asset_returns=returns,
+    )
 
-    signal_service = SignalService(config)
+    signal_service = SignalService(config, loader=loader)
     latest_signal = signal_service.generate_latest_allocation()
 
     store = ResearchStore()
@@ -214,6 +232,9 @@ def execute_experiment_and_save(
             portfolio=portfolio,
             order_df=orders,
             latest_signal=latest_signal,
+            dataset_snapshot_id=loader.dataset_snapshot_id,
+            universe_version=config.universe_version,
+            strategy_version=config.strategy_version,
         )
     finally:
         store.close()

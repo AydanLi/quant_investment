@@ -26,11 +26,21 @@ class OrderRepository(BaseRepository):
                 {
                     "run_id": run_id,
                     "order_date": str(row.get("date")),
+                    "signal_date": str(row.get("signal_date")),
                     "ticker": row.get("ticker"),
                     "side": row.get("side"),
                     "weight_change": _opt_float(row.get("weight_change")),
+                    "quantity": _opt_float(row.get("quantity")),
+                    "notional": _opt_float(row.get("notional")),
                     "price": _opt_float(row.get("price")),
                     "est_cost": _opt_float(row.get("est_cost")),
+                    "trading_cost_dollars": _opt_float(row.get("trading_cost_dollars")),
+                    "slippage_dollars": _opt_float(row.get("slippage_dollars")),
+                    "impact_cost_dollars": _opt_float(row.get("impact_cost_dollars")),
+                    "adv_fraction": _opt_float(row.get("adv_fraction")),
+                    "average_entry_cost": _opt_float(row.get("average_entry_cost")),
+                    "gross_realized_pnl": _opt_float(row.get("gross_realized_pnl")),
+                    "realized_pnl": _opt_float(row.get("realized_pnl")),
                 }
             )
 

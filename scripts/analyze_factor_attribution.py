@@ -1,12 +1,12 @@
 from __future__ import annotations
 
+import argparse
 import json
 from dataclasses import replace
 
 import pandas as pd
 
 from config.settings import Config
-from data.features import FeatureEngineer
 from research.factor_attribution import (
     PROXY_FACTOR_DEFINITIONS,
     RollingFactorAttribution,
@@ -16,7 +16,7 @@ from research.factor_attribution import (
     rolling_factor_attribution,
 )
 from scripts.validate_dynamic_factor_model import (
-    load_cached_market_data,
+    prepare_snapshot_inputs,
     run_portfolio,
 )
 
@@ -58,6 +58,12 @@ def oos_rolling_attribution(
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Read-only factor attribution on an immutable trusted snapshot."
+    )
+    parser.add_argument("--snapshot-id", type=int)
+    parser.add_argument("--database", default="quant_research.db")
+    args = parser.parse_args()
     oos_start = pd.Timestamp("2022-01-01")
     baseline_config = Config(
         risk_model="sample",
@@ -71,17 +77,37 @@ def main() -> None:
         pca_stress_multiplier=1.50,
     )
 
-    data = load_cached_market_data()
-    engineer = FeatureEngineer(data, baseline_config)
-    prices = engineer.make_price_frame()
-    returns = engineer.make_returns_frame(prices)
-    features = engineer.compute_features(prices, returns)
+    (
+        snapshot_id,
+        _,
+        prices,
+        execution_prices,
+        returns,
+        features,
+        median_dollar_volume,
+    ) = prepare_snapshot_inputs(
+        baseline_config,
+        database=args.database,
+        snapshot_id=args.snapshot_id,
+    )
     factors, cash = build_proxy_factor_returns(prices)
 
     baseline = run_portfolio(
-        baseline_config, prices, returns, features
+        baseline_config,
+        prices,
+        returns,
+        features,
+        execution_prices=execution_prices,
+        median_dollar_volume=median_dollar_volume,
     )
-    dynamic = run_portfolio(dynamic_config, prices, returns, features)
+    dynamic = run_portfolio(
+        dynamic_config,
+        prices,
+        returns,
+        features,
+        execution_prices=execution_prices,
+        median_dollar_volume=median_dollar_volume,
+    )
 
     baseline_static = fit_factor_regression(
         baseline["daily_return"].loc[oos_start:],
@@ -137,6 +163,8 @@ def main() -> None:
     }
 
     output = {
+        "dataset_snapshot_id": snapshot_id,
+        "candidate_is_admitted": False,
         "data_start": str(prices.index.min().date()),
         "data_end": str(prices.index.max().date()),
         "analysis_start": str(oos_start.date()),

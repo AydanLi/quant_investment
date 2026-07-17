@@ -54,7 +54,17 @@ class PortfolioRepository(BaseRepository):
                         row.get("est_trading_cost")
                     ),
                     "est_slippage": _opt_float(row.get("est_slippage")),
+                    "est_impact": _opt_float(row.get("est_impact")),
                     "est_cost": _opt_float(row.get("est_cost")),
+                    "cost_dollars": _opt_float(row.get("cost_dollars")),
+                    "cash": _opt_float(row.get("cash")),
+                    "settled_cash": _opt_float(row.get("settled_cash")),
+                    "unsettled_cash": _opt_float(row.get("unsettled_cash")),
+                    "drawdown": _opt_float(row.get("drawdown")),
+                    "high_water": _opt_float(row.get("high_water")),
+                    "risk_status": row.get("risk_status"),
+                    "stop_triggered": int(bool(row.get("stop_triggered", False))),
+                    "maximum_adv_fraction": _opt_float(row.get("maximum_adv_fraction")),
                 }
             )
             for col in weight_columns:

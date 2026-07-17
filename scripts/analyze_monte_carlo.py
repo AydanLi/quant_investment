@@ -1,19 +1,19 @@
 from __future__ import annotations
 
+import argparse
 import json
 from dataclasses import replace
 
 import pandas as pd
 
 from config.settings import Config
-from data.features import FeatureEngineer
 from research.monte_carlo import (
     PairedBootstrapResult,
     evaluate_monte_carlo_robustness,
     paired_block_bootstrap,
 )
 from scripts.validate_dynamic_factor_model import (
-    load_cached_market_data,
+    prepare_snapshot_inputs,
     run_portfolio,
 )
 
@@ -58,6 +58,12 @@ def _conditional_results(
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Read-only Monte Carlo diagnostic on an immutable trusted snapshot."
+    )
+    parser.add_argument("--snapshot-id", type=int)
+    parser.add_argument("--database", default="quant_research.db")
+    args = parser.parse_args()
     seed = 20260715
     oos_start = pd.Timestamp("2022-01-01")
     baseline_config = Config(
@@ -72,13 +78,29 @@ def main() -> None:
         pca_stress_multiplier=1.50,
     )
 
-    data = load_cached_market_data()
-    engineer = FeatureEngineer(data, baseline_config)
-    prices = engineer.make_price_frame()
-    returns = engineer.make_returns_frame(prices)
-    features = engineer.compute_features(prices, returns)
-    baseline = run_portfolio(baseline_config, prices, returns, features)
-    candidate = run_portfolio(candidate_config, prices, returns, features)
+    (
+        snapshot_id,
+        _,
+        prices,
+        execution_prices,
+        returns,
+        features,
+        median_dollar_volume,
+    ) = prepare_snapshot_inputs(
+        baseline_config,
+        database=args.database,
+        snapshot_id=args.snapshot_id,
+    )
+    run_kwargs = {
+        "execution_prices": execution_prices,
+        "median_dollar_volume": median_dollar_volume,
+    }
+    baseline = run_portfolio(
+        baseline_config, prices, returns, features, **run_kwargs
+    )
+    candidate = run_portfolio(
+        candidate_config, prices, returns, features, **run_kwargs
+    )
 
     main_result = paired_block_bootstrap(
         baseline,
@@ -162,6 +184,7 @@ def main() -> None:
         start_date_results=start_date_results,
     )
     output = {
+        "dataset_snapshot_id": snapshot_id,
         "method": "paired_circular_block_bootstrap",
         "data_start": str(prices.index.min().date()),
         "data_end": str(prices.index.max().date()),

@@ -18,6 +18,16 @@ class RiskEngine:
             pca_stress_multiplier=config.pca_stress_multiplier,
         )
 
+    def _cash_bucket(self) -> str:
+        return (
+            self.config.cash_asset
+            if self.config.cash_asset in self.config.universe
+            else self.config.synthetic_cash_asset
+        )
+
+    def _is_cash(self, ticker: str) -> bool:
+        return ticker in {self.config.cash_asset, self.config.synthetic_cash_asset}
+
     @staticmethod
     def normalize_weights(weights: Dict[str, float]) -> Dict[str, float]:
         total = sum(max(v, 0.0) for v in weights.values())
@@ -29,7 +39,10 @@ class RiskEngine:
         if not raw_weights:
             return raw_weights
 
-        tickers = [t for t in raw_weights if t in returns.columns]
+        tickers = [
+            t for t in raw_weights
+            if t in returns.columns and not self._is_cash(t)
+        ]
         if not tickers:
             return raw_weights
 
@@ -37,8 +50,10 @@ class RiskEngine:
         if self.config.risk_model == "dynamic_factor":
             try:
                 estimate = self.dynamic_factor_model.estimate(history)
-            except ValueError:
-                return raw_weights
+            except ValueError as exc:
+                raise ValueError(
+                    "Dynamic risk model could not produce an admissible covariance estimate."
+                ) from exc
             cov = estimate.covariance
         else:
             hist = history.tail(60).dropna(how="all")
@@ -55,27 +70,29 @@ class RiskEngine:
             return raw_weights
 
         scale = min(1.0, self.config.target_annual_vol / port_vol)
-        scaled = {k: v * scale for k, v in raw_weights.items()}
-
-        residual = 1.0 - sum(scaled.values())
-        if residual > 0 and "BIL" in self.config.universe:
-            scaled["BIL"] = scaled.get("BIL", 0.0) + residual
+        scaled = {
+            ticker: weight * scale
+            for ticker, weight in raw_weights.items()
+            if not self._is_cash(ticker)
+        }
+        existing_cash = sum(
+            weight for ticker, weight in raw_weights.items() if self._is_cash(ticker)
+        )
+        residual = 1.0 - existing_cash - sum(scaled.values())
+        cash = self._cash_bucket()
+        scaled[cash] = existing_cash + max(residual, 0.0)
 
         return scaled
 
     def enforce_weight_limits(self, weights: Dict[str, float]) -> Dict[str, float]:
         """Apply risk-asset bounds without re-expanding capped positions.
 
-        BIL is treated as the cash-equivalent bucket and is exempt from the
-        risky-asset cap.  Any allocation that cannot remain in risky assets
-        without exceeding ``max_asset_weight`` is moved to BIL.  If BIL is not
-        available, an infeasible target raises instead of silently violating
-        the configured limit.
+        BIL/CASH_USD are exempt cash buckets. Risky allocations are never
+        re-expanded after volatility scaling or capping; residual capital is
+        routed to cash.
         """
         if not weights:
-            if "BIL" in self.config.universe:
-                return {"BIL": 1.0}
-            raise ValueError("Cannot build a fully invested portfolio from zero weights.")
+            return {self._cash_bucket(): 1.0}
         if not all(np.isfinite(v) for v in weights.values()):
             raise ValueError("Weights must contain only finite values.")
 
@@ -84,78 +101,30 @@ class RiskEngine:
         }
         total = sum(positive.values())
         if total <= 0.0:
-            if "BIL" in self.config.universe:
-                return {"BIL": 1.0}
-            raise ValueError("Cannot build a fully invested portfolio from zero weights.")
+            return {self._cash_bucket(): 1.0}
 
-        normalized = {ticker: weight / total for ticker, weight in positive.items()}
-        has_cash_equivalent = "BIL" in self.config.universe
-        cash_target = normalized.get("BIL", 0.0) if has_cash_equivalent else 0.0
-        desired_risk = {
-            ticker: weight
-            for ticker, weight in normalized.items()
-            if ticker != "BIL" and weight > 0.0
-        }
+        if total > 1.0 + 1e-9:
+            positive = {ticker: value / total for ticker, value in positive.items()}
 
-        if not desired_risk:
-            if has_cash_equivalent:
-                return {"BIL": 1.0}
-            raise ValueError("Cannot build a fully invested portfolio from zero weights.")
+        allocated: Dict[str, float] = {}
+        cash_target = 0.0
+        for ticker, weight in positive.items():
+            if self._is_cash(ticker):
+                cash_target += weight
+                continue
+            if weight < self.config.min_asset_weight - 1e-12:
+                continue
+            allocated[ticker] = min(weight, self.config.max_asset_weight)
 
-        risk_budget = 1.0 - cash_target
-        min_weight = self.config.min_asset_weight
-        max_weight = self.config.max_asset_weight
-        minimum_required = len(desired_risk) * min_weight
-        if minimum_required > risk_budget + 1e-9:
-            raise ValueError(
-                "Risk target is infeasible: active positions require more than "
-                "the available risk budget at min_asset_weight."
-            )
-
-        allocatable_risk = min(risk_budget, len(desired_risk) * max_weight)
-        allocated = {ticker: min_weight for ticker in desired_risk}
-        remaining = allocatable_risk - minimum_required
-        active = set(desired_risk)
-
-        while remaining > 1e-12 and active:
-            preference_total = sum(desired_risk[ticker] for ticker in active)
-            if preference_total <= 0.0:
-                proposed = {ticker: remaining / len(active) for ticker in active}
-            else:
-                proposed = {
-                    ticker: remaining * desired_risk[ticker] / preference_total
-                    for ticker in active
-                }
-
-            saturated = [
-                ticker
-                for ticker in active
-                if proposed[ticker] >= max_weight - allocated[ticker] - 1e-12
-            ]
-            if not saturated:
-                for ticker in active:
-                    allocated[ticker] += proposed[ticker]
-                remaining = 0.0
-                break
-
-            for ticker in saturated:
-                capacity = max_weight - allocated[ticker]
-                allocated[ticker] = max_weight
-                remaining -= capacity
-                active.remove(ticker)
-
-        unallocated = 1.0 - sum(allocated.values())
-        if unallocated > 1e-9:
-            if not has_cash_equivalent:
-                raise ValueError(
-                    "Risk target is infeasible without BIL: the active assets "
-                    "cannot absorb 100% within max_asset_weight."
-                )
-            allocated["BIL"] = unallocated
-        elif has_cash_equivalent and cash_target > 0.0:
-            allocated["BIL"] = max(unallocated, 0.0)
-
-        return allocated
+        cash = self._cash_bucket()
+        residual = 1.0 - sum(allocated.values())
+        allocated[cash] = max(residual, cash_target, 0.0)
+        total_allocated = sum(allocated.values())
+        if total_allocated < 1.0 - 1e-9:
+            allocated[cash] += 1.0 - total_allocated
+        elif total_allocated > 1.0 + 1e-9:
+            allocated[cash] = max(0.0, allocated[cash] - (total_allocated - 1.0))
+        return {ticker: weight for ticker, weight in allocated.items() if weight > 1e-12}
 
     def pre_trade_check(self, weights: Dict[str, float]) -> Tuple[bool, str]:
         if not all(np.isfinite(v) for v in weights.values()):
@@ -168,11 +137,20 @@ class RiskEngine:
             return False, f"Weights do not sum close to 1.0: {total:.4f}"
 
         for ticker, weight in weights.items():
-            is_cash_equivalent = ticker == "BIL" and "BIL" in self.config.universe
+            is_cash_equivalent = self._is_cash(ticker)
             if not is_cash_equivalent and weight > self.config.max_asset_weight + 1e-9:
                 return (
                     False,
                     f"{ticker} weight {weight:.4f} exceeds max_asset_weight "
                     f"{self.config.max_asset_weight:.4f}.",
+                )
+            if (
+                not is_cash_equivalent
+                and 1e-9 < weight < self.config.min_asset_weight - 1e-9
+            ):
+                return (
+                    False,
+                    f"{ticker} weight {weight:.4f} is below min_asset_weight "
+                    f"{self.config.min_asset_weight:.4f}.",
                 )
         return True, "OK"

@@ -8,10 +8,13 @@ Postgres/MySQL switch a one-line URL change.
 from __future__ import annotations
 
 from storage.repositories.experiments import ExperimentRepository
+from storage.repositories.governance import GovernanceRepository
+from storage.repositories.execution import ExecutionRepository
 from storage.repositories.market_data import MarketDataRepository
 from storage.repositories.orders import OrderRepository
 from storage.repositories.portfolio import PortfolioRepository
 from storage.repositories.signals import SignalRepository
+from storage.repositories.trusted_data import TrustedMarketDataRepository
 
 __all__ = [
     "ExperimentRepository",
@@ -19,4 +22,7 @@ __all__ = [
     "OrderRepository",
     "SignalRepository",
     "MarketDataRepository",
+    "TrustedMarketDataRepository",
+    "GovernanceRepository",
+    "ExecutionRepository",
 ]

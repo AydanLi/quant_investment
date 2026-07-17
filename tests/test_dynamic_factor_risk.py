@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+import pytest
 
 from config.settings import Config
 from risk.covariance import DynamicFactorRiskModel
@@ -80,3 +81,19 @@ def test_invalid_dynamic_factor_settings_are_rejected():
             pass
         else:
             raise AssertionError("Expected invalid risk-model configuration to fail.")
+
+
+def test_dynamic_risk_model_failure_blocks_instead_of_silently_skipping_scaling():
+    engine = RiskEngine(
+        Config(
+            universe=["SPY", "QQQ", "BIL"],
+            max_asset_weight=1.0,
+            risk_model="dynamic_factor",
+        )
+    )
+    returns = _correlated_returns().head(20)
+
+    with pytest.raises(ValueError, match="could not produce"):
+        engine.scale_to_target_vol(
+            returns.index[-1], {"SPY": 0.5, "QQQ": 0.5}, returns
+        )

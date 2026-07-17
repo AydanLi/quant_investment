@@ -14,18 +14,22 @@ class RegimeDetector:
         fear = self.config.fear_gauge
 
         if benchmark not in prices.columns or fear not in prices.columns:
-            return "neutral"
+            raise ValueError("Regime classification requires benchmark and VIX data.")
 
         try:
             benchmark_price = prices.at[date, benchmark]
             vix = prices.at[date, fear]
             ma_200 = features["ma_200"].at[date, benchmark]
             dd_200 = features["drawdown_200"].at[date, benchmark]
-        except Exception:
-            return "neutral"
+        except (KeyError, TypeError) as exc:
+            raise ValueError(
+                f"Regime inputs are incomplete for {pd.Timestamp(date).date()}."
+            ) from exc
 
         if pd.isna(benchmark_price) or pd.isna(vix) or pd.isna(ma_200) or pd.isna(dd_200):
-            return "neutral"
+            raise ValueError(
+                f"Regime inputs contain missing values for {pd.Timestamp(date).date()}."
+            )
 
         if vix >= self.config.vix_risk_off_threshold or dd_200 <= self.config.max_allowed_drawdown_from_200d:
             return "risk_off"

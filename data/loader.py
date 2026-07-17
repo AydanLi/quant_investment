@@ -21,7 +21,7 @@ _CACHE_TO_TITLE = {
 
 
 class MarketDataLoader:
-    """Loads OHLCV data, backed by a local cache.
+    """Legacy adjusted-price cache kept only for compatibility and migration.
 
     On first use the requested range is downloaded from yfinance and written to
     the ``market_data`` table; subsequent loads are served from the cache, with
@@ -134,7 +134,7 @@ class MarketDataLoader:
             tickers=tickers,
             start=start,
             end=end,
-            auto_adjust=True,
+        auto_adjust=False,
             progress=False,
             group_by="ticker",
             threads=True,
@@ -291,7 +291,7 @@ class MarketDataLoader:
         if self.repo is None or not frames:
             return
         try:
-            self.repo.upsert_prices(frames, auto_adjusted=True, source="yfinance")
+            self.repo.upsert_prices(frames, auto_adjusted=False, source="yfinance_raw_legacy")
         except Exception:
             # Caching is an optimization; never let it break the load.
             pass
