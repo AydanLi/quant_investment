@@ -13,22 +13,32 @@
 - A provider HTTP 429 exits with `provider_rate_limit`; wait for the documented
   provider quota reset and rerun. Do not rotate credentials, silently switch to
   Yahoo, or treat an incomplete fetch as a trusted snapshot.
+- The free Tiingo plan permits 50 requests per hour. The 25-symbol snapshot uses
+  25 authenticated price-history requests; metadata comes from Tiingo's daily
+  `supported_tickers.zip` bulk catalog and does not consume per-symbol API
+  requests. The provider enforces a local 50-request preflight budget before it
+  starts a batch.
 
 ## 2. Data incident workflow
 
 1. Stop signal/order generation when the snapshot is blocked.
 2. Record provider, ticker, date, raw values, retrieval time and issue code.
-3. Check the primary authoritative source and an independent source. Do not
+3. Check the primary authoritative source and an independent source. Normalize
+   each vendor's documented split basis before comparing historical prices or
+   per-share distributions; retain the original rows unchanged. Do not
    overwrite the original provider row.
 4. Wait for a provider correction or create a separately reviewed resolution
    policy/version. Never silently suppress a discrepancy.
 5. Fetch again and create a new immutable snapshot. Do not change the old
    snapshot or reuse its ID.
 
-The 2026-07-17 smoke test found a real unresolved example: official CBOE VIX
-close was 17.76 for 2026-02-06 while Yahoo reported 20.37. The >20 bp rule
-correctly blocks the snapshot. No exception has been assumed; the user must
-approve any future adjudication policy.
+The 2026-07-17 smoke test found a real discrepancy: official CBOE VIX close was
+17.76 for 2026-02-06 while Yahoo reported 20.37. From 2026-07-19 onward, VIX is
+validated against FRED `VIXCLS`, whose documented underlying source is CBOE.
+This gives a separate official publication path but not an independently
+calculated index. Yahoo remains the ETF validation source and is no longer used
+as the blocking VIX source. CBOE/FRED differences still use the same 5 bp
+warning and 20 bp blocking thresholds; no discrepancy is silently suppressed.
 
 ## 3. Research sequence
 
@@ -42,7 +52,9 @@ approve any future adjudication policy.
    `python -m scripts.validate_dynamic_factor_model --snapshot-id <id> --strategy-version <version>`
 
 6. Keep sample covariance if no candidate passes.
-7. Start the paper clock only after the final strategy version is frozen.
+7. Start the local simulation clock only after the final strategy version is
+   frozen. It does not count as broker-paper validation unless a future
+   strategy version explicitly enters `BROKER_PAPER` mode.
 
 Any change to the seed pool, filter rules, parameter grid, signal, cost formula,
 or execution method requires a new strategy version and a new 12-month paper
@@ -77,10 +89,22 @@ does not restart the clock.
 Every incident must retain trigger value, realized outcome, snapshots, operator,
 timestamps and recovery authorization.
 
-## 6. Paper/live gates
+## 6. Simulation and future broker gates
 
-Do not enable live IBKR methods until all missing account and permission inputs
-are supplied and tested in paper. Paper admission requires 12 months, 12
-completed rebalances and at least 30 fills. The first live review is for a
-$10,000 cash account, fractional orders only when explicitly supported, no
-margin, leverage, shorting, or automatic order approval.
+The active configuration is `PERSONAL_RESEARCH`: local simulated fills are
+allowed, while external broker connectivity and live submission are both
+disabled. An external paper adapter requires the separate `BROKER_PAPER` mode
+and an explicit connectivity switch. Future live use requires `MANUAL_LIVE`
+plus both connectivity and live-submission switches; every order still needs
+individual human approval.
+
+Do not enable any IBKR method until the missing account, permission, market
+data, commission, fractional-order, and TWS/Gateway inputs are supplied and
+tested in broker paper. Broker-paper admission requires 12 months, 12 completed
+rebalances and at least 30 fills. The first live review is for a $10,000 cash
+account, fractional orders only when explicitly supported, no margin, leverage,
+shorting, or automatic order approval.
+
+External alerts remain disabled until the user selects a channel and supplies
+its credentials. Dashboard state, structured logs, and risk-incident records
+remain mandatory even after an alert channel is added.

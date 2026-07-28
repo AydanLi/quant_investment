@@ -6,12 +6,18 @@ from typing import Mapping
 import pandas as pd
 
 from config.settings import Config
-from config.universe import EligibilityRules, UniversePolicy, UniverseVersion
+from config.universe import (
+    INITIAL_SECURITY_CLASSIFICATION,
+    EligibilityRules,
+    UniversePolicy,
+    UniverseVersion,
+)
 from data.adjustments import locally_adjust_ohlcv
 from data.calendar import NyseCalendar
 from data.models import DataQualityReport, ProviderPayload
 from data.providers import (
     CboeVixProvider,
+    FredVixProvider,
     MarketDataProvider,
     ProviderError,
     TiingoMarketDataProvider,
@@ -37,6 +43,7 @@ class TrustedMarketDataLoader:
         primary_provider: MarketDataProvider | None = None,
         secondary_provider: MarketDataProvider | None = None,
         vix_provider: CboeVixProvider | None = None,
+        vix_validation_provider: FredVixProvider | None = None,
         repository: TrustedMarketDataRepository | None = None,
         calendar: NyseCalendar | None = None,
         as_of: pd.Timestamp | None = None,
@@ -46,6 +53,7 @@ class TrustedMarketDataLoader:
         self.calendar = calendar or NyseCalendar()
         self.as_of = as_of
         self.vix_provider = vix_provider or CboeVixProvider()
+        self.vix_validation_provider = vix_validation_provider or FredVixProvider()
         self.primary_provider = primary_provider or self._default_primary()
         if secondary_provider is not None:
             self.secondary_provider = secondary_provider
@@ -74,21 +82,48 @@ class TrustedMarketDataLoader:
     def _provider_payload(self, provider: MarketDataProvider) -> ProviderPayload:
         tickers = sorted(set(self.config.universe + [self.config.benchmark]))
         provider_tickers = [ticker for ticker in tickers if ticker != self.config.fear_gauge]
-        if provider.name == "yahoo":
-            provider_tickers.append(self.config.fear_gauge)
         payload = provider.fetch(provider_tickers, self.config.start_date, self.config.end_date)
         bars = dict(payload.bars)
         metadata = dict(payload.metadata)
+        for ticker in provider_tickers:
+            provider_basis = (
+                "as_traded"
+                if provider.name == "tiingo"
+                else "current_share_basis" if provider.name == "yahoo" else "unknown"
+            )
+            if ticker in INITIAL_SECURITY_CLASSIFICATION:
+                metadata[ticker] = {
+                    **INITIAL_SECURITY_CLASSIFICATION[ticker],
+                    **metadata.get(ticker, {}),
+                    "source": provider.name,
+                    "price_split_basis": provider_basis,
+                    "dividend_split_basis": provider_basis,
+                }
+            else:
+                metadata[ticker] = {
+                    **metadata.get(ticker, {}),
+                    "source": provider.name,
+                    "price_split_basis": provider_basis,
+                    "dividend_split_basis": provider_basis,
+                }
         if self.config.fear_gauge not in bars:
-            if provider.name != "tiingo":
+            if provider.name == "tiingo":
+                vix_provider = self.vix_provider
+            elif provider.name == "yahoo":
+                vix_provider = self.vix_validation_provider
+            else:
                 raise ProviderError(
                     f"{provider.name} did not return {self.config.fear_gauge}."
                 )
-            bars[self.config.fear_gauge] = self.vix_provider.fetch(
+            bars[self.config.fear_gauge] = vix_provider.fetch(
                 self.config.start_date, self.config.end_date
             )
-            metadata[self.config.fear_gauge] = {"source": self.vix_provider.name}
-        source = provider.name if provider.name != "tiingo" else "tiingo+cboe"
+            metadata[self.config.fear_gauge] = {
+                "source": vix_provider.name,
+                "validation_role": "official_close_redistribution",
+            }
+        vix_source = metadata.get(self.config.fear_gauge, {}).get("source")
+        source = provider.name if not vix_source else f"{provider.name}+{vix_source}"
         return ProviderPayload(
             bars=bars,
             actions=payload.actions,

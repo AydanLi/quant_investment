@@ -22,6 +22,7 @@ quant_research_v2.db*
 # Legacy DB backup kept from the v2 cutover
 quant_research_legacy_backup.db*
 quant_research_before_v3_*.db*
+quant_research_before_snapshot_*.db*
 
 # SQLite sidecar files (WAL mode)
 *.db-wal

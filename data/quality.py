@@ -116,12 +116,63 @@ def _quality_snapshot_hash(
     ).hexdigest()
 
 
+def _split_normalized_close(payload: ProviderPayload, ticker: str) -> pd.Series:
+    """Return a distribution-unadjusted close on the current share basis.
+
+    Tiingo preserves as-traded historical prices while Yahoo rewrites OHLC for
+    later splits. Comparing either representation directly produces thousands
+    of false discrepancies. The transformation is used only for QA; immutable
+    vendor rows remain untouched.
+    """
+    close = payload.bars[ticker]["Close"].astype(float).copy()
+    basis = payload.metadata.get(ticker, {}).get("price_split_basis")
+    if basis != "as_traded":
+        return close
+    for raw_action in payload.actions:
+        action = raw_action.normalized()
+        if action.ticker != ticker.upper() or action.action_type != "split":
+            continue
+        if action.split_factor <= 0.0:
+            continue
+        close.loc[close.index < action.ex_date] /= action.split_factor
+    return close
+
+
+def _cash_on_current_share_basis(
+    action: CorporateAction,
+    all_actions: Iterable[CorporateAction],
+    *,
+    basis: object,
+) -> float:
+    value = float(action.cash_amount)
+    if basis != "as_traded":
+        return value
+    for raw_split in all_actions:
+        split = raw_split.normalized()
+        if (
+            split.ticker == action.ticker
+            and split.action_type == "split"
+            and split.ex_date > action.ex_date
+            and split.split_factor > 0.0
+        ):
+            value /= split.split_factor
+    return value
+
+
 def _compare_actions(
-    primary: Iterable[CorporateAction],
-    secondary: Iterable[CorporateAction],
+    primary: ProviderPayload,
+    secondary: ProviderPayload,
 ) -> list[DataQualityIssue]:
-    primary_map = {_action_key(item): item.normalized() for item in primary}
-    secondary_map = {_action_key(item): item.normalized() for item in secondary}
+    primary_actions = tuple(item.normalized() for item in primary.actions)
+    secondary_actions = tuple(item.normalized() for item in secondary.actions)
+    primary_splits = tuple(
+        item for item in primary_actions if item.action_type == "split"
+    )
+    secondary_splits = tuple(
+        item for item in secondary_actions if item.action_type == "split"
+    )
+    primary_map = {_action_key(item): item for item in primary_actions}
+    secondary_map = {_action_key(item): item for item in secondary_actions}
     issues: list[DataQualityIssue] = []
     for key in sorted(set(primary_map).union(secondary_map)):
         left = primary_map.get(key)
@@ -142,11 +193,36 @@ def _compare_actions(
             # while Tiingo retains six. Differences no larger than one half of
             # Yahoo's last published decimal are representation rounding, not
             # an economic corporate-action conflict.
+            left_cash = _cash_on_current_share_basis(
+                left,
+                primary_splits,
+                basis=primary.metadata.get(left.ticker, {}).get(
+                    "dividend_split_basis"
+                ),
+            )
+            right_cash = _cash_on_current_share_basis(
+                right,
+                secondary_splits,
+                basis=secondary.metadata.get(right.ticker, {}).get(
+                    "dividend_split_basis"
+                ),
+            )
+            # Add a sub-micro-dollar guard for binary floating representation
+            # at the exact half-mill boundary; economically larger differences
+            # remain blocked.
             mismatch = not np.isclose(
-                left.cash_amount, right.cash_amount, rtol=0.0, atol=0.0005
+                left_cash, right_cash, rtol=0.0, atol=0.0005001
             )
         else:
-            mismatch = not np.isclose(left.split_factor, right.split_factor, rtol=0.0, atol=1e-8)
+            # Vendors can serialize a 3-for-1 action as 3 or 3.000003. A
+            # one-part-per-million relative tolerance accepts representation
+            # noise without accepting economically different split factors.
+            mismatch = not np.isclose(
+                left.split_factor,
+                right.split_factor,
+                rtol=1e-6,
+                atol=1e-8,
+            )
         if mismatch:
             issues.append(
                 DataQualityIssue(
@@ -211,7 +287,7 @@ def assess_market_data_quality(
             DataQualityIssue(
                 QualitySeverity.BLOCK,
                 "SECONDARY_SOURCE_MISSING",
-                "Actionable signals require an independent secondary source.",
+                "Actionable signals require an approved secondary publication source.",
             )
         )
     else:
@@ -229,7 +305,10 @@ def assess_market_data_quality(
                 )
                 continue
             aligned = pd.concat(
-                [left["Close"].rename("primary"), right["Close"].rename("secondary")],
+                [
+                    _split_normalized_close(primary, ticker).rename("primary"),
+                    _split_normalized_close(secondary, ticker).rename("secondary"),
+                ],
                 axis=1,
                 join="inner",
             ).dropna()
@@ -256,7 +335,7 @@ def assess_market_data_quality(
                     DataQualityIssue(
                         severity,
                         "CROSS_SOURCE_CLOSE_MISMATCH",
-                        f"{ticker} raw closes differ by {value:.2f} bp.",
+                        f"{ticker} split-normalized closes differ by {value:.2f} bp.",
                         ticker=ticker,
                         session=str(pd.Timestamp(session).date()),
                         value=float(value),
@@ -267,7 +346,10 @@ def assess_market_data_quality(
             secondary_returns = right["Close"].astype(float).pct_change(fill_method=None)
             # The 10% confirmation gate is an ETF rule. VIX is a volatility
             # index, where moves of this size are routine; it remains subject
-            # to the independent CBOE/Yahoo close-difference checks above.
+            # to the CBOE/FRED VIXCLS close-difference checks above. FRED is an
+            # independent publication path, but its stated underlying source
+            # is still CBOE, so this is not represented as an independent
+            # calculation of the index.
             extreme = (
                 pd.Series(dtype=float)
                 if ticker == config.fear_gauge
@@ -303,7 +385,7 @@ def assess_market_data_quality(
                         value=float(value),
                     )
                 )
-        issues.extend(_compare_actions(primary.actions, secondary.actions))
+        issues.extend(_compare_actions(primary, secondary))
 
     if any(issue.severity == QualitySeverity.BLOCK for issue in issues):
         status = DataQualityStatus.BLOCKED

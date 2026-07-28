@@ -421,7 +421,19 @@ class TrustedMarketDataRepository(BaseRepository):
                 columns={value: key for key, value in _BAR_MAP.items()}
             )
             bars[ticker] = frame[list(_BAR_MAP)].astype(float)
-            metadata[ticker] = {"source": rows[0]["source"]}
+            source = str(rows[0]["source"])
+            split_basis = (
+                "as_traded"
+                if source == "tiingo"
+                else "current_share_basis"
+                if source.startswith("yahoo")
+                else "unknown"
+            )
+            metadata[ticker] = {
+                "source": source,
+                "price_split_basis": split_basis,
+                "dividend_split_basis": split_basis,
+            }
         actions = tuple(
             CorporateAction(
                 ticker=str(row["ticker"]),

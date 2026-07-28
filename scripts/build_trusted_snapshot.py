@@ -30,7 +30,7 @@ def _database_url(database: str) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Build and persist a full immutable Tiingo/Yahoo/CBOE snapshot."
+        description="Build a Tiingo/Yahoo ETF plus CBOE/FRED VIX snapshot."
     )
     parser.add_argument("--database", default="quant_research.db")
     parser.add_argument("--start", default="2006-01-01")
@@ -85,6 +85,8 @@ def main() -> None:
         "universe_version": config.universe_version,
         "universe_version_recorded": loader.universe_version_recorded,
         "historical_universe_integrity": config.historical_universe_integrity,
+        "tiingo_requests_used": loader.primary_provider.request_count,
+        "tiingo_hourly_request_limit": loader.primary_provider.hourly_request_limit,
         "issue_counts": dict(sorted(issue_counts.items())),
     }
     print(json.dumps(output, ensure_ascii=False, indent=2))

@@ -8,6 +8,7 @@ from sqlalchemy import inspect, text
 
 from storage.db import create_all, create_db_engine
 from storage.repositories.portfolio import PortfolioRepository
+from storage.repositories.trusted_data import TrustedMarketDataRepository
 from storage.schema import experiment_runs
 
 
@@ -100,6 +101,26 @@ def test_migration_preserves_legacy_rows_as_null_and_is_reversible(
         "est_trading_cost",
         "est_slippage",
     }.issubset(upgraded_columns)
+    raw_columns = {
+        column["name"]
+        for column in inspect(upgraded_engine).get_columns("raw_market_data")
+    }
+    assert "role" not in raw_columns
+    TrustedMarketDataRepository(engine=upgraded_engine).upsert_raw_bars(
+        {
+            "SPY": pd.DataFrame(
+                {
+                    "Open": [100.0],
+                    "High": [101.0],
+                    "Low": [99.0],
+                    "Close": [100.5],
+                    "Volume": [1_000_000.0],
+                },
+                index=pd.to_datetime(["2026-07-16"]),
+            )
+        },
+        source="migration-test",
+    )
     with upgraded_engine.connect() as conn:
         row = conn.execute(
             text(
@@ -109,10 +130,12 @@ def test_migration_preserves_legacy_rows_as_null_and_is_reversible(
                 """
             )
         ).mappings().one()
+        raw_count = conn.execute(text("SELECT COUNT(*) FROM raw_market_data")).scalar_one()
     assert row["gross_return"] is None
     assert row["est_trading_cost"] is None
     assert row["est_slippage"] is None
     assert row["est_cost"] == pytest.approx(0.0007)
+    assert raw_count == 1
     upgraded_engine.dispose()
 
     command.downgrade(alembic_config, "b91e2f08c4a1")

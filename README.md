@@ -1,15 +1,15 @@
 # Quant System v3
 
 A modular ETF rotation quant framework with:
-- Tiingo/Yahoo/CBOE raw-data ingestion with immutable snapshots
+- Tiingo/Yahoo ETF data plus CBOE/FRED VIX ingestion with immutable snapshots
 - Feature engineering
 - Regime detection
 - Momentum rotation strategy
 - Sample-covariance baseline plus separately gated dynamic-risk candidates
 - Risk engine
 - Backtesting engine
-- T+1 quantity/cash ledger and human-approved paper OMS
-- Connection-blocked IBKR adapter boundary
+- T+1 quantity/cash ledger and broker-isolated simulated OMS
+- Two-switch connection-blocked IBKR adapter boundary for future manual use
 - Read-only external brokerage position snapshots
 - Reporting
 - Latest allocation signal service
@@ -21,6 +21,9 @@ Current architecture and system boundaries are documented in
 [`quant_system_architecture_overview.md`](quant_system_architecture_overview.md).
 Operational procedures are in
 [`docs/upgrade_v3_runbook.md`](docs/upgrade_v3_runbook.md).
+The confirmed personal-research, tax-account, alert, and historical-universe
+decisions are recorded in
+[`docs/personal_research_operating_profile.md`](docs/personal_research_operating_profile.md).
 
 ## 1. Install
 
@@ -211,7 +214,7 @@ alembic current
 ```
 
 The expected result is a fully passing suite and Alembic revision
-`c8e3f1047a92 (head)`. Project code emits no compatibility
+`a14f0c9d7e62 (head)`. Project code emits no compatibility
 deprecation warnings in the current suite. A local pytest cache ACL warning may
 still appear on this Windows checkout and does not come from application code.
 

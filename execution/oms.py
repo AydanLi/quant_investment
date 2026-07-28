@@ -24,6 +24,16 @@ from execution.pretrade import PreTradeVerification
 
 class OrderManagementSystem:
     def __init__(self, config: Config, broker: BrokerAdapter) -> None:
+        config.validate_execution_mode()
+        if broker.external_connectivity and not config.broker_connectivity_enabled:
+            raise ValueError(
+                "External broker connectivity is disabled in the current operating mode."
+            )
+        if (
+            broker.environment == BrokerEnvironment.LIVE
+            and not config.live_order_submission_enabled
+        ):
+            raise ValueError("Live order submission is disabled by configuration.")
         self.config = config
         self.broker = broker
         self._intents: dict[str, OrderIntent] = {}

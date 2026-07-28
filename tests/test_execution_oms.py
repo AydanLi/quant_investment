@@ -16,6 +16,8 @@ from execution import (
     Quote,
     reconcile_account,
 )
+from execution.adapters import IbkrBrokerAdapter
+from execution.models import BrokerEnvironment
 from services.models import SignalDecision, SignalStatus
 
 
@@ -193,3 +195,35 @@ def test_oms_uses_configured_impact_coefficient_and_0935_execution_gate():
         verification=VERIFIED,
     )
     assert all(intent.estimated_impact_bps == pytest.approx(25.0) for intent in drafts)
+
+
+def test_personal_research_mode_blocks_external_broker_but_allows_simulation():
+    broker, _, _ = _broker()
+    OrderManagementSystem(Config(), broker)
+
+    ibkr = IbkrBrokerAdapter(
+        host="127.0.0.1",
+        port=7497,
+        client_id=1,
+        account_ref="paper-placeholder",
+    )
+    with pytest.raises(ValueError, match="External broker connectivity"):
+        OrderManagementSystem(Config(), ibkr)
+
+
+def test_future_manual_live_mode_requires_all_explicit_switches():
+    with pytest.raises(ValueError, match="MANUAL_LIVE"):
+        Config(operating_mode="MANUAL_LIVE").validate_execution_mode()
+
+    class _LiveBroker(InMemoryPaperBroker):
+        environment = BrokerEnvironment.LIVE
+        external_connectivity = True
+
+    paper, account, quotes = _broker()
+    live = _LiveBroker(account, quotes)
+    config = Config(
+        operating_mode="MANUAL_LIVE",
+        broker_connectivity_enabled=True,
+        live_order_submission_enabled=True,
+    )
+    OrderManagementSystem(config, live)

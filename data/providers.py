@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from io import StringIO
+from io import BytesIO, StringIO
 import os
 from typing import Mapping, Sequence
+from zipfile import ZipFile
 
 import pandas as pd
 import requests
@@ -152,19 +153,59 @@ class YahooMarketDataProvider(MarketDataProvider):
 class TiingoMarketDataProvider(MarketDataProvider):
     name = "tiingo"
     base_url = "https://api.tiingo.com/tiingo/daily"
+    bulk_metadata_url = (
+        "https://apimedia.tiingo.com/docs/tiingo/daily/supported_tickers.zip"
+    )
 
     def __init__(
         self,
         token: str | None = None,
         session: requests.Session | None = None,
         timeout_seconds: float = 30.0,
+        hourly_request_limit: int = 50,
+        use_bulk_metadata: bool = True,
     ) -> None:
         self.token = token or os.getenv("TIINGO_API_TOKEN")
         if not self.token:
             raise ProviderError("TIINGO_API_TOKEN is required for trusted market data.")
         self.session = session or requests.Session()
         self.timeout_seconds = timeout_seconds
+        if hourly_request_limit <= 0:
+            raise ValueError("hourly_request_limit must be positive.")
+        self.hourly_request_limit = int(hourly_request_limit)
+        self.use_bulk_metadata = bool(use_bulk_metadata)
+        self._request_count = 0
         self._payload_cache: dict[tuple[str, str | None, str | None], list[dict]] = {}
+        self._metadata_cache: dict[str, Mapping[str, object]] = {}
+        self._catalog_cache: pd.DataFrame | None = None
+
+    @property
+    def request_count(self) -> int:
+        return self._request_count
+
+    @property
+    def remaining_request_budget(self) -> int:
+        return max(self.hourly_request_limit - self._request_count, 0)
+
+    def _get(self, url: str, **kwargs):  # noqa: ANN003, ANN201
+        if self.remaining_request_budget <= 0:
+            raise ProviderRateLimitError(self.name, retry_after="next hourly reset")
+        self._request_count += 1
+        return self.session.get(url, **kwargs)
+
+    def fetch(self, tickers, start, end):  # noqa: ANN001
+        unique_tickers = tuple(dict.fromkeys(str(ticker).upper() for ticker in tickers))
+        required_requests = sum(
+            (ticker, start, end) not in self._payload_cache
+            for ticker in unique_tickers
+        )
+        if not self.use_bulk_metadata:
+            required_requests += sum(
+                ticker not in self._metadata_cache for ticker in unique_tickers
+            )
+        if required_requests > self.remaining_request_budget:
+            raise ProviderRateLimitError(self.name, retry_after="next hourly reset")
+        return super().fetch(unique_tickers, start, end)
 
     def _prices(self, ticker: str, start: str | None, end: str | None) -> list[dict]:
         key = (ticker, start, end)
@@ -175,7 +216,7 @@ class TiingoMarketDataProvider(MarketDataProvider):
             params["startDate"] = start
         if end:
             params["endDate"] = end
-        response = self.session.get(
+        response = self._get(
             f"{self.base_url}/{ticker}/prices",
             params=params,
             headers={"Authorization": f"Token {self.token}"},
@@ -229,9 +270,37 @@ class TiingoMarketDataProvider(MarketDataProvider):
         return tuple(action.normalized() for action in actions)
 
     def fetch_metadata(self, tickers):  # noqa: ANN001
+        if self.use_bulk_metadata:
+            catalog = self._load_bulk_catalog()
+            result: dict[str, Mapping[str, object]] = {}
+            for raw_ticker in tickers:
+                ticker = str(raw_ticker).upper()
+                if ticker not in catalog.index:
+                    raise ProviderError(
+                        f"Tiingo bulk metadata has no entry for {ticker}."
+                    )
+                row = catalog.loc[ticker]
+                if isinstance(row, pd.DataFrame):
+                    row = row.iloc[-1]
+                metadata = {
+                    "ticker": ticker,
+                    "exchangeCode": row.get("exchange"),
+                    "assetType": row.get("assetType"),
+                    "priceCurrency": row.get("priceCurrency"),
+                    "startDate": row.get("startDate"),
+                    "endDate": row.get("endDate"),
+                    "metadataMode": "supported_tickers_bulk_catalog",
+                }
+                self._metadata_cache[ticker] = metadata
+                result[ticker] = metadata
+            return result
+
         result: dict[str, Mapping[str, object]] = {}
         for ticker in tickers:
-            response = self.session.get(
+            if ticker in self._metadata_cache:
+                result[ticker] = self._metadata_cache[ticker]
+                continue
+            response = self._get(
                 f"{self.base_url}/{ticker}",
                 headers={"Authorization": f"Token {self.token}"},
                 timeout=self.timeout_seconds,
@@ -244,8 +313,43 @@ class TiingoMarketDataProvider(MarketDataProvider):
             if response.status_code != 200:
                 raise ProviderError(f"Tiingo metadata failed for {ticker}: HTTP {response.status_code}")
             payload = response.json()
-            result[ticker] = payload if isinstance(payload, dict) else {}
+            metadata = payload if isinstance(payload, dict) else {}
+            self._metadata_cache[ticker] = metadata
+            result[ticker] = metadata
         return result
+
+    def _load_bulk_catalog(self) -> pd.DataFrame:
+        if self._catalog_cache is not None:
+            return self._catalog_cache
+        response = self.session.get(
+            self.bulk_metadata_url,
+            timeout=self.timeout_seconds,
+        )
+        if response.status_code != 200:
+            raise ProviderError(
+                f"Tiingo bulk metadata failed: HTTP {response.status_code}"
+            )
+        try:
+            with ZipFile(BytesIO(response.content)) as archive:
+                csv_names = [name for name in archive.namelist() if name.endswith(".csv")]
+                if len(csv_names) != 1:
+                    raise ValueError("expected one CSV")
+                catalog = pd.read_csv(archive.open(csv_names[0]), dtype=str)
+        except Exception as exc:
+            raise ProviderError("Tiingo bulk metadata returned an invalid archive.") from exc
+        required = {
+            "ticker",
+            "exchange",
+            "assetType",
+            "priceCurrency",
+            "startDate",
+            "endDate",
+        }
+        if not required.issubset(catalog.columns):
+            raise ProviderError("Tiingo bulk metadata is missing required fields.")
+        catalog["ticker"] = catalog["ticker"].astype(str).str.upper()
+        self._catalog_cache = catalog.set_index("ticker").sort_index()
+        return self._catalog_cache
 
 
 class CboeVixProvider:
@@ -274,6 +378,38 @@ class CboeVixProvider:
         return frame[["Open", "High", "Low", "Close", "Volume"]]
 
 
+class FredVixProvider:
+    """Close-only VIX validation feed redistributed by the Federal Reserve."""
+
+    name = "fred_vixcls"
+    csv_url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=VIXCLS"
+
+    def __init__(self, session: requests.Session | None = None, timeout_seconds: float = 30.0) -> None:
+        self.session = session or requests.Session()
+        self.timeout_seconds = timeout_seconds
+
+    def fetch(self, start: str | None = None, end: str | None = None) -> pd.DataFrame:
+        response = self.session.get(self.csv_url, timeout=self.timeout_seconds)
+        if response.status_code != 200:
+            raise ProviderError(f"FRED VIXCLS failed: HTTP {response.status_code}")
+        frame = pd.read_csv(StringIO(response.text))
+        date_column = "DATE" if "DATE" in frame else "observation_date"
+        if date_column not in frame or "VIXCLS" not in frame:
+            raise ProviderError("FRED VIXCLS returned an invalid payload.")
+        frame[date_column] = pd.to_datetime(frame[date_column])
+        values = pd.to_numeric(frame["VIXCLS"], errors="coerce")
+        close = pd.Series(values.to_numpy(), index=frame[date_column]).dropna().sort_index()
+        if start:
+            close = close.loc[pd.Timestamp(start):]
+        if end:
+            close = close.loc[:pd.Timestamp(end)]
+        result = pd.DataFrame(index=close.index)
+        for column in ("Open", "High", "Low", "Close"):
+            result[column] = close
+        result["Volume"] = 0.0
+        return result
+
+
 class FredRiskFreeProvider:
     name = "fred_dgs3mo"
     csv_url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS3MO"
@@ -287,9 +423,14 @@ class FredRiskFreeProvider:
         if response.status_code != 200:
             raise ProviderError(f"FRED DGS3MO failed: HTTP {response.status_code}")
         frame = pd.read_csv(StringIO(response.text))
-        frame["DATE"] = pd.to_datetime(frame["DATE"])
+        date_column = "DATE" if "DATE" in frame else "observation_date"
+        if date_column not in frame or "DGS3MO" not in frame:
+            raise ProviderError("FRED DGS3MO returned an invalid payload.")
+        frame[date_column] = pd.to_datetime(frame[date_column])
         values = pd.to_numeric(frame["DGS3MO"], errors="coerce") / 100.0
-        annual_yield = pd.Series(values.to_numpy(), index=frame["DATE"], name="DGS3MO").sort_index().ffill()
+        annual_yield = pd.Series(
+            values.to_numpy(), index=frame[date_column], name="DGS3MO"
+        ).sort_index().ffill()
         if start:
             annual_yield = annual_yield.loc[pd.Timestamp(start):]
         if end:

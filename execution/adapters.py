@@ -15,6 +15,7 @@ from execution.models import (
 
 class BrokerAdapter(ABC):
     environment: BrokerEnvironment
+    external_connectivity = False
 
     @abstractmethod
     def account_snapshot(self) -> AccountSnapshot:
@@ -60,6 +61,8 @@ class IbkrBrokerAdapter(BrokerAdapter):
     ``ibapi`` dependency is imported only when ``connect`` is called, keeping
     research installations physically separated from broker connectivity.
     """
+
+    external_connectivity = True
 
     def __init__(
         self,
@@ -127,6 +130,7 @@ class InMemoryPaperBroker(BrokerAdapter):
     """Deterministic broker used only by OMS integration tests and paper drills."""
 
     environment = BrokerEnvironment.PAPER
+    external_connectivity = False
 
     def __init__(self, account: AccountSnapshot, quotes: dict[str, Quote]) -> None:
         self._account = account
@@ -161,4 +165,3 @@ class InMemoryPaperBroker(BrokerAdapter):
 
     def supports_fractional(self, ticker: str, order_type: str = "LMT") -> bool:
         return True
-

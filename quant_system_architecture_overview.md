@@ -1,9 +1,10 @@
 # Quant System v3 architecture overview
 
-Updated: 2026-07-17
+Updated: 2026-07-19
 
-The active platform is a research and paper-execution system for a long-only,
-cash-account ETF rotation strategy. It is **not live-admitted**. Legacy
+The active platform is a personal research and local-simulation system for a
+long-only, cash-account ETF rotation strategy. It is **not broker-connected or
+live-admitted**. Legacy
 `market_data` rows and all experiments without an immutable v3 dataset snapshot
 remain available for audit, but cannot enter rankings or admission decisions.
 
@@ -12,7 +13,7 @@ remain available for audit, but cannot enter rankings or admission decisions.
 ```text
 Tiingo raw ETF bars/actions ----+
 Yahoo raw bars/actions ---------+--> dual-source quality gate
-CBOE VIX / Yahoo VIX -----------+          |
+CBOE VIX / FRED VIXCLS ---------+          |
 NYSE calendar ------------------+          v
                                      immutable DatasetSnapshot
                                                |
@@ -38,7 +39,7 @@ NYSE calendar ------------------+          v
  AdmissionRun                           v
                                 T+1 pre-trade verification
                                        |
-                                human-approved paper OMS
+                                human-approved simulated OMS
                                        |
                                 IBKR adapter boundary
 ```
@@ -70,15 +71,19 @@ Executable quality rules are:
 
 - 0 stale NYSE sessions for actionable data;
 - 1 stale session is diagnostic only; 2 or more block;
-- raw close differences above 5 bp warn and above 20 bp block;
+- split-basis-normalized, distribution-unadjusted close differences above 5 bp
+  warn and above 20 bp block; original vendor rows remain immutable;
 - dividend/split conflicts block (provider display rounding is tolerated only
   within the documented decimal precision);
 - ETF raw returns over 10% require a second source or corporate action;
-- VIX is exempt from the ETF 10% rule but remains subject to CBOE/Yahoo close
-  comparison.
+- VIX is exempt from the ETF 10% rule but remains subject to a CBOE/FRED close
+  comparison. FRED `VIXCLS` is an official redistribution sourced from CBOE,
+  not an independently calculated index.
 
-The seed universe is the fixed 25-symbol list in `config/universe.py`. Risk ETFs
-need 756 sessions, 60-session median dollar volume of at least $25 million,
+The seed universe is the fixed 25-symbol list in `config/universe.py`. Its
+non-leveraged classification is explicitly recorded. Any newly proposed ticker
+with no reviewed leveraged/inverse classification fails closed. Risk ETFs need
+756 sessions, 60-session median dollar volume of at least $25 million,
 price of at least $5, at least 98% completeness, and no leveraged/inverse flag.
 Membership is calculated point in time and frozen by quarter. New proposals are
 drafts until manually approved and never backfilled.
@@ -172,7 +177,9 @@ The OMS enforces:
 - cancellation/review after a partial fill remains open ten minutes;
 - fractional orders only when the adapter confirms support.
 
-Research, paper, and live execution records are environment-scoped. The IBKR
+Research, paper, and live execution records are environment-scoped. The active
+`PERSONAL_RESEARCH` mode permits only local simulated fills; external broker
+connectivity and live submission are separate disabled switches. The IBKR
 adapter is intentionally connection-blocked until the user supplies account
 entity/region, paper permissions, market-data/fractional entitlements,
 commission plan, and TWS/Gateway settings. Constructing it cannot connect or
@@ -188,6 +195,8 @@ marked `invalid_data_v1` and `admissible=0`.
 Revision `c8e3f1047a92` adds average entry cost and gross/net realized P&L to
 backtest orders so trade win rate and profit factor are calculated from actual
 closed quantities instead of placeholders.
+Revision `a14f0c9d7e62` removes an accidental `role` column from mutable raw
+market data. Source roles remain attached only to immutable snapshot rows.
 
 Any admissible result must identify:
 

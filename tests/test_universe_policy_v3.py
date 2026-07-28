@@ -49,6 +49,20 @@ def test_universe_rejects_insufficient_history_low_liquidity_and_leverage():
     assert {"insufficient_history", "insufficient_dollar_volume", "leveraged_or_inverse"}.issubset(result.reasons)
 
 
+def test_unknown_security_fails_closed_without_leverage_classification():
+    sessions = NyseCalendar().sessions("2020-01-01", "2024-12-31")
+    frame = pd.DataFrame(
+        {"Close": 100.0, "Volume": 1_000_000.0}, index=sessions
+    )
+
+    result = UniversePolicy(seed_tickers=("NEWETF",)).assess(
+        "NEWETF", frame, as_of=sessions[-1], sessions=sessions
+    )
+
+    assert result.eligible is False
+    assert "leverage_classification_missing" in result.reasons
+
+
 def test_quarterly_change_only_becomes_effective_next_quarter():
     assert str(UniversePolicy.next_quarter_effective_date(pd.Timestamp("2026-07-17"))) == "2026-10-01"
 

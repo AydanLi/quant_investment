@@ -45,6 +45,13 @@ class Config:
 
     initial_capital: float = 10000.0
 
+    # The default installation is deliberately broker-isolated.  Simulated
+    # fills may use the in-memory paper adapter, but external broker sessions
+    # and live submissions require separate, explicit configuration changes.
+    operating_mode: str = "PERSONAL_RESEARCH"
+    broker_connectivity_enabled: bool = False
+    live_order_submission_enabled: bool = False
+
     cash_asset: str = CASH_ETF
     synthetic_cash_asset: str = SYNTHETIC_CASH
     execution_lag_sessions: int = 1
@@ -133,4 +140,28 @@ class Config:
         if self.daily_regime_overlay_enabled and not self.daily_regime_overlay_admitted:
             raise ValueError(
                 "Daily regime overlay cannot be enabled before independent admission."
+            )
+        self.validate_execution_mode()
+
+    def validate_execution_mode(self) -> None:
+        allowed = {"PERSONAL_RESEARCH", "BROKER_PAPER", "MANUAL_LIVE"}
+        if self.operating_mode not in allowed:
+            raise ValueError(
+                "operating_mode must be PERSONAL_RESEARCH, BROKER_PAPER, or MANUAL_LIVE."
+            )
+        if self.operating_mode == "PERSONAL_RESEARCH":
+            if self.broker_connectivity_enabled or self.live_order_submission_enabled:
+                raise ValueError(
+                    "PERSONAL_RESEARCH must remain isolated from external broker connectivity."
+                )
+        elif self.operating_mode == "BROKER_PAPER":
+            if not self.broker_connectivity_enabled:
+                raise ValueError("BROKER_PAPER requires broker_connectivity_enabled.")
+            if self.live_order_submission_enabled:
+                raise ValueError("BROKER_PAPER cannot enable live order submission.")
+        elif not (
+            self.broker_connectivity_enabled and self.live_order_submission_enabled
+        ):
+            raise ValueError(
+                "MANUAL_LIVE requires both broker connectivity and live submission enablement."
             )

@@ -20,7 +20,7 @@ from data.trusted_loader import TrustedMarketDataLoader
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Read-only Tiingo/Yahoo/CBOE entitlement and quality smoke test."
+        description="Validate Tiingo/Yahoo ETF plus CBOE/FRED VIX data."
     )
     parser.add_argument("--tickers", nargs="+", default=["SPY", "BIL"])
     parser.add_argument("--start", default="2025-01-01")
@@ -76,6 +76,8 @@ def main() -> None:
             for ticker in config.universe
         },
         "corporate_action_count": len(loader.primary_payload.actions),
+        "tiingo_requests_used": loader.primary_provider.request_count,
+        "tiingo_hourly_request_limit": loader.primary_provider.hourly_request_limit,
         "quality_status": report.status.value,
         "actionable": report.actionable,
         "expected_session": report.expected_session,

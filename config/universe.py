@@ -22,6 +22,13 @@ RISK_ETFS = (
 CASH_ETF = "BIL"
 SYNTHETIC_CASH = "CASH_USD"
 INITIAL_ETF_UNIVERSE = RISK_ETFS + (CASH_ETF,)
+INITIAL_SECURITY_CLASSIFICATION = {
+    ticker: {
+        "leveraged_or_inverse": False,
+        "classification_source": "manual_seed_review_2026-07-17",
+    }
+    for ticker in INITIAL_ETF_UNIVERSE
+}
 
 
 @dataclass(frozen=True)
@@ -144,11 +151,16 @@ class UniversePolicy:
         if data_completeness < self.rules.minimum_data_completeness:
             reasons.append("insufficient_data_completeness")
 
-        metadata = metadata or {}
-        if not self.rules.leveraged_and_inverse_allowed and bool(
-            metadata.get("leveraged_or_inverse", False)
-        ):
-            reasons.append("leveraged_or_inverse")
+        security_metadata = {
+            **INITIAL_SECURITY_CLASSIFICATION.get(ticker, {}),
+            **(metadata or {}),
+        }
+        if not self.rules.leveraged_and_inverse_allowed:
+            leverage_flag = security_metadata.get("leveraged_or_inverse")
+            if not isinstance(leverage_flag, bool):
+                reasons.append("leverage_classification_missing")
+            elif leverage_flag:
+                reasons.append("leveraged_or_inverse")
 
         return UniverseEligibility(
             ticker=ticker,

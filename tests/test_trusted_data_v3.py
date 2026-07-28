@@ -17,6 +17,7 @@ from data.models import (
     ProviderPayload,
 )
 from data.providers import (
+    FredVixProvider,
     ProviderError,
     ProviderRateLimitError,
     TiingoMarketDataProvider,
@@ -136,6 +137,109 @@ def test_vendor_decimal_rounding_is_not_treated_as_action_conflict():
     assert not any(issue.code == "CORPORATE_ACTION_VALUE_MISMATCH" for issue in report.issues)
 
 
+def test_exact_half_mill_dividend_rounding_survives_binary_float_noise():
+    config = Config(universe=["SPY"])
+    as_of = pd.Timestamp("2024-01-03 21:00", tz="America/New_York")
+    primary_action = CorporateAction(
+        "SPY", pd.Timestamp("2024-01-03"), "dividend", cash_amount=0.7615
+    )
+    secondary_action = replace(primary_action, cash_amount=0.762)
+
+    report = assess_market_data_quality(
+        _payload(100.0, source="primary", action=[primary_action]),
+        _payload(100.0, source="secondary", action=[secondary_action]),
+        required_tickers=["SPY"],
+        config=config,
+        as_of=as_of,
+    )
+
+    assert not any(
+        issue.code == "CORPORATE_ACTION_VALUE_MISMATCH" for issue in report.issues
+    )
+
+
+def test_split_basis_is_normalized_before_close_and_dividend_comparison():
+    dates = ["2017-11-29", "2017-11-30"]
+    primary_bars = _bars([45.0, 90.0], dates)
+    secondary_bars = _bars([90.0, 90.0], dates)
+    primary_actions = (
+        CorporateAction("BIL", "2017-01-03", "dividend", cash_amount=0.20, source="tiingo"),
+        CorporateAction("BIL", "2017-11-30", "split", split_factor=0.5, source="tiingo"),
+    )
+    secondary_actions = (
+        CorporateAction("BIL", "2017-01-03", "dividend", cash_amount=0.40, source="yahoo"),
+        CorporateAction("BIL", "2017-11-30", "split", split_factor=0.5, source="yahoo"),
+    )
+    primary = ProviderPayload(
+        bars={"BIL": primary_bars},
+        actions=primary_actions,
+        metadata={
+            "BIL": {
+                "price_split_basis": "as_traded",
+                "dividend_split_basis": "as_traded",
+            }
+        },
+        source="tiingo",
+    )
+    secondary = ProviderPayload(
+        bars={"BIL": secondary_bars},
+        actions=secondary_actions,
+        metadata={
+            "BIL": {
+                "price_split_basis": "current_share_basis",
+                "dividend_split_basis": "current_share_basis",
+            }
+        },
+        source="yahoo",
+    )
+
+    report = assess_market_data_quality(
+        primary,
+        secondary,
+        required_tickers=["BIL"],
+        config=Config(universe=["BIL"]),
+        as_of=pd.Timestamp("2017-11-30 21:00", tz="America/New_York"),
+    )
+
+    assert not any(
+        issue.code
+        in {"CROSS_SOURCE_CLOSE_MISMATCH", "CORPORATE_ACTION_VALUE_MISMATCH"}
+        for issue in report.issues
+    )
+
+
+def test_materially_different_split_factors_still_block():
+    primary_action = CorporateAction(
+        "SPY", "2024-01-03", "split", split_factor=3.000003, source="tiingo"
+    )
+    rounded_secondary = replace(primary_action, split_factor=3.0, source="yahoo")
+    wrong_secondary = replace(primary_action, split_factor=2.0, source="yahoo")
+    config = Config(universe=["SPY"])
+    as_of = pd.Timestamp("2024-01-03 21:00", tz="America/New_York")
+
+    rounded = assess_market_data_quality(
+        _payload(100.0, source="primary", action=[primary_action]),
+        _payload(100.0, source="secondary", action=[rounded_secondary]),
+        required_tickers=["SPY"],
+        config=config,
+        as_of=as_of,
+    )
+    wrong = assess_market_data_quality(
+        _payload(100.0, source="primary", action=[primary_action]),
+        _payload(100.0, source="secondary", action=[wrong_secondary]),
+        required_tickers=["SPY"],
+        config=config,
+        as_of=as_of,
+    )
+
+    assert not any(
+        issue.code == "CORPORATE_ACTION_VALUE_MISMATCH" for issue in rounded.issues
+    )
+    assert any(
+        issue.code == "CORPORATE_ACTION_VALUE_MISMATCH" for issue in wrong.issues
+    )
+
+
 def test_one_stale_session_is_diagnostic_and_two_sessions_are_blocked():
     config = Config(universe=["SPY"])
     one_day_frame = _bars([100.0, 101.0], ["2024-01-05", "2024-01-08"])
@@ -206,7 +310,11 @@ class _RecordingSession:
 
 def test_tiingo_token_is_sent_only_in_authorization_header():
     session = _RecordingSession()
-    provider = TiingoMarketDataProvider(token="test-secret", session=session)
+    provider = TiingoMarketDataProvider(
+        token="test-secret",
+        session=session,
+        use_bulk_metadata=False,
+    )
 
     provider.fetch_bars(["SPY"], "2024-01-01", "2024-01-03")
     provider.fetch_metadata(["SPY"])
@@ -236,6 +344,120 @@ def test_tiingo_rate_limit_is_explicit_and_does_not_expose_token():
 
     assert exc_info.value.retry_after == "3600"
     assert "test-secret" not in str(exc_info.value)
+
+
+def test_tiingo_25_symbol_batch_can_use_exactly_50_requests_with_detail_metadata():
+    session = _RecordingSession()
+    provider = TiingoMarketDataProvider(
+        token="test-secret",
+        session=session,
+        use_bulk_metadata=False,
+    )
+    tickers = [f"ETF{i:02d}" for i in range(25)]
+
+    provider.fetch(tickers, "2024-01-01", "2024-01-03")
+
+    assert provider.request_count == 50
+    assert provider.remaining_request_budget == 0
+    assert len(session.calls) == 50
+
+
+def test_tiingo_bulk_metadata_reduces_25_symbol_batch_to_25_limited_requests():
+    session = _RecordingSession()
+    provider = TiingoMarketDataProvider(token="test-secret", session=session)
+    tickers = [f"ETF{i:02d}" for i in range(25)]
+    provider._load_bulk_catalog = lambda: pd.DataFrame(
+        {
+            "exchange": "NYSE",
+            "assetType": "ETF",
+            "priceCurrency": "USD",
+            "startDate": "2000-01-01",
+            "endDate": "2026-07-17",
+        },
+        index=tickers,
+    )
+
+    provider.fetch(tickers, "2024-01-01", "2024-01-03")
+
+    assert provider.request_count == 25
+    assert provider.remaining_request_budget == 25
+    assert len(session.calls) == 25
+
+
+def test_tiingo_batch_over_local_budget_fails_before_any_request():
+    session = _RecordingSession()
+    provider = TiingoMarketDataProvider(
+        token="test-secret",
+        session=session,
+        hourly_request_limit=3,
+        use_bulk_metadata=False,
+    )
+
+    with pytest.raises(ProviderRateLimitError, match="rate limit"):
+        provider.fetch(["SPY", "QQQ"], "2024-01-01", "2024-01-03")
+
+    assert provider.request_count == 0
+    assert session.calls == []
+
+
+def test_fred_vix_provider_builds_close_only_validation_frame():
+    class _FredResponse:
+        status_code = 200
+        text = "observation_date,VIXCLS\n2024-01-02,13.20\n2024-01-03,.\n"
+
+    class _FredSession:
+        def get(self, url, **kwargs):
+            return _FredResponse()
+
+    frame = FredVixProvider(session=_FredSession()).fetch()
+
+    assert list(frame.columns) == ["Open", "High", "Low", "Close", "Volume"]
+    assert frame.loc["2024-01-02", "Close"] == pytest.approx(13.20)
+    assert len(frame) == 1
+
+
+def test_yahoo_secondary_uses_fred_vix_instead_of_yahoo_vix():
+    class _PayloadProvider:
+        def __init__(self, name, bars):
+            self.name = name
+            self._bars = bars
+
+        def fetch(self, tickers, start, end):
+            return ProviderPayload(
+                bars={ticker: self._bars[ticker] for ticker in tickers},
+                actions=(),
+                metadata={ticker: {} for ticker in tickers},
+                source=self.name,
+            )
+
+    class _FredFixture:
+        name = "fred_vixcls"
+
+        def fetch(self, start=None, end=None):
+            return _bars([15.0, 16.0], ["2024-01-02", "2024-01-03"])
+
+    class _CboeFixture:
+        name = "cboe"
+
+        def fetch(self, start=None, end=None):
+            return vix
+
+    spy = _bars([100.0, 101.0], ["2024-01-02", "2024-01-03"])
+    vix = _bars([15.0, 16.0], ["2024-01-02", "2024-01-03"])
+    loader = TrustedMarketDataLoader(
+        Config(universe=["SPY"], start_date="2024-01-01"),
+        primary_provider=_PayloadProvider("tiingo", {"SPY": spy}),
+        secondary_provider=_PayloadProvider("yahoo", {"SPY": spy}),
+        vix_provider=_CboeFixture(),
+        vix_validation_provider=_FredFixture(),
+        persist=False,
+        as_of=pd.Timestamp("2024-01-03 21:00", tz="America/New_York"),
+    )
+
+    loader.load()
+
+    assert loader.secondary_payload.source == "yahoo+fred_vixcls"
+    assert loader.secondary_payload.metadata["^VIX"]["source"] == "fred_vixcls"
 
 
 def test_missing_tiingo_credential_never_silently_promotes_yahoo(monkeypatch):
@@ -379,6 +601,7 @@ def test_dataset_snapshot_payload_is_immutable_and_reconstructable():
     assert set(sources) == {"primary", "secondary"}
     assert sources["secondary"].bars["SPY"].loc["2024-01-03", "Close"] == 101.0
     assert sources["secondary"].actions[0].source == "check"
+    assert sources["secondary"].metadata["SPY"]["price_split_basis"] == "unknown"
     assert dataset_content_hash(
         restored.bars, restored.actions, source=restored.source
     ) == content_hash
