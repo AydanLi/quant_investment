@@ -37,3 +37,13 @@ def test_database_dashboards_do_not_use_deprecated_container_width_argument():
     for dashboard_path in dashboard_paths:
         source = dashboard_path.read_text(encoding="utf-8")
         assert "use_container_width" not in source, dashboard_path.name
+
+
+def test_old_database_dashboard_is_explicitly_legacy_read_only():
+    project_root = Path(__file__).resolve().parents[1]
+    source = (project_root / "streamlit_dashboard_db.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert "LEGACY READ-ONLY" in source
+    assert "streamlit_dashboard_db_v1_1_save_experiment.py" in source

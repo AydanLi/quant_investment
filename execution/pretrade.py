@@ -48,13 +48,17 @@ def verify_pre_open(
     if now.date().isoformat() != decision.next_rebalance_session:
         reasons.append("WRONG_EXECUTION_SESSION")
     local_time = now.timetz().replace(tzinfo=None)
-    if local_time < time(9, 30) or local_time >= time(16, 0):
-        reasons.append("OUTSIDE_EXECUTION_WINDOW")
+    if local_time >= time(9, 25):
+        reasons.append("APPROVAL_DEADLINE_MISSED")
     if not quality.actionable:
         reasons.append("DATA_NOT_ACTIONABLE")
     if not reconciliation.matched:
         reasons.append("ACCOUNT_NOT_RECONCILED")
-    if risk_state.upper() not in {"NORMAL", "WARNING", "DRIFT_REVIEW"}:
+    if risk_state.upper() not in {"NORMAL", "WARNING", "DRIFT_REVIEW"} or account.risk_state.upper() not in {
+        "NORMAL",
+        "WARNING",
+        "DRIFT_REVIEW",
+    }:
         reasons.append("RISK_HALTED")
     if account.settled_cash < -1e-9 or account.available_cash < -1e-9:
         reasons.append("NEGATIVE_CASH_OR_FINANCING")
@@ -62,12 +66,42 @@ def verify_pre_open(
         reasons.append("LEVERAGE_DETECTED")
     if any(position.quantity < -1e-9 for position in account.positions.values()):
         reasons.append("SHORT_POSITION")
+    captured_account = pd.Timestamp(account.captured_at)
+    if captured_account.tzinfo is None:
+        captured_account = captured_account.tz_localize("UTC")
+    account_age = (now.tz_convert("UTC") - captured_account.tz_convert("UTC")).total_seconds()
+    if account_age < -1.0 or account_age > maximum_quote_age_seconds:
+        reasons.append("STALE_ACCOUNT")
+    if reconciliation.reconciled_at is None:
+        reasons.append("STALE_RECONCILIATION")
+    else:
+        reconciled_at = pd.Timestamp(reconciliation.reconciled_at)
+        if reconciled_at.tzinfo is None:
+            reconciled_at = reconciled_at.tz_localize("UTC")
+        reconciliation_age = (
+            now.tz_convert("UTC") - reconciled_at.tz_convert("UTC")
+        ).total_seconds()
+        if reconciliation_age < -1.0 or reconciliation_age > maximum_quote_age_seconds:
+            reasons.append("STALE_RECONCILIATION")
+        if reconciled_at < captured_account:
+            reasons.append("RECONCILIATION_PREDATES_ACCOUNT")
+    required_tickers = {
+        ticker
+        for ticker in set(decision.target_weights).union(decision.current_weights)
+        if abs(
+            float(decision.target_weights.get(ticker, 0.0))
+            - float(decision.current_weights.get(ticker, 0.0))
+        )
+        > 1e-9
+    }
+    missing_quotes = sorted(required_tickers - set(quotes))
+    reasons.extend(f"MISSING_QUOTE:{ticker}" for ticker in missing_quotes)
     for ticker, quote in quotes.items():
         captured = pd.Timestamp(quote.captured_at)
         if captured.tzinfo is None:
             captured = captured.tz_localize("UTC")
-        age = abs((now.tz_convert("UTC") - captured.tz_convert("UTC")).total_seconds())
-        if age > maximum_quote_age_seconds:
+        age = (now.tz_convert("UTC") - captured.tz_convert("UTC")).total_seconds()
+        if age < -1.0 or age > maximum_quote_age_seconds:
             reasons.append(f"STALE_QUOTE:{ticker}")
     return PreTradeVerification(
         verified_at=now.to_pydatetime(),

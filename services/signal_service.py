@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+from inspect import signature
+from datetime import time
 from typing import Mapping
 
 import pandas as pd
@@ -14,6 +16,7 @@ from services.models import SignalDecision, SignalStatus
 from strategy.momentum_rotation import MomentumRotationStrategy
 from strategy.regime import RegimeDetector
 from storage.repositories import GovernanceRepository
+from storage.repositories.signals import SignalRepository
 
 
 class SignalService:
@@ -23,10 +26,12 @@ class SignalService:
         *,
         loader: TrustedMarketDataLoader | None = None,
         calendar: NyseCalendar | None = None,
+        signal_repository: SignalRepository | None = None,
     ) -> None:
         self.config = config
         self.calendar = calendar or NyseCalendar()
         self.loader = loader
+        self.signal_repository = signal_repository
 
     def generate_decision(
         self,
@@ -44,13 +49,12 @@ class SignalService:
         loader = self.loader or TrustedMarketDataLoader(
             self.config, calendar=self.calendar, as_of=now
         )
-        data = loader.load()
-        fe = FeatureEngineer(data, self.config)
-        prices = fe.make_price_frame()
-        returns = fe.make_returns_frame(prices)
-        features = fe.compute_features(prices, returns)
-
-        date = pd.Timestamp(prices.index[-1]).normalize()
+        load_parameters = signature(loader.load).parameters
+        data = (
+            loader.load(require_actionable=False)
+            if "require_actionable" in load_parameters
+            else loader.load()
+        )
         quality = loader.quality_report
         issues = tuple(
             {**asdict(issue), "severity": issue.severity.value}
@@ -71,11 +75,34 @@ class SignalService:
         if data_blocked:
             block_reasons.append("Data quality or freshness gate did not pass.")
 
+        # A blocked dataset is still useful for a diagnostic decision, but it
+        # must not reach feature or strategy code.  Derive only a display date
+        # from the immutable quality report (or, as a last resort, the raw
+        # frame indexes) so malformed blocked inputs fail closed as BLOCKED.
+        if quality is not None and quality.latest_session is not None:
+            date = pd.Timestamp(quality.latest_session).normalize()
+        else:
+            available_dates = [
+                pd.Timestamp(frame.index[-1]).normalize()
+                for frame in data.values()
+                if frame is not None and not frame.empty
+            ]
+            date = (
+                max(available_dates)
+                if available_dates
+                else self.calendar.latest_completed_session(now)
+            )
+
         regime = "UNAVAILABLE"
         target: dict[str, float] = {}
         target_available = False
         if not data_blocked:
             try:
+                fe = FeatureEngineer(data, self.config)
+                prices = fe.make_price_frame()
+                returns = fe.make_returns_frame(prices)
+                features = fe.compute_features(prices, returns)
+                date = pd.Timestamp(prices.index[-1]).normalize()
                 regime = RegimeDetector(self.config).classify(date, prices, features)
                 strategy = MomentumRotationStrategy(self.config)
                 risk_engine = RiskEngine(self.config)
@@ -103,7 +130,23 @@ class SignalService:
                 block_reasons.append("Strategy version is not frozen in governance storage.")
 
         month_end = self.calendar.is_month_end_session(date)
-        after_cutoff = self.calendar.after_cutoff(now, self.config.signal_cutoff_time_et)
+        next_session = (
+            self.calendar.next_session(date)
+            if month_end
+            else self.calendar.next_month_end_session(date)
+        )
+        local_now = now.tz_convert(NEW_YORK)
+        same_session_window = bool(
+            month_end
+            and local_now.date() == date.date()
+            and self.calendar.after_cutoff(local_now, self.config.signal_cutoff_time_et)
+        )
+        catch_up_window = bool(
+            month_end
+            and local_now.date() == next_session.date()
+            and local_now.timetz().replace(tzinfo=None) < time(9, 25)
+        )
+        actionable_window = same_session_window or catch_up_window
         admitted_frequency = self.config.rebalance_frequency == "M"
         halted = risk_state.upper() not in {"NORMAL", "WARNING", "DRIFT_REVIEW"}
         if halted:
@@ -112,7 +155,7 @@ class SignalService:
             status = SignalStatus.BLOCKED
         elif diagnostic_data_only:
             status = SignalStatus.DIAGNOSTIC
-        elif month_end and after_cutoff and admitted_frequency:
+        elif month_end and actionable_window and admitted_frequency:
             status = SignalStatus.ACTIONABLE
         else:
             status = SignalStatus.DIAGNOSTIC
@@ -136,12 +179,7 @@ class SignalService:
             * estimated_cost_bps
             / 10000.0
         )
-        next_session = (
-            self.calendar.next_session(date)
-            if month_end
-            else self.calendar.next_month_end_session(date)
-        )
-        return SignalDecision(
+        decision = SignalDecision(
             strategy_version=self.config.strategy_version,
             universe_version=self.config.universe_version,
             dataset_snapshot_id=loader.dataset_snapshot_id,
@@ -164,6 +202,13 @@ class SignalService:
             risk_state=risk_state.upper(),
             block_reasons=tuple(dict.fromkeys(block_reasons)),
         )
+        if (
+            self.signal_repository is not None
+            and decision.dataset_snapshot_id is not None
+            and decision.strategy_version != "UNFROZEN"
+        ):
+            decision = self.signal_repository.save_decision(decision)
+        return decision
 
     def generate_latest_allocation(self, **kwargs: object) -> dict[str, object]:
         """Compatibility wrapper returning the unified decision as a mapping."""

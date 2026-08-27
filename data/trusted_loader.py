@@ -161,8 +161,14 @@ class TrustedMarketDataLoader:
                 result[ticker] = locally_adjust_ohlcv(frame, actions.get(ticker, ()))
         return result
 
-    def load(self, *, force_refresh: bool = False) -> dict[str, pd.DataFrame]:
+    def load(
+        self,
+        *,
+        force_refresh: bool = False,
+        require_actionable: bool = True,
+    ) -> dict[str, pd.DataFrame]:
         if self._loaded_data is not None and not force_refresh:
+            self._raise_if_not_actionable(require_actionable)
             return {
                 ticker: frame.copy(deep=True)
                 for ticker, frame in self._loaded_data.items()
@@ -187,7 +193,6 @@ class TrustedMarketDataLoader:
         )
         self.primary_payload = primary
         self.secondary_payload = secondary
-        self.quality_report = report
 
         if self.repository is not None:
             for ticker, frame in primary.bars.items():
@@ -222,7 +227,7 @@ class TrustedMarketDataLoader:
                 )
                 for ticker in primary.bars
             }
-            self.dataset_snapshot_id = self.repository.create_snapshot(
+            source_snapshot_id = self.repository.create_snapshot(
                 report,
                 as_of=as_of.isoformat(),
                 start_date=self.config.start_date,
@@ -232,6 +237,24 @@ class TrustedMarketDataLoader:
                 source_by_ticker=source_by_ticker,
                 secondary_payload=secondary,
             )
+            self.dataset_snapshot_id = source_snapshot_id
+            decisions = self.repository.quality_decisions(source_snapshot_id)
+            if decisions:
+                adjudicated = self.repository.adjudicated_report(
+                    source_snapshot_id, config=self.config
+                )
+                if adjudicated.actionable:
+                    self.dataset_snapshot_id = self.repository.create_snapshot(
+                        adjudicated,
+                        as_of=as_of.isoformat(),
+                        start_date=self.config.start_date,
+                        end_date=self.config.end_date,
+                        bars=primary.bars,
+                        actions=primary.actions,
+                        source_by_ticker=source_by_ticker,
+                        secondary_payload=secondary,
+                    )
+                    report = adjudicated
             if report.latest_session is not None:
                 session = pd.Timestamp(report.latest_session)
                 benchmark = primary.bars[self.config.benchmark]
@@ -255,14 +278,15 @@ class TrustedMarketDataLoader:
                         effective_date=self.config.universe_effective_date,
                         seed_tickers=tuple(self.config.universe),
                         rules=policy.rules,
-                        approved=True,
-                        approved_by="implementation_plan_2026-07-17",
+                        approved=False,
                         historical_universe_integrity=self.config.historical_universe_integrity,
                     ),
                     eligibility=eligibility,
                 )
                 self.universe_version_recorded = True
+        self.quality_report = report
         self._loaded_data = self._adjusted_frames(primary)
+        self._raise_if_not_actionable(require_actionable)
         return {
             ticker: frame.copy(deep=True)
             for ticker, frame in self._loaded_data.items()
@@ -271,3 +295,11 @@ class TrustedMarketDataLoader:
     @property
     def actionable(self) -> bool:
         return bool(self.quality_report and self.quality_report.actionable)
+
+    def _raise_if_not_actionable(self, require_actionable: bool) -> None:
+        if require_actionable and not self.actionable:
+            status = None if self.quality_report is None else self.quality_report.status.value
+            raise ValueError(
+                f"Trusted market data is not actionable (status={status}); "
+                "use require_actionable=False only for diagnostics."
+            )

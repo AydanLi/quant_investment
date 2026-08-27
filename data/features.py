@@ -35,10 +35,6 @@ class FeatureEngineer:
                 prices[ticker] = df["Adjusted Open"]
             elif "Open" in df.columns:
                 prices[ticker] = df["Open"]
-            elif "Adjusted Close" in df.columns:
-                prices[ticker] = df["Adjusted Close"]
-            elif "Close" in df.columns:
-                prices[ticker] = df["Close"]
         result = pd.DataFrame(prices).sort_index()
         if self.config.benchmark in result:
             result = result.reindex(result[self.config.benchmark].dropna().index)

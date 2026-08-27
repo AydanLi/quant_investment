@@ -24,11 +24,12 @@ class Backtester:
         risk_engine,
         execution_prices: pd.DataFrame | None = None,
         median_dollar_volume: pd.DataFrame | None = None,
+        drawdown_reentry_mode: str = "next_month_end",
     ):
         self.config = config
         self.prices = prices.copy().sort_index()
         self.execution_prices = (
-            prices.copy().sort_index()
+            None
             if execution_prices is None
             else execution_prices.copy().sort_index().reindex(prices.index)
         )
@@ -43,24 +44,19 @@ class Backtester:
         self.strategy = strategy
         self.risk_engine = risk_engine
         self.calendar = NyseCalendar()
+        if drawdown_reentry_mode not in {
+            "next_month_end",
+            "permanent_cash_stress",
+        }:
+            raise ValueError(
+                "drawdown_reentry_mode must be next_month_end or permanent_cash_stress."
+            )
+        self.drawdown_reentry_mode = drawdown_reentry_mode
 
     def _get_rebalance_dates(self) -> pd.DatetimeIndex:
-        idx = self.prices.index
-        if self.config.rebalance_frequency == "D":
-            return idx
-        if self.config.rebalance_frequency == "W":
-            # Weekly is exploratory only. Determine week-end sessions from the
-            # exchange calendar, not from whether future price rows exist.
-            return pd.DatetimeIndex(
-                [
-                    session
-                    for session in idx
-                    if self.calendar.next_session(session).isocalendar().week
-                    != pd.Timestamp(session).isocalendar().week
-                ]
-            )
-        return pd.DatetimeIndex(
-            [session for session in idx if self.calendar.is_month_end_session(session)]
+        return self.calendar.rebalance_sessions(
+            self.prices.index,
+            self.config.rebalance_frequency,
         )
 
     def run(self) -> Dict[str, pd.DataFrame]:
@@ -73,22 +69,51 @@ class Backtester:
             raise ValueError(
                 "Price index contains non-NYSE sessions; VIX-only dates or synthetic business days are forbidden."
             )
+        if self.execution_prices is None:
+            raise ValueError(
+                "T+1 execution requires an explicit Open-price frame; Close fallback is forbidden."
+            )
         warmup = 252
         if len(self.prices) <= warmup:
             raise ValueError("Not enough data after 252-session warmup. Extend start_date earlier.")
+        cash_close = self.prices.get(self.config.cash_asset)
+        cash_open = self.execution_prices.get(self.config.cash_asset)
+        if cash_close is None or cash_open is None:
+            raise ValueError(
+                f"Backtest cannot start before {self.config.cash_asset} has Close and Open prices."
+            )
+        cash_tradable = (
+            pd.to_numeric(cash_close, errors="coerce").gt(0.0)
+            & pd.to_numeric(cash_open, errors="coerce").gt(0.0)
+        )
+        eligible_starts = self.prices.index[
+            (self.prices.index >= self.prices.index[warmup]) & cash_tradable
+        ]
+        if eligible_starts.empty:
+            raise ValueError(
+                f"No backtest session satisfies both 252-session warmup and {self.config.cash_asset} tradability."
+            )
+        start_position = self.prices.index.get_loc(eligible_starts[0])
         rebalance_dates = set(self._get_rebalance_dates())
-        previous_session = self.prices.index[warmup - 1]
-        dates = self.prices.index[warmup:]
+        previous_session = self.prices.index[start_position - 1]
+        dates = self.prices.index[start_position:]
+        initial_prices = self.prices.loc[previous_session].copy()
+        previous_cash_open = self.execution_prices.at[
+            previous_session, self.config.cash_asset
+        ]
+        if pd.isna(previous_cash_open) or float(previous_cash_open) <= 0.0:
+            initial_prices.loc[self.config.cash_asset] = float("nan")
         ledger = PortfolioLedger.initialize(
             self.config,
             session=previous_session,
-            prices=self.prices.loc[previous_session],
+            prices=initial_prices,
         )
         previous_equity = ledger.mark(self.prices.loc[previous_session])
         risk_monitor = PortfolioRiskMonitor(self.config, previous_equity)
         pending_target: dict[str, float] | None = None
         pending_signal_date: pd.Timestamp | None = None
         pending_regime: str | None = None
+        drawdown_reentry_session: pd.Timestamp | None = None
         history: list[dict[str, object]] = []
         signal_history: list[dict[str, object]] = []
 
@@ -143,13 +168,36 @@ class Backtester:
             stop_triggered = any(
                 event.code == "PORTFOLIO_DRAWDOWN_STOP" for event in events
             )
+            research_reentry = False
             if stop_triggered:
                 pending_target = {self.config.synthetic_cash_asset: 1.0}
                 pending_signal_date = pd.Timestamp(date)
                 pending_regime = "risk_off"
+                if self.drawdown_reentry_mode == "next_month_end":
+                    drawdown_reentry_session = self.calendar.next_month_end_session(
+                        date
+                    )
+            elif (
+                risk_status == RiskStatus.DRAWDOWN_HALTED
+                and self.drawdown_reentry_mode == "next_month_end"
+                and drawdown_reentry_session is not None
+                and date >= drawdown_reentry_session
+                and date in rebalance_dates
+            ):
+                risk_monitor.authorize_research_reentry(
+                    session=date,
+                    next_monthly_rebalance_session=drawdown_reentry_session,
+                    nav=equity,
+                )
+                risk_status = RiskStatus.NORMAL
+                drawdown = 0.0
+                research_reentry = True
+                drawdown_reentry_session = None
+
+            if stop_triggered:
+                pass
             elif date in rebalance_dates and risk_status not in {
                 RiskStatus.DRAWDOWN_HALTED,
-                RiskStatus.DAILY_LOSS_HALT,
                 RiskStatus.DRIFT_REVIEW,
             }:
                 target = self.strategy.target_weights(
@@ -177,11 +225,13 @@ class Backtester:
                         ),
                         "regime": regime,
                         "weights": dict(target),
+                        "research_reentry": research_reentry,
                     }
                 )
 
             snapshot: dict[str, object] = {
                 "date": date,
+                "previous_nav": previous_equity,
                 "equity": equity,
                 "gross_return": gross_return,
                 "daily_return": daily_return,
@@ -199,6 +249,8 @@ class Backtester:
                 "high_water": risk_monitor.high_water,
                 "risk_status": risk_status.value,
                 "stop_triggered": stop_triggered,
+                "research_reentry": research_reentry,
+                "drawdown_reentry_mode": self.drawdown_reentry_mode,
                 "maximum_adv_fraction": execution["maximum_adv_fraction"],
             }
             for ticker in set(self.config.universe).union(

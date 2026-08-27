@@ -36,10 +36,10 @@ def _decision(status=SignalStatus.ACTIONABLE):
         next_rebalance_session="2026-07-17",
         status=status,
         regime="neutral",
-        target_weights={"SPY": 0.3, "BIL": 0.7},
-        current_weights={"QQQ": 0.1, "BIL": 0.9},
-        weight_deltas={"SPY": 0.1, "QQQ": -0.1},
-        dollar_deltas={"SPY": 1000.0, "QQQ": -1000.0},
+        target_weights={"SPY": 0.3, "BIL": 0.65, "CASH_USD": 0.05},
+        current_weights={"QQQ": 0.1, "BIL": 0.6},
+        weight_deltas={"SPY": 0.3, "BIL": 0.05, "QQQ": -0.1},
+        dollar_deltas={"SPY": 3000.0, "BIL": 500.0, "QQQ": -1000.0},
         estimated_cost_dollars=1.4,
     )
 
@@ -48,15 +48,19 @@ def _broker():
     account = AccountSnapshot(
         account_ref="paper",
         nav=10_000.0,
-        settled_cash=5_000.0,
-        available_cash=5_000.0,
-        buying_power=10_000.0,
-        positions={"QQQ": BrokerPosition("QQQ", 5.0, 1000.0)},
+        settled_cash=3_000.0,
+        available_cash=3_000.0,
+        buying_power=3_000.0,
+        positions={
+            "QQQ": BrokerPosition("QQQ", 5.0, 1000.0),
+            "BIL": BrokerPosition("BIL", 60.0, 6000.0),
+        },
         captured_at=NOW,
     )
     quotes = {
         "SPY": Quote("SPY", 99.95, 100.05, NOW),
         "QQQ": Quote("QQQ", 199.90, 200.10, NOW),
+        "BIL": Quote("BIL", 99.95, 100.05, NOW),
     }
     return InMemoryPaperBroker(account, quotes), account, quotes
 
@@ -66,7 +70,11 @@ def test_order_drafts_are_idempotent_sell_first_and_require_human_approval():
     oms = OrderManagementSystem(Config(strategy_version="SV-001"), broker)
     kwargs = {
         "quotes": quotes,
-        "median_daily_dollar_volume": {"SPY": 10_000_000.0, "QQQ": 10_000_000.0},
+        "median_daily_dollar_volume": {
+            "SPY": 10_000_000.0,
+            "QQQ": 10_000_000.0,
+            "BIL": 10_000_000.0,
+        },
         "account": account,
         "verification": VERIFIED,
     }
@@ -83,8 +91,8 @@ def test_order_drafts_are_idempotent_sell_first_and_require_human_approval():
     submitted = oms.submit(approved.client_order_id)
     assert submitted.state == OrderState.SUBMITTED
     assert submitted.broker_order_id
-    assert oms.update_status(submitted.client_order_id, "PARTIAL").state == OrderState.PARTIAL
-    assert oms.update_status(submitted.client_order_id, "FILLED").state == OrderState.FILLED
+    with pytest.raises(ValueError, match="persisted fills"):
+        oms.update_status(submitted.client_order_id, "FILLED")
 
 
 def test_stale_limit_is_canceled_and_40bp_reprice_needs_second_approval():
@@ -93,7 +101,11 @@ def test_stale_limit_is_canceled_and_40bp_reprice_needs_second_approval():
     intent = oms.create_drafts(
         _decision(),
         quotes=quotes,
-        median_daily_dollar_volume={"SPY": 10_000_000.0, "QQQ": 10_000_000.0},
+        median_daily_dollar_volume={
+            "SPY": 10_000_000.0,
+            "QQQ": 10_000_000.0,
+            "BIL": 10_000_000.0,
+        },
         account=account,
         verification=VERIFIED,
     )[0]
@@ -119,7 +131,11 @@ def test_spread_adv_and_nonactionable_gates_block_orders():
         oms.create_drafts(
             _decision(SignalStatus.DIAGNOSTIC),
             quotes=quotes,
-            median_daily_dollar_volume={"SPY": 10_000_000.0, "QQQ": 10_000_000.0},
+            median_daily_dollar_volume={
+                "SPY": 10_000_000.0,
+                "QQQ": 10_000_000.0,
+                "BIL": 10_000_000.0,
+            },
             account=account,
             verification=VERIFIED,
         )
@@ -129,7 +145,11 @@ def test_spread_adv_and_nonactionable_gates_block_orders():
         oms.create_drafts(
             _decision(),
             quotes=wide,
-            median_daily_dollar_volume={"SPY": 10_000_000.0, "QQQ": 10_000_000.0},
+            median_daily_dollar_volume={
+                "SPY": 10_000_000.0,
+                "QQQ": 10_000_000.0,
+                "BIL": 10_000_000.0,
+            },
             account=account,
             verification=VERIFIED,
         )
@@ -137,7 +157,7 @@ def test_spread_adv_and_nonactionable_gates_block_orders():
         oms.create_drafts(
             _decision(),
             quotes=quotes,
-            median_daily_dollar_volume={"SPY": 50_000.0, "QQQ": 50_000.0},
+            median_daily_dollar_volume={"SPY": 50_000.0, "QQQ": 50_000.0, "BIL": 50_000.0},
             account=account,
             verification=VERIFIED,
         )
@@ -145,8 +165,12 @@ def test_spread_adv_and_nonactionable_gates_block_orders():
 
 def test_reconciliation_locks_material_difference():
     _, account, _ = _broker()
-    matched = reconcile_account(account=account, expected_values={"QQQ": 1000.0})
-    mismatch = reconcile_account(account=account, expected_values={"QQQ": 900.0})
+    matched = reconcile_account(
+        account=account, expected_values={"QQQ": 1000.0, "BIL": 6000.0}
+    )
+    mismatch = reconcile_account(
+        account=account, expected_values={"QQQ": 900.0, "BIL": 6000.0}
+    )
 
     assert matched.matched is True
     assert mismatch.matched is False
@@ -161,12 +185,16 @@ def test_drift_review_blocks_new_buys_but_keeps_risk_reducing_sells():
     drafts = oms.create_drafts(
         decision,
         quotes=quotes,
-        median_daily_dollar_volume={"SPY": 10_000_000.0, "QQQ": 10_000_000.0},
+        median_daily_dollar_volume={
+            "SPY": 10_000_000.0,
+            "QQQ": 10_000_000.0,
+            "BIL": 10_000_000.0,
+        },
         account=account,
         verification=VERIFIED,
     )
 
-    assert [intent.ticker for intent in drafts] == ["QQQ"]
+    assert [intent.ticker for intent in drafts] == ["QQQ", "BIL"]
     assert drafts[0].side.value == "SELL"
     assert oms.last_draft_warnings == ("BUY_BLOCKED_DRIFT_REVIEW:SPY",)
 
@@ -180,7 +208,7 @@ def test_oms_uses_configured_impact_coefficient_and_0935_execution_gate():
         oms.create_drafts(
             _decision(),
             quotes=quotes,
-            median_daily_dollar_volume={"SPY": 1_000_000.0, "QQQ": 1_000_000.0},
+            median_daily_dollar_volume={"SPY": 3_000_000.0, "QQQ": 1_000_000.0, "BIL": 500_000.0},
             account=account,
             verification=PreTradeVerification(
                 datetime(2026, 7, 17, 13, 34, tzinfo=timezone.utc), True, ()
@@ -190,7 +218,7 @@ def test_oms_uses_configured_impact_coefficient_and_0935_execution_gate():
     drafts = oms.create_drafts(
         _decision(),
         quotes=quotes,
-        median_daily_dollar_volume={"SPY": 1_000_000.0, "QQQ": 1_000_000.0},
+        median_daily_dollar_volume={"SPY": 3_000_000.0, "QQQ": 1_000_000.0, "BIL": 500_000.0},
         account=account,
         verification=VERIFIED,
     )

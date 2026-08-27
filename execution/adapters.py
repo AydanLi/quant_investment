@@ -147,8 +147,10 @@ class InMemoryPaperBroker(BrokerAdapter):
         return {"accepted": True, "notional": intent.notional}
 
     def submit(self, intent: OrderIntent) -> str:
-        broker_id = f"paper-{len(self._orders) + 1}"
-        self._orders[broker_id] = intent
+        # Deterministic ID closes the crash window between local submit and
+        # SQLite state persistence; replaying the same intent is harmless.
+        broker_id = f"paper-{intent.client_order_id}"
+        self._orders.setdefault(broker_id, intent)
         return broker_id
 
     def cancel(self, broker_order_id: str) -> None:

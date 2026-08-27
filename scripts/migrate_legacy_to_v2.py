@@ -15,9 +15,8 @@ Known limitation: per-day ``portfolio_weights`` cannot be backfilled (the legacy
 schema never stored daily weights), so that table starts empty for migrated
 runs. ``market_data`` likewise starts empty.
 
-Usage:
-    python scripts/migrate_legacy_to_v2.py
-    python scripts/migrate_legacy_to_v2.py --old-db quant_research.db --new-db quant_research_v2.db
+Usage (both paths are intentionally explicit):
+    python scripts/migrate_legacy_to_v2.py --old-db legacy.db --new-db migrated.db
 """
 from __future__ import annotations
 
@@ -91,6 +90,8 @@ def _build_v2_schema(new_db: Path) -> None:
 
 
 def migrate(old_db: Path, new_db: Path) -> dict[str, int]:
+    if old_db.resolve() == new_db.resolve():
+        raise ValueError("Legacy input and migrated output must be different files")
     if not old_db.exists():
         raise FileNotFoundError(f"Legacy database not found: {old_db}")
     if new_db.exists():
@@ -189,8 +190,8 @@ def _legacy_counts(old_db: Path) -> dict[str, int]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--old-db", default="quant_research.db", type=Path)
-    parser.add_argument("--new-db", default="quant_research_v2.db", type=Path)
+    parser.add_argument("--old-db", required=True, type=Path)
+    parser.add_argument("--new-db", required=True, type=Path)
     args = parser.parse_args()
 
     before = _legacy_counts(args.old_db)

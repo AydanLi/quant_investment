@@ -494,9 +494,9 @@ def test_trusted_loader_reuses_one_snapshot_without_refetching():
         as_of=pd.Timestamp("2024-01-03 21:00", tz="America/New_York"),
     )
 
-    first = loader.load()
+    first = loader.load(require_actionable=False)
     first["SPY"].iloc[0, 0] = -1.0
-    second = loader.load()
+    second = loader.load(require_actionable=False)
 
     assert provider.calls == 1
     assert second["SPY"].iloc[0, 0] != -1.0

@@ -98,6 +98,23 @@ def test_before_cutoff_and_exploratory_frequency_are_diagnostic_only():
     assert exploratory.status == SignalStatus.DIAGNOSTIC
 
 
+def test_month_end_signal_can_be_caught_up_only_before_t1_0925_et():
+    config, data = _signal_fixture()
+    service = SignalService(config, loader=_TrustedLoader(data))
+
+    caught_up = service.generate_decision(
+        as_of=pd.Timestamp("2025-01-02 09:24", tz="America/New_York")
+    )
+    too_late = service.generate_decision(
+        as_of=pd.Timestamp("2025-01-02 09:25", tz="America/New_York")
+    )
+
+    assert caught_up.status == SignalStatus.ACTIONABLE
+    assert caught_up.signal_session == "2024-12-31"
+    assert caught_up.next_rebalance_session == "2025-01-02"
+    assert too_late.status == SignalStatus.DIAGNOSTIC
+
+
 def test_untrusted_data_unfrozen_strategy_and_halt_cannot_be_actionable():
     config, data = _signal_fixture()
     blocked = SignalService(
@@ -157,3 +174,42 @@ def test_blocked_data_with_missing_regime_input_returns_no_liquidation_draft():
     assert decision.regime == "UNAVAILABLE"
     assert decision.target_weights == {}
     assert decision.weight_deltas == {}
+
+
+def test_malformed_blocked_data_returns_structured_blocked_decision():
+    config, data = _signal_fixture()
+    malformed = {
+        ticker: frame.drop(columns=[column for column in frame if "Close" in column])
+        for ticker, frame in data.items()
+    }
+
+    decision = SignalService(
+        config,
+        loader=_TrustedLoader(malformed, status=DataQualityStatus.BLOCKED),
+    ).generate_decision(
+        as_of=pd.Timestamp("2024-12-31 20:31", tz="America/New_York")
+    )
+
+    assert decision.status == SignalStatus.BLOCKED
+    assert decision.regime == "UNAVAILABLE"
+    assert decision.target_weights == {}
+
+
+def test_signal_service_uses_diagnostic_loader_path_for_blocked_data():
+    config, data = _signal_fixture()
+
+    class _FailClosedLoader(_TrustedLoader):
+        def load(self, *, require_actionable=True):
+            assert require_actionable is False
+            return self._data
+
+    decision = SignalService(
+        config,
+        loader=_FailClosedLoader(data, status=DataQualityStatus.BLOCKED),
+    ).generate_decision(
+        as_of=pd.Timestamp("2024-12-31 20:31", tz="America/New_York")
+    )
+
+    assert decision.status == SignalStatus.BLOCKED
+    assert decision.target_weights == {}
+    assert decision.actionable is False

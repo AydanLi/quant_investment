@@ -31,6 +31,9 @@ quant_research_before_snapshot_*.db*
 # One-click Dashboard launcher runtime files
 .runtime/
 
+# Local coding-agent permissions; never share machine-specific settings.
+.claude/settings.local.json
+
 # Local project review and progress notes
 CHANGELOG.md
 PROJECT_STATUS.md

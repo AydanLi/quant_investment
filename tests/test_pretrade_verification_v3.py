@@ -1,4 +1,5 @@
-from datetime import datetime, timezone
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 
 from data.models import DataQualityReport, DataQualityStatus
 from execution import (
@@ -42,7 +43,7 @@ def _quality():
 
 
 def test_preopen_rechecks_session_data_account_quotes_and_risk():
-    now = datetime(2026, 7, 17, 13, 35, tzinfo=timezone.utc)
+    now = datetime(2026, 7, 17, 13, 20, tzinfo=timezone.utc)
     account = AccountSnapshot(
         account_ref="paper",
         nav=10_000.0,
@@ -61,6 +62,7 @@ def test_preopen_rechecks_session_data_account_quotes_and_risk():
         unknown_positions=(),
         open_orders=(),
         reasons=(),
+        reconciled_at=now,
     )
     quote = Quote("BIL", 91.0, 91.01, now)
 
@@ -86,3 +88,46 @@ def test_preopen_rechecks_session_data_account_quotes_and_risk():
     )
     assert halted.passed is False
     assert "RISK_HALTED" in halted.reasons
+
+
+def test_preopen_blocks_late_approval_stale_account_and_missing_trade_quote():
+    now = datetime(2026, 7, 17, 13, 25, tzinfo=timezone.utc)
+    decision = replace(
+        _decision(),
+        target_weights={"SPY": 0.5, "BIL": 0.5},
+        current_weights={"BIL": 1.0},
+    )
+    account = AccountSnapshot(
+        account_ref="paper",
+        nav=10_000.0,
+        settled_cash=10_000.0,
+        available_cash=10_000.0,
+        buying_power=10_000.0,
+        positions={},
+        captured_at=now - timedelta(minutes=5),
+    )
+    reconciliation = ReconciliationResult(
+        matched=True,
+        difference_value=0.0,
+        threshold=5.0,
+        negative_cash=False,
+        short_positions=(),
+        unknown_positions=(),
+        open_orders=(),
+        reasons=(),
+        reconciled_at=now,
+    )
+    result = verify_pre_open(
+        decision=decision,
+        verified_at=now,
+        account=account,
+        quality=_quality(),
+        reconciliation=reconciliation,
+        quotes={"BIL": Quote("BIL", 91.0, 91.01, now)},
+        risk_state="NORMAL",
+    )
+
+    assert result.passed is False
+    assert "APPROVAL_DEADLINE_MISSED" in result.reasons
+    assert "STALE_ACCOUNT" in result.reasons
+    assert "MISSING_QUOTE:SPY" in result.reasons

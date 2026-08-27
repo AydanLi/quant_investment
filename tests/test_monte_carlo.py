@@ -9,20 +9,27 @@ from research.monte_carlo import (
 
 def _portfolio(returns, index):
     returns = np.asarray(returns, dtype=float)
+    equity = 10_000.0 * np.cumprod(1.0 + returns)
+    previous_nav = np.concatenate(([10_000.0], equity[:-1]))
     turnover = np.zeros(len(index))
     turnover[::20] = 0.25
     trading_cost = turnover * 0.0005
     slippage = turnover * 0.0002
-    total_cost = trading_cost + slippage
-    gross_return = (1.0 + returns) / (1.0 - total_cost) - 1.0
+    impact = turnover * 0.0001
+    total_cost = trading_cost + slippage + impact
+    cost_dollars = previous_nav * total_cost
+    gross_return = returns + cost_dollars / previous_nav
     return pd.DataFrame(
         {
+            "previous_nav": previous_nav,
             "gross_return": gross_return,
             "daily_return": returns,
             "turnover": turnover,
             "est_trading_cost": trading_cost,
             "est_slippage": slippage,
+            "est_impact": impact,
             "est_cost": total_cost,
+            "cost_dollars": cost_dollars,
         },
         index=index,
     )
@@ -65,6 +72,7 @@ def test_paired_bootstrap_uses_same_paths_and_preserves_cost_audit():
     assert paired["probability_sharpe_improvement"] > 0.95
     assert paired["probability_drawdown_reduction"] > 0.95
     assert result.summary["source_totals"]["candidate"]["est_cost"] > 0.0
+    assert result.summary["source_totals"]["candidate"]["est_impact"] > 0.0
     assert result.horizon == len(index)
 
 
@@ -116,3 +124,23 @@ def test_paired_bootstrap_rejects_mismatched_dates_and_missing_costs():
         assert "not net" in str(exc)
     else:
         raise AssertionError("Expected a return that excludes costs to fail.")
+
+    missing_impact = baseline.copy()
+    missing_impact.loc[index[0], "est_cost"] -= missing_impact.loc[
+        index[0], "est_impact"
+    ]
+    try:
+        paired_block_bootstrap(missing_impact, baseline)
+    except ValueError as exc:
+        assert "impact" in str(exc)
+    else:
+        raise AssertionError("Expected est_cost that omits impact to fail.")
+
+    wrong_dollars = baseline.copy()
+    wrong_dollars.loc[index[0], "cost_dollars"] += 10.0
+    try:
+        paired_block_bootstrap(wrong_dollars, baseline)
+    except ValueError as exc:
+        assert "previous NAV" in str(exc)
+    else:
+        raise AssertionError("Expected a dollar-cost accounting mismatch to fail.")

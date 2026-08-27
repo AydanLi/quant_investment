@@ -36,6 +36,36 @@ class NyseCalendar:
     def sessions(self, start: object, end: object) -> pd.DatetimeIndex:
         return self.schedule(start, end).index
 
+    def rebalance_sessions(
+        self,
+        sessions: pd.DatetimeIndex,
+        frequency: str,
+    ) -> pd.DatetimeIndex:
+        """Return exchange week/month-end sessions with one schedule lookup."""
+        index = (
+            pd.DatetimeIndex(sessions)
+            .tz_localize(None)
+            .normalize()
+            .drop_duplicates()
+            .sort_values()
+        )
+        if frequency == "D" or index.empty:
+            return index
+        if frequency not in {"W", "M"}:
+            raise ValueError("Rebalance frequency must be D, W, or M.")
+
+        exchange_sessions = self.sessions(
+            index[0], index[-1] + pd.Timedelta(days=14)
+        )
+        positions = exchange_sessions.get_indexer(index)
+        if (positions < 0).any():
+            raise ValueError("Rebalance dates must all be NYSE sessions.")
+        if (positions + 1 >= len(exchange_sessions)).any():
+            raise ValueError("Unable to resolve the next NYSE session.")
+        following = exchange_sessions.take(positions + 1)
+        period = "W-SUN" if frequency == "W" else "M"
+        return index[index.to_period(period) != following.to_period(period)]
+
     def latest_completed_session(self, as_of: pd.Timestamp | None = None) -> pd.Timestamp:
         now = pd.Timestamp.now(tz=NEW_YORK) if as_of is None else pd.Timestamp(as_of)
         if now.tzinfo is None:
@@ -71,16 +101,20 @@ class NyseCalendar:
 
     def is_month_end_session(self, session: object) -> bool:
         session = pd.Timestamp(session).normalize()
-        if not self.is_session(session):
+        try:
+            return session in self.rebalance_sessions(
+                pd.DatetimeIndex([session]), "M"
+            )
+        except ValueError:
             return False
-        return self.next_session(session).month != session.month
 
     def next_month_end_session(self, after: object) -> pd.Timestamp:
         after = pd.Timestamp(after).normalize()
         sessions = self.sessions(after, after + pd.DateOffset(months=3))
-        for session in sessions:
-            if session > after and self.is_month_end_session(session):
-                return pd.Timestamp(session)
+        month_ends = self.rebalance_sessions(sessions, "M")
+        candidates = month_ends[month_ends > after]
+        if len(candidates):
+            return pd.Timestamp(candidates[0])
         raise ValueError(f"No month-end NYSE session found after {after.date()}.")
 
     def freshness(

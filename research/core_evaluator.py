@@ -66,10 +66,25 @@ class CoreStrategyEvaluator:
         portfolio = result.loc[validation_start:validation_end]
         if portfolio.empty:
             raise ValueError("Validation portfolio is empty after feature warmup.")
-        bil_returns = returns.get(config.cash_asset, pd.Series(dtype=float)).reindex(
-            portfolio.index
-        ).fillna(0.0)
+        if config.cash_asset not in returns:
+            raise ValueError(
+                f"Validation requires {config.cash_asset} benchmark returns."
+            )
+        bil_returns = returns[config.cash_asset].reindex(portfolio.index)
+        if bil_returns.isna().any():
+            missing = bil_returns.index[bil_returns.isna()][0]
+            raise ValueError(
+                f"Missing {config.cash_asset} benchmark return on {missing.date()}."
+            )
         excess_returns = portfolio["daily_return"] - bil_returns
+        risky_weight_columns = [
+            f"w_{ticker}"
+            for ticker in config.universe
+            if ticker != config.cash_asset and f"w_{ticker}" in portfolio
+        ]
+        degenerate_all_cash = not risky_weight_columns or bool(
+            portfolio[risky_weight_columns].abs().sum(axis=1).le(1e-12).all()
+        )
         stop_rows = portfolio[portfolio["stop_triggered"].astype(bool)]
         minimum_drawdown = float(portfolio["drawdown"].min())
         overshoot = max(
@@ -83,4 +98,5 @@ class CoreStrategyEvaluator:
             max_drawdown=max_drawdown((1.0 + portfolio["daily_return"]).cumprod()),
             stop_count=len(stop_rows),
             maximum_stop_overshoot=overshoot,
+            degenerate_all_cash=degenerate_all_cash,
         )

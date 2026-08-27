@@ -7,10 +7,20 @@ import numpy as np
 import pandas as pd
 from sqlalchemy import and_, select
 
-from data.models import CorporateAction, DataQualityReport, ProviderPayload
+from config.settings import Config
+from data.models import (
+    CorporateAction,
+    DataQualityDecision,
+    DataQualityReport,
+    DataQualityStatus,
+    ProviderPayload,
+    QualitySeverity,
+)
+from data.quality import apply_data_quality_decisions
 from storage.repositories.base import BaseRepository, upsert
 from storage.schema import (
     corporate_actions,
+    data_quality_decisions,
     data_revisions,
     dataset_snapshots,
     dataset_snapshot_actions,
@@ -39,6 +49,103 @@ def _different(left: float | None, right: float | None) -> bool:
 
 
 class TrustedMarketDataRepository(BaseRepository):
+    def save_quality_decision(self, decision: DataQualityDecision) -> int:
+        """Insert one immutable decision after exact source-issue validation."""
+        with self.engine.begin() as conn:
+            snapshot = conn.execute(
+                select(dataset_snapshots).where(
+                    dataset_snapshots.c.id == decision.source_snapshot_id
+                )
+            ).mappings().one_or_none()
+            if snapshot is None:
+                raise ValueError(
+                    f"Unknown source dataset snapshot {decision.source_snapshot_id}."
+                )
+            report = DataQualityReport.from_dict(snapshot["quality_json"])
+            if report.status != DataQualityStatus.BLOCKED:
+                raise ValueError("Only a blocked source snapshot can be adjudicated.")
+            if report.source_snapshot_id is not None:
+                raise ValueError("Derived snapshots cannot be adjudication sources.")
+            if report.raw_data_hash != decision.raw_data_hash:
+                raise ValueError("Decision raw_data_hash does not match the source snapshot.")
+            issue = next(
+                (
+                    item
+                    for item in report.issues
+                    if item.severity == QualitySeverity.BLOCK
+                    and item.fingerprint == decision.issue_fingerprint
+                ),
+                None,
+            )
+            if issue is None:
+                raise ValueError("Decision fingerprint is not a blocking source issue.")
+            if (
+                issue.code != decision.issue_code
+                or issue.ticker != decision.ticker
+                or issue.session is None
+                or not decision.start_date <= issue.session <= decision.end_date
+            ):
+                raise ValueError("Decision code, ticker, or date scope does not match.")
+
+            existing = conn.execute(
+                select(data_quality_decisions).where(
+                    data_quality_decisions.c.source_snapshot_id
+                    == decision.source_snapshot_id,
+                    data_quality_decisions.c.issue_fingerprint
+                    == decision.issue_fingerprint,
+                )
+            ).mappings().one_or_none()
+            if existing is not None:
+                if existing["decision_hash"] != decision.decision_hash:
+                    raise ValueError(
+                        "Data quality decisions are immutable; create a new source snapshot."
+                    )
+                return int(existing["id"])
+
+            values = decision.to_dict()
+            values["decided_at"] = decision.decided_at
+            result = conn.execute(data_quality_decisions.insert().values(**values))
+            return int(result.inserted_primary_key[0])
+
+    def quality_decisions(
+        self, source_snapshot_id: int
+    ) -> tuple[DataQualityDecision, ...]:
+        with self.engine.connect() as conn:
+            rows = conn.execute(
+                select(data_quality_decisions)
+                .where(
+                    data_quality_decisions.c.source_snapshot_id
+                    == int(source_snapshot_id)
+                )
+                .order_by(data_quality_decisions.c.id)
+            ).mappings().all()
+        return tuple(DataQualityDecision.from_record(row) for row in rows)
+
+    def adjudicated_report(
+        self,
+        source_snapshot_id: int,
+        *,
+        config: Config | None = None,
+    ) -> DataQualityReport:
+        with self.engine.connect() as conn:
+            row = conn.execute(
+                select(dataset_snapshots.c.quality_json).where(
+                    dataset_snapshots.c.id == int(source_snapshot_id)
+                )
+            ).scalar_one_or_none()
+        if row is None:
+            raise KeyError(f"Unknown dataset snapshot {source_snapshot_id}.")
+        report = DataQualityReport.from_dict(row)
+        sources = self.load_snapshot_sources(source_snapshot_id)
+        return apply_data_quality_decisions(
+            report,
+            self.quality_decisions(source_snapshot_id),
+            source_snapshot_id=source_snapshot_id,
+            primary=sources.get("primary"),
+            secondary=sources.get("secondary"),
+            config=config,
+        )
+
     def upsert_metadata(
         self,
         metadata: Mapping[str, Mapping[str, object]],
@@ -313,6 +420,7 @@ class TrustedMarketDataRepository(BaseRepository):
                     secondary_source=report.secondary_source,
                     content_hash=report.content_hash,
                     status=report.status.value,
+                    decision_set_hash=report.decision_set_hash,
                     quality_json=report.to_dict(),
                 )
             )

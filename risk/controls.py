@@ -54,6 +54,23 @@ class PortfolioRiskMonitor:
         self.drawdown_halted = False
         self.high_water = float(nav)
 
+    def authorize_research_reentry(
+        self,
+        *,
+        session: object,
+        next_monthly_rebalance_session: object,
+        nav: float,
+    ) -> None:
+        """Apply the preregistered historical proxy at the next month-end."""
+        self.authorize_reentry(
+            session=session,
+            next_monthly_rebalance_session=next_monthly_rebalance_session,
+            nav=nav,
+            reconciliation_ok=True,
+            incident_recorded=True,
+            authorized_by="historical_research_proxy",
+        )
+
     def evaluate(
         self,
         *,

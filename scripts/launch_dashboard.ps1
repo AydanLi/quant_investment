@@ -9,6 +9,7 @@ $ErrorActionPreference = "Stop"
 
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $pythonExe = Join-Path $projectRoot ".venv\Scripts\python.exe"
+# Formal entry point. streamlit_dashboard_db.py remains legacy read-only.
 $dashboardFile = "streamlit_dashboard_db_v1_1_save_experiment.py"
 $dashboardPath = Join-Path $projectRoot $dashboardFile
 $runtimeDir = Join-Path $projectRoot ".runtime"

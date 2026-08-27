@@ -10,7 +10,13 @@ import pandas as pd
 from sqlalchemy import delete, select
 
 from storage.repositories.base import BaseRepository
-from storage.schema import experiment_runs
+from storage.schema import (
+    admission_runs,
+    dataset_snapshots,
+    experiment_runs,
+    strategy_versions,
+    universe_versions,
+)
 
 # Config fields promoted to their own queryable columns (mirrored from config_json).
 _PROMOTED_CONFIG_FIELDS = (
@@ -92,15 +98,11 @@ class ExperimentRepository(BaseRepository):
         frequency = config_dict.get("rebalance_frequency")
         if frequency in {"D", "W"}:
             status = "exploratory_only"
-            admissible = False
         if dataset_snapshot_id is None:
             status = "invalid_data_v1"
-            admissible = False
             invalidated_reason = invalidated_reason or "No trusted dataset snapshot."
         strategy_version = strategy_version or config_dict.get("strategy_version")
         universe_version = universe_version or config_dict.get("universe_version")
-        if strategy_version in {None, "UNFROZEN"}:
-            admissible = False
 
         values: dict[str, Any] = {
             "scenario_name": scenario_name,
@@ -114,7 +116,7 @@ class ExperimentRepository(BaseRepository):
             "dataset_snapshot_id": dataset_snapshot_id,
             "universe_version": universe_version,
             "strategy_version": strategy_version,
-            "admissible": int(admissible),
+            "admissible": 0,
             "invalidated_reason": invalidated_reason,
         }
         for field in _PROMOTED_CONFIG_FIELDS:
@@ -123,8 +125,110 @@ class ExperimentRepository(BaseRepository):
             values[column] = _opt_float(summary.get(label))
 
         with self.engine.begin() as conn:
+            derived_admissible, governance_reason = self._derive_admissibility(
+                conn,
+                dataset_snapshot_id=dataset_snapshot_id,
+                universe_version=universe_version,
+                strategy_version=strategy_version,
+            )
+            values["admissible"] = int(
+                derived_admissible
+                and status == "complete"
+                and frequency not in {"D", "W"}
+            )
+            if not values["admissible"] and governance_reason:
+                values["invalidated_reason"] = invalidated_reason or governance_reason
+                if status == "complete":
+                    values["status"] = (
+                        "blocked_data"
+                        if governance_reason.startswith("Dataset snapshot")
+                        else "invalid_governance"
+                    )
+            if dataset_snapshot_id is not None and conn.execute(
+                select(dataset_snapshots.c.id).where(
+                    dataset_snapshots.c.id == int(dataset_snapshot_id)
+                )
+            ).scalar_one_or_none() is None:
+                values["dataset_snapshot_id"] = None
+            if universe_version and conn.execute(
+                select(universe_versions.c.version).where(
+                    universe_versions.c.version == universe_version
+                )
+            ).scalar_one_or_none() is None:
+                values["universe_version"] = None
+            if strategy_version and conn.execute(
+                select(strategy_versions.c.version).where(
+                    strategy_versions.c.version == strategy_version
+                )
+            ).scalar_one_or_none() is None:
+                values["strategy_version"] = None
             result = conn.execute(experiment_runs.insert().values(**values))
             return int(result.inserted_primary_key[0])
+
+    @staticmethod
+    def _derive_admissibility(
+        conn,
+        *,
+        dataset_snapshot_id: int | None,
+        universe_version: str | None,
+        strategy_version: str | None,
+    ) -> tuple[bool, str | None]:
+        if dataset_snapshot_id is None:
+            return False, "Dataset snapshot is missing."
+        snapshot = conn.execute(
+            select(dataset_snapshots).where(
+                dataset_snapshots.c.id == int(dataset_snapshot_id)
+            )
+        ).mappings().one_or_none()
+        if snapshot is None:
+            return False, "Dataset snapshot does not exist."
+        quality = snapshot["quality_json"] or {}
+        if (
+            snapshot["status"]
+            not in {"TRUSTED", "WARNING", "TRUSTED_WITH_EXCEPTIONS"}
+            or quality.get("stale_sessions") != 0
+            or (
+                snapshot["status"] == "TRUSTED_WITH_EXCEPTIONS"
+                and not snapshot["decision_set_hash"]
+            )
+        ):
+            return False, "Dataset snapshot is not actionable."
+        if not universe_version:
+            return False, "Universe version is missing."
+        universe_status = conn.execute(
+            select(universe_versions.c.status).where(
+                universe_versions.c.version == universe_version
+            )
+        ).scalar_one_or_none()
+        if universe_status != "approved":
+            return False, "Universe version is not approved."
+        if not strategy_version or strategy_version == "UNFROZEN":
+            return False, "Strategy version is missing or unfrozen."
+        strategy = conn.execute(
+            select(strategy_versions).where(
+                strategy_versions.c.version == strategy_version
+            )
+        ).mappings().one_or_none()
+        if strategy is None or strategy["status"] != "frozen":
+            return False, "Strategy version is not frozen."
+        if (
+            strategy["universe_version"] != universe_version
+            or int(strategy["dataset_snapshot_id"]) != int(dataset_snapshot_id)
+        ):
+            return False, "Experiment references do not match the frozen strategy."
+        admitted = conn.execute(
+            select(admission_runs.c.id)
+            .where(
+                admission_runs.c.strategy_version == strategy_version,
+                admission_runs.c.status == "admitted",
+                admission_runs.c.completed_at.is_not(None),
+                admission_runs.c.selection_uses_future_holdout == 0,
+            )
+            .limit(1)
+        ).scalar_one_or_none()
+        if admitted is None:
+            return False, "Strategy has no admitted AdmissionRun."
+        return True, None
 
     def get_runs(self, limit: int = 20, scenario_name: Optional[str] = None) -> pd.DataFrame:
         """Most-recent runs first, optionally filtered by scenario name."""

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
+import re
 from typing import Union
 
 import pandas as pd
 import streamlit as st
+from sqlalchemy import select
 
 from backtest.engine import Backtester
 from config.settings import Config
@@ -18,6 +21,7 @@ from services.experiment_validation import validate_experiment_parameters
 from services.factor_monitor import FACTOR_LABELS, build_factor_monitor
 from services.monte_carlo_monitor import build_monte_carlo_monitor
 from services.signal_service import SignalService
+from storage.schema import admission_runs, strategy_versions
 from storage.store import ResearchStore
 from strategy.momentum_rotation import MomentumRotationStrategy
 from strategy.regime import RegimeDetector
@@ -25,6 +29,110 @@ from strategy.regime import RegimeDetector
 
 DB_PATH = "quant_research.db"
 Numeric = Union[int, float]
+EXPLORATORY_FREQUENCIES = frozenset({"D", "W"})
+_DYNAMIC_FACTOR_LABEL = re.compile(
+    r"dynamic_half_life_(?P<half_life>\d+)_stress_(?P<stress>\d+(?:\.\d+)?)"
+)
+_ADMITTED_DYNAMIC_COMBINATIONS = {
+    (half_life, stress)
+    for half_life in (20, 40, 60)
+    for stress in (1.0, 1.5)
+}
+
+
+def frequency_governance_status(rebalance_frequency: str) -> str:
+    return (
+        "exploratory_only"
+        if rebalance_frequency in EXPLORATORY_FREQUENCIES
+        else "admission_candidate"
+    )
+
+
+def parse_admitted_dynamic_factor(
+    results: object,
+) -> dict[str, object] | None:
+    """Return the selected dynamic-factor settings from an admission result."""
+    if not isinstance(results, Mapping):
+        return None
+    if (
+        results.get("core_strategy_frozen") is not True
+        or results.get("baseline_model") != "sample"
+        or results.get("candidate_count") != 6
+    ):
+        return None
+    label = results.get("selected_admitted_candidate")
+    if not isinstance(label, str):
+        return None
+    match = _DYNAMIC_FACTOR_LABEL.fullmatch(label)
+    if match is None:
+        return None
+    half_life = int(match.group("half_life"))
+    stress = float(match.group("stress"))
+    if (half_life, stress) not in _ADMITTED_DYNAMIC_COMBINATIONS:
+        return None
+    evaluations = results.get("evaluations")
+    if (
+        not isinstance(evaluations, Mapping)
+        or not isinstance(evaluations.get(label), Mapping)
+        or evaluations[label].get("admitted") is not True
+    ):
+        return None
+    return {
+        "risk_model": "dynamic_factor",
+        "ewma_half_life_days": half_life,
+        "pca_stress_multiplier": stress,
+        "admission_label": label,
+    }
+
+
+def dashboard_risk_model_options(
+    admitted_dynamic_factor: Mapping[str, object] | None,
+) -> dict[str, dict[str, object]]:
+    baseline = Config()
+    options = {
+        "Sample covariance（基准）": {
+            "risk_model": baseline.risk_model,
+            "ewma_half_life_days": baseline.ewma_half_life_days,
+            "pca_stress_multiplier": baseline.pca_stress_multiplier,
+        }
+    }
+    if admitted_dynamic_factor is not None:
+        label = str(admitted_dynamic_factor["admission_label"])
+        options[f"Dynamic factor（已准入：{label}）"] = dict(
+            admitted_dynamic_factor
+        )
+    return options
+
+
+@st.cache_data(show_spinner=False)
+def load_admitted_dynamic_factor() -> dict[str, object] | None:
+    """Load the latest dynamic model backed by an admitted, frozen version."""
+    store = ResearchStore()
+    try:
+        statement = (
+            select(admission_runs.c.results_json)
+            .select_from(
+                admission_runs.join(
+                    strategy_versions,
+                    strategy_versions.c.version == admission_runs.c.strategy_version,
+                )
+            )
+            .where(
+                admission_runs.c.status == "admitted",
+                strategy_versions.c.status == "frozen",
+            )
+            .order_by(admission_runs.c.id.desc())
+        )
+        with store.engine.connect() as connection:
+            results = connection.execute(statement).scalars().all()
+    finally:
+        store.close()
+
+    for result in results:
+        parsed = parse_admitted_dynamic_factor(result)
+        if parsed is not None:
+            return parsed
+    return None
 
 
 def synced_numeric_parameter(
@@ -69,6 +177,8 @@ def synced_numeric_parameter(
     with input_col:
         st.number_input(
             f"{label} direct input",
+            min_value=min_value,
+            max_value=max_value,
             step=step,
             format=number_format,
             key=input_key,
@@ -156,6 +266,9 @@ def execute_experiment_and_save(
     vix_high_threshold: float,
     trading_cost_bps: float,
     slippage_bps: float,
+    risk_model: str,
+    ewma_half_life_days: int,
+    pca_stress_multiplier: float,
 ) -> int:
     config = Config(
         start_date=start_date,
@@ -170,9 +283,9 @@ def execute_experiment_and_save(
         vix_high_threshold=vix_high_threshold,
         trading_cost_bps=trading_cost_bps,
         slippage_bps=slippage_bps,
-        risk_model="dynamic_factor",
-        ewma_half_life_days=20,
-        pca_stress_multiplier=1.50,
+        risk_model=risk_model,
+        ewma_half_life_days=ewma_half_life_days,
+        pca_stress_multiplier=pca_stress_multiplier,
     )
 
     loader = TrustedMarketDataLoader(config)
@@ -244,9 +357,12 @@ def execute_experiment_and_save(
 
 
 def main() -> None:
+    baseline_config = Config()
     st.set_page_config(page_title="Quant Research DB Dashboard v1.1", layout="wide")
     st.title("Quant Research DB Dashboard v1.1")
-    st.caption("读取 SQLite 历史实验，并支持一键保存当前参数为新实验")
+    st.caption(
+        "正式研究入口：读取SQLite历史实验，并保存受治理标记约束的新实验。"
+    )
 
     with st.sidebar:
         st.header("数据库设置")
@@ -265,15 +381,29 @@ def main() -> None:
 
         st.header("新实验参数")
         scenario_name = st.text_input("Scenario Name", value="dashboard_manual_run")
-        start_date = st.text_input("Start Date", value="2018-01-01")
-        rebalance_frequency = st.selectbox("Rebalance Frequency", ["D", "W", "M"], index=2)
+        start_date = st.text_input("Start Date", value=baseline_config.start_date)
+        frequency_options = ["D", "W", "M"]
+        rebalance_frequency = st.selectbox(
+            "Rebalance Frequency",
+            frequency_options,
+            index=frequency_options.index(baseline_config.rebalance_frequency),
+            format_func=lambda value: (
+                f"{value} — exploratory_only"
+                if value in EXPLORATORY_FREQUENCIES
+                else f"{value} — admission protocol"
+            ),
+        )
+        if frequency_governance_status(rebalance_frequency) == "exploratory_only":
+            st.warning(
+                "EXPLORATORY_ONLY：日频/周频结果不得进入准入排名或称为正式候选。"
+            )
         top_n = int(
             synced_numeric_parameter(
                 "Top N Assets",
                 "top_n",
                 min_value=1,
                 max_value=6,
-                value=3,
+                value=baseline_config.top_n,
                 step=1,
                 number_format="%d",
             )
@@ -284,7 +414,7 @@ def main() -> None:
                 "min_momentum_threshold",
                 min_value=-0.10,
                 max_value=0.20,
-                value=0.00,
+                value=baseline_config.min_momentum_threshold,
                 step=0.01,
                 number_format="%.2f",
             )
@@ -295,7 +425,7 @@ def main() -> None:
                 "target_annual_vol",
                 min_value=0.05,
                 max_value=0.30,
-                value=0.12,
+                value=baseline_config.target_annual_vol,
                 step=0.01,
                 number_format="%.2f",
             )
@@ -305,8 +435,8 @@ def main() -> None:
                 "Max Asset Weight",
                 "max_asset_weight",
                 min_value=0.10,
-                max_value=1.00,
-                value=0.40,
+                max_value=baseline_config.max_asset_weight,
+                value=baseline_config.max_asset_weight,
                 step=0.05,
                 number_format="%.2f",
             )
@@ -317,7 +447,7 @@ def main() -> None:
                 "risk_off_cash_weight",
                 min_value=0.00,
                 max_value=1.00,
-                value=0.50,
+                value=baseline_config.risk_off_cash_weight,
                 step=0.05,
                 number_format="%.2f",
             )
@@ -328,7 +458,7 @@ def main() -> None:
                 "vix_risk_off_threshold",
                 min_value=15.0,
                 max_value=50.0,
-                value=28.0,
+                value=baseline_config.vix_risk_off_threshold,
                 step=1.0,
                 number_format="%.1f",
             )
@@ -339,7 +469,7 @@ def main() -> None:
                 "vix_high_threshold",
                 min_value=12.0,
                 max_value=40.0,
-                value=22.0,
+                value=baseline_config.vix_high_threshold,
                 step=1.0,
                 number_format="%.1f",
             )
@@ -350,7 +480,7 @@ def main() -> None:
                 "trading_cost_bps",
                 min_value=0.0,
                 max_value=30.0,
-                value=5.0,
+                value=baseline_config.trading_cost_bps,
                 step=0.5,
                 number_format="%.1f",
             )
@@ -361,14 +491,29 @@ def main() -> None:
                 "slippage_bps",
                 min_value=0.0,
                 max_value=30.0,
-                value=2.0,
+                value=baseline_config.slippage_bps,
                 step=0.5,
                 number_format="%.1f",
             )
         )
-        st.caption(
-            "已准入风险模型：EWMA(20日半衰期) + PCA第一因子1.5倍压力。"
+        admitted_dynamic_factor = load_admitted_dynamic_factor()
+        risk_model_options = dashboard_risk_model_options(admitted_dynamic_factor)
+        risk_model_label = st.selectbox(
+            "Risk Model",
+            options=list(risk_model_options),
+            index=0,
         )
+        risk_model_settings = risk_model_options[risk_model_label]
+        if admitted_dynamic_factor is None:
+            st.caption(
+                "当前仅可选择sample covariance基准；数据库没有可验证的"
+                "dynamic_factor已准入记录。"
+            )
+        else:
+            st.caption(
+                "dynamic_factor选项来自已准入记录及对应的冻结策略版本；"
+                "未被记录选中的参数不会显示。"
+            )
 
         auto_name = (
             f"dashboard_{rebalance_frequency}"
@@ -424,6 +569,13 @@ def main() -> None:
                         vix_high_threshold=vix_high_threshold,
                         trading_cost_bps=trading_cost_bps,
                         slippage_bps=slippage_bps,
+                        risk_model=str(risk_model_settings["risk_model"]),
+                        ewma_half_life_days=int(
+                            risk_model_settings["ewma_half_life_days"]
+                        ),
+                        pca_stress_multiplier=float(
+                            risk_model_settings["pca_stress_multiplier"]
+                        ),
                     )
                     st.cache_data.clear()
                     st.success(f"保存成功，run_id = {run_id}")
@@ -438,7 +590,10 @@ def main() -> None:
         return
 
     if runs.empty:
-        st.warning("数据库里还没有实验记录。先点击左侧按钮保存一条新实验，或先运行 `python main_with_db.py`。")
+        st.warning(
+            "数据库里还没有实验记录。先点击左侧按钮保存一条新实验，"
+            "或运行 `.\\.venv\\Scripts\\python.exe main_with_db.py`。"
+        )
         return
 
     st.subheader("最近实验记录")

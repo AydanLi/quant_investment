@@ -1,3 +1,5 @@
+"""Legacy read-only dashboard retained for audit compatibility."""
+
 from __future__ import annotations
 
 import pandas as pd
@@ -45,9 +47,13 @@ def safe_float(x):
 
 
 def main() -> None:
-    st.set_page_config(page_title="Quant Research DB Dashboard", layout="wide")
-    st.title("Quant Research DB Dashboard")
-    st.caption("从 SQLite 读取历史实验、净值、订单、信号")
+    st.set_page_config(page_title="Legacy Quant Research DB Dashboard", layout="wide")
+    st.title("Legacy Quant Research DB Dashboard")
+    st.warning(
+        "LEGACY READ-ONLY：此入口仅保留用于历史审计。正式入口为"
+        "streamlit_dashboard_db_v1_1_save_experiment.py。"
+    )
+    st.caption("从SQLite读取历史实验、净值、订单和信号；不能保存正式实验。")
 
     with st.sidebar:
         st.header("数据库设置")
@@ -61,7 +67,10 @@ def main() -> None:
         return
 
     if runs.empty:
-        st.warning("数据库里还没有实验记录。先运行 `python main_with_db.py` 写入数据。")
+        st.warning(
+            "数据库里还没有实验记录。可运行"
+            " `.\\.venv\\Scripts\\python.exe main_with_db.py` 写入研究数据。"
+        )
         return
 
     st.subheader("最近实验记录")

@@ -8,12 +8,15 @@ import pandas as pd
 
 
 REQUIRED_PORTFOLIO_COLUMNS = (
+    "previous_nav",
     "gross_return",
     "daily_return",
     "turnover",
     "est_trading_cost",
     "est_slippage",
+    "est_impact",
     "est_cost",
+    "cost_dollars",
 )
 
 
@@ -106,33 +109,39 @@ def _validate_and_align(
                     "turnover",
                     "est_trading_cost",
                     "est_slippage",
+                    "est_impact",
                     "est_cost",
+                    "cost_dollars",
                 ]
             ]
             < 0.0
         ).any().any():
             raise ValueError(f"{label} contains negative turnover or costs.")
+        if (numeric["previous_nav"] <= 0.0).any():
+            raise ValueError(f"{label} contains non-positive previous NAV.")
         if not np.allclose(
             numeric["est_cost"],
-            numeric["est_trading_cost"] + numeric["est_slippage"],
+            numeric["est_trading_cost"]
+            + numeric["est_slippage"]
+            + numeric["est_impact"],
             rtol=1e-9,
             atol=1e-12,
         ):
             raise ValueError(
-                f"{label} total cost does not equal trading cost plus slippage."
+                f"{label} total cost does not equal trading, slippage, and impact."
             )
-        expected_net_return = (
-            (1.0 + numeric["gross_return"]) * (1.0 - numeric["est_cost"])
-            - 1.0
+        expected_gross_return = (
+            numeric["daily_return"]
+            + numeric["cost_dollars"] / numeric["previous_nav"]
         )
         if not np.allclose(
-            numeric["daily_return"],
-            expected_net_return,
+            numeric["gross_return"],
+            expected_gross_return,
             rtol=1e-9,
             atol=1e-12,
         ):
             raise ValueError(
-                f"{label} daily_return is not net of its recorded costs."
+                f"{label} daily_return is not net of cost_dollars/previous NAV."
             )
         frame.loc[:, REQUIRED_PORTFOLIO_COLUMNS] = numeric
     return baseline_period, candidate_period
@@ -163,7 +172,9 @@ def _path_metrics(frame: pd.DataFrame, indices: np.ndarray) -> dict[str, np.ndar
         "turnover",
         "est_trading_cost",
         "est_slippage",
+        "est_impact",
         "est_cost",
+        "cost_dollars",
     ):
         metrics[column] = frame[column].to_numpy(dtype=float)[indices].sum(axis=1)
     return metrics
@@ -189,7 +200,9 @@ def _build_summary(
         "turnover",
         "est_trading_cost",
         "est_slippage",
+        "est_impact",
         "est_cost",
+        "cost_dollars",
     )
     distributions = {
         label: {
@@ -231,7 +244,9 @@ def _build_summary(
                 "turnover",
                 "est_trading_cost",
                 "est_slippage",
+                "est_impact",
                 "est_cost",
+                "cost_dollars",
             )
         }
         for label, frame in (("baseline", baseline), ("candidate", candidate))
@@ -267,9 +282,9 @@ def paired_block_bootstrap(
 ) -> PairedBootstrapResult:
     """Bootstrap identical net-return blocks for a baseline and candidate.
 
-    ``daily_return`` is already net of the stored trading-cost and slippage
-    columns. Costs are sampled for audit and must not be subtracted a second
-    time.
+    ``daily_return`` is already net of all stored costs. The accounting check
+    uses cost dollars divided by previous NAV because T+1 open execution and
+    close marking do not share a single multiplicative return base.
     """
     baseline_period, candidate_period = _validate_and_align(
         baseline, candidate, start, end

@@ -18,7 +18,14 @@ from storage.db import create_all, create_db_engine
 from storage.repositories.execution import ExecutionRepository
 from storage.repositories.experiments import ExperimentRepository
 from storage.repositories.governance import GovernanceRepository
-from storage.schema import admission_runs, execution_fills, experiment_runs, parameter_trials
+from storage.schema import (
+    admission_runs,
+    dataset_snapshots,
+    execution_fills,
+    experiment_runs,
+    parameter_trials,
+    strategy_versions,
+)
 
 
 NOW = datetime(2026, 7, 17, tzinfo=timezone.utc)
@@ -30,7 +37,82 @@ def _engine():
     return engine
 
 
-def test_universe_and_frozen_strategy_versions_are_immutable():
+def _strategy_draft(engine):
+    repository = GovernanceRepository(engine=engine)
+    repository.create_universe_draft(
+        UniverseVersion(
+            version="UV-001",
+            effective_date="2026-07-17",
+            seed_tickers=INITIAL_ETF_UNIVERSE,
+            rules=EligibilityRules(),
+        )
+    )
+    repository.approve_universe_version("UV-001", approved_by="operator")
+    with engine.begin() as connection:
+        snapshot_id = int(
+            connection.execute(
+                dataset_snapshots.insert().values(
+                    as_of="2026-07-17T21:00:00+00:00",
+                    start_date="2026-07-16",
+                    end_date="2026-07-17",
+                    primary_source="fixture",
+                    secondary_source="check",
+                    content_hash="a" * 64,
+                    status="TRUSTED",
+                    decision_set_hash=None,
+                    quality_json={
+                        "status": "TRUSTED",
+                        "primary_source": "fixture",
+                        "secondary_source": "check",
+                        "expected_session": "2026-07-17",
+                        "latest_session": "2026-07-17",
+                        "stale_sessions": 0,
+                        "content_hash": "a" * 64,
+                        "raw_data_hash": "b" * 64,
+                    },
+                )
+            ).inserted_primary_key[0]
+        )
+    repository.create_strategy_version(
+        version="SV-001",
+        universe_version="UV-001",
+        protocol={"hash": "one"},
+        dataset_snapshot_id=snapshot_id,
+        code_commit="a" * 40,
+    )
+    return repository, snapshot_id
+
+
+def _admit_and_freeze(repository):
+    admission_id = repository.start_admission(
+        strategy_version="SV-001",
+        methodology="nested_expanding_v3",
+    )
+    for index in range(135):
+        repository.save_admission_trial(
+            admission_id,
+            stage="final_selection_summary",
+            fold_key="aggregate",
+            label=f"candidate-{index:03d}",
+            parameters={"index": index},
+            folds=[],
+            status="evaluated",
+            score=float(index),
+        )
+    repository.finish_admission(
+        admission_id,
+        status="admitted",
+        results={
+            "selection_uses_future_holdout": False,
+            "admitted": True,
+            "gates": {"historical": True},
+        },
+    )
+    repository.freeze_strategy_version("SV-001", admission_run_id=admission_id)
+    return admission_id
+
+
+def test_universe_strategy_and_admission_lifecycle_is_fail_closed():
     engine = _engine()
     repository = GovernanceRepository(engine=engine)
     policy_version = UniverseVersion(
@@ -38,41 +120,203 @@ def test_universe_and_frozen_strategy_versions_are_immutable():
         effective_date="2026-07-17",
         seed_tickers=INITIAL_ETF_UNIVERSE,
         rules=EligibilityRules(),
-        approved=True,
-        approved_by="operator",
     )
-    repository.save_universe_version(policy_version)
-    repository.save_universe_version(policy_version)
+    repository.create_universe_draft(policy_version)
+    assert repository.is_universe_approved("UV-001") is False
+    repository.approve_universe_version("UV-001", approved_by="operator")
+    repository.create_universe_draft(policy_version)
     with pytest.raises(ValueError, match="immutable"):
-        repository.save_universe_version(
+        repository.create_universe_draft(
             UniverseVersion(
                 version="UV-001",
                 effective_date="2026-10-01",
                 seed_tickers=INITIAL_ETF_UNIVERSE,
                 rules=policy_version.rules,
-                approved=True,
             )
         )
-
-    repository.save_strategy_version(
+    with engine.begin() as connection:
+        snapshot_id = int(
+            connection.execute(
+                dataset_snapshots.insert().values(
+                    as_of="2026-07-17T21:00:00+00:00",
+                    start_date="2026-07-16",
+                    end_date="2026-07-17",
+                    primary_source="fixture",
+                    secondary_source="check",
+                    content_hash="b" * 64,
+                    status="TRUSTED",
+                    decision_set_hash=None,
+                    quality_json={
+                        "status": "TRUSTED",
+                        "primary_source": "fixture",
+                        "secondary_source": "check",
+                        "expected_session": "2026-07-17",
+                        "latest_session": "2026-07-17",
+                        "stale_sessions": 0,
+                        "content_hash": "b" * 64,
+                        "raw_data_hash": "b" * 64,
+                    },
+                )
+            ).inserted_primary_key[0]
+        )
+    repository.create_strategy_version(
         version="SV-001",
         universe_version="UV-001",
         protocol={"hash": "one"},
-        dataset_snapshot_id=1,
+        dataset_snapshot_id=snapshot_id,
         code_commit="a" * 40,
-        frozen=True,
     )
-    with pytest.raises(ValueError, match="Frozen strategy"):
-        repository.save_strategy_version(
+    with pytest.raises(ValueError, match="AdmissionRun"):
+        repository.freeze_strategy_version("SV-001")
+    admission_id = _admit_and_freeze(repository)
+    with pytest.raises(ValueError, match="immutable"):
+        repository.create_strategy_version(
             version="SV-001",
             universe_version="UV-001",
             protocol={"hash": "changed"},
-            dataset_snapshot_id=1,
+            dataset_snapshot_id=snapshot_id,
             code_commit="a" * 40,
-            frozen=True,
         )
     assert repository.is_universe_approved("UV-001") is True
     assert repository.is_strategy_frozen("SV-001") is True
+    repository.start_local_sim_clock("SV-001")
+    with engine.connect() as connection:
+        strategy = connection.execute(
+            select(strategy_versions).where(strategy_versions.c.version == "SV-001")
+        ).mappings().one()
+    assert strategy["local_sim_start"] is not None
+    with pytest.raises(TypeError):
+        repository.start_paper_clock("SV-001", started_at=NOW)
+    assert admission_id > 0
+
+
+def test_admitted_status_requires_complete_final_candidate_trials():
+    engine = _engine()
+    repository, _ = _strategy_draft(engine)
+    admission_id = repository.start_admission(
+        strategy_version="SV-001",
+        methodology="nested_expanding_v3",
+    )
+    repository.save_admission_trial(
+        admission_id,
+        stage="final_selection_summary",
+        fold_key="aggregate",
+        label="candidate-000",
+        parameters={},
+        folds=[],
+        status="evaluated",
+    )
+
+    with pytest.raises(ValueError, match="complete evaluated final candidate"):
+        repository.finish_admission(
+            admission_id,
+            status="admitted",
+            results={"admitted": True, "gates": {"historical": True}},
+        )
+
+    repository.finish_admission(
+        admission_id,
+        status="rejected",
+        results={"admitted": False, "gates": {"historical": False}},
+    )
+
+
+def test_strategy_creation_rejects_unapproved_universe_and_blocked_snapshot():
+    engine = _engine()
+    repository = GovernanceRepository(engine=engine)
+    repository.create_universe_draft(
+        UniverseVersion(
+            version="UV-001",
+            effective_date="2026-07-17",
+            seed_tickers=INITIAL_ETF_UNIVERSE,
+            rules=EligibilityRules(),
+        )
+    )
+    with engine.begin() as connection:
+        blocked_snapshot_id = int(
+            connection.execute(
+                dataset_snapshots.insert().values(
+                    as_of="2026-07-17T21:00:00+00:00",
+                    primary_source="fixture",
+                    secondary_source="check",
+                    content_hash="c" * 64,
+                    status="BLOCKED",
+                    quality_json={"status": "BLOCKED", "stale_sessions": 0},
+                )
+            ).inserted_primary_key[0]
+        )
+
+    with pytest.raises(ValueError, match="approved universe"):
+        repository.create_strategy_version(
+            version="SV-001",
+            universe_version="UV-001",
+            protocol={},
+            dataset_snapshot_id=blocked_snapshot_id,
+        )
+    repository.approve_universe_version("UV-001", approved_by="operator")
+    with pytest.raises(ValueError, match="actionable dataset"):
+        repository.create_strategy_version(
+            version="SV-001",
+            universe_version="UV-001",
+            protocol={},
+            dataset_snapshot_id=blocked_snapshot_id,
+        )
+    with pytest.raises(ValueError, match="Unknown strategy"):
+        repository.start_admission(
+            strategy_version="SV-MISSING",
+            methodology="nested_expanding_v3",
+        )
+
+
+def test_experiment_admissibility_is_derived_from_governed_references():
+    engine = _engine()
+    governance, snapshot_id = _strategy_draft(engine)
+    _admit_and_freeze(governance)
+    repository = ExperimentRepository(engine=engine)
+
+    run_id = repository.save_run(
+        scenario_name="governed",
+        config=Config(strategy_version="SV-001"),
+        summary=pd.Series({"Start Equity": 10_000.0, "End Equity": 10_100.0}),
+        latest_signal={"date": "2026-07-17", "regime": "neutral"},
+        dataset_snapshot_id=snapshot_id,
+        universe_version="UV-001",
+        strategy_version="SV-001",
+        admissible=False,
+    )
+
+    with engine.connect() as connection:
+        row = connection.execute(
+            select(experiment_runs).where(experiment_runs.c.id == run_id)
+        ).one()
+    assert row.admissible == 1
+    assert row.status == "complete"
+
+
+def test_experiment_cannot_forge_admissibility_with_invalid_references():
+    engine = _engine()
+    repository = ExperimentRepository(engine=engine)
+
+    run_id = repository.save_run(
+        scenario_name="forged",
+        config=Config(strategy_version="SV-MISSING"),
+        summary=pd.Series({"Start Equity": 10_000.0, "End Equity": 20_000.0}),
+        latest_signal={"date": "2026-07-17", "regime": "neutral"},
+        dataset_snapshot_id=999,
+        universe_version="UV-MISSING",
+        strategy_version="SV-MISSING",
+        admissible=True,
+    )
+
+    with engine.connect() as connection:
+        row = connection.execute(
+            select(experiment_runs).where(experiment_runs.c.id == run_id)
+        ).one()
+    assert row.admissible == 0
+    assert row.status == "blocked_data"
+    assert row.dataset_snapshot_id is None
+    assert row.universe_version is None
+    assert row.strategy_version is None
 
 
 def test_experiment_repository_forces_legacy_invalid_and_daily_weekly_exploratory():
@@ -105,12 +349,17 @@ def test_experiment_repository_forces_legacy_invalid_and_daily_weekly_explorator
         }
     assert rows[legacy_id].status == "invalid_data_v1"
     assert rows[legacy_id].admissible == 0
+    assert rows[legacy_id].universe_version is None
+    assert rows[legacy_id].strategy_version is None
     assert rows[exploratory_id].status == "exploratory_only"
     assert rows[exploratory_id].admissible == 0
+    assert rows[exploratory_id].dataset_snapshot_id is None
 
 
 def test_execution_repository_is_environment_scoped_and_fill_idempotent():
     engine = _engine()
+    governance, _ = _strategy_draft(engine)
+    _admit_and_freeze(governance)
     repository = ExecutionRepository(engine=engine, environment="PAPER")
     quote = Quote("SPY", 99.95, 100.05, NOW)
     intent = OrderIntent(
@@ -161,7 +410,7 @@ def test_execution_repository_is_environment_scoped_and_fill_idempotent():
 
 def test_admission_storage_normalizes_timestamps_and_nonfinite_trial_values():
     engine = _engine()
-    repository = GovernanceRepository(engine=engine)
+    repository, _ = _strategy_draft(engine)
 
     admission_id = repository.save_admission(
         strategy_version="SV-001",

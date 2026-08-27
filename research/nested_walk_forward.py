@@ -8,6 +8,8 @@ import pandas as pd
 
 from research.protocol import (
     CandidateParameters,
+    MOMENTUM_PROFILES,
+    REGIME_PROFILES,
     ResearchProtocol,
     parameter_neighbors,
 )
@@ -35,10 +37,11 @@ class EvaluationMetrics:
     max_drawdown: float
     stop_count: int = 0
     maximum_stop_overshoot: float = 0.0
+    degenerate_all_cash: bool = False
 
     @property
     def selection_score(self) -> float:
-        if not np.isfinite(self.excess_sharpe):
+        if self.degenerate_all_cash or not np.isfinite(self.excess_sharpe):
             return float("-inf")
         return float(self.excess_sharpe)
 
@@ -47,6 +50,7 @@ Evaluator = Callable[
     [CandidateParameters, Mapping[str, pd.DataFrame], Mapping[str, pd.DataFrame], float],
     EvaluationMetrics,
 ]
+TrialCallback = Callable[[Mapping[str, object]], None]
 
 
 def _evaluation_record(
@@ -58,7 +62,14 @@ def _evaluation_record(
 ) -> dict[str, object]:
     try:
         metric = evaluator(candidate, training, validation, cost_bps)
-        return {"status": "evaluated", "metrics": asdict(metric)}
+        return {
+            "status": (
+                "DEGENERATE_ALL_CASH"
+                if metric.degenerate_all_cash
+                else "evaluated"
+            ),
+            "metrics": asdict(metric),
+        }
     except Exception as exc:  # individual trial failure must remain auditable
         failed = EvaluationMetrics(
             excess_sharpe=float("-inf"),
@@ -71,6 +82,23 @@ def _evaluation_record(
             "error": f"{type(exc).__name__}: {exc}",
             "metrics": asdict(failed),
         }
+
+
+def _record_score(record: Mapping[str, object]) -> float:
+    if record.get("status") != "evaluated":
+        return float("-inf")
+    metrics = record["metrics"]
+    value = float(metrics["excess_sharpe"])
+    return value if np.isfinite(value) else float("-inf")
+
+
+def _trial_status(records: list[Mapping[str, object]]) -> str:
+    statuses = {str(item.get("status")) for item in records}
+    if "failed" in statuses:
+        return "failed"
+    if "DEGENERATE_ALL_CASH" in statuses:
+        return "DEGENERATE_ALL_CASH"
+    return "evaluated"
 
 
 def _first_on_or_after(index: pd.DatetimeIndex, value: pd.Timestamp) -> pd.Timestamp | None:
@@ -165,6 +193,30 @@ def _slice_data(
     return {name: frame.loc[start:end].copy() for name, frame in data.items()}
 
 
+def fixed_current_baseline_candidate(
+    protocol: ResearchProtocol,
+) -> CandidateParameters:
+    current_momentum = next(
+        profile for profile in MOMENTUM_PROFILES if profile.name == "current"
+    )
+    baseline_regime = next(
+        profile for profile in REGIME_PROFILES if profile.name == "baseline"
+    )
+    matches = [
+        candidate
+        for candidate in protocol.candidates
+        if candidate.momentum == current_momentum
+        and candidate.top_n == 3
+        and candidate.target_annual_vol == 0.12
+        and candidate.regime == baseline_regime
+    ]
+    if len(matches) != 1:
+        raise ValueError(
+            "Protocol must contain exactly one fixed current baseline candidate."
+        )
+    return matches[0]
+
+
 class NestedExpandingAdmissionRunner:
     """Runs selection without exposing outer/future rows to the evaluator."""
 
@@ -174,10 +226,70 @@ class NestedExpandingAdmissionRunner:
         evaluator: Evaluator,
         *,
         calendar_key: str = "SPY",
+        trial_callback: TrialCallback | None = None,
+        trial_cache: Mapping[tuple[str, str, str], Mapping[str, object]] | None = None,
     ) -> None:
         self.protocol = protocol
         self.evaluator = evaluator
         self.calendar_key = calendar_key
+        self.trial_callback = trial_callback
+        self.trial_cache = dict(trial_cache or {})
+
+    def _notify_trial(
+        self,
+        *,
+        stage: str,
+        fold_key: str,
+        candidate: CandidateParameters,
+        cost_bps: float,
+        record: Mapping[str, object],
+    ) -> None:
+        if self.trial_callback is None:
+            return
+        self.trial_callback(
+            {
+                "stage": stage,
+                "fold_key": fold_key,
+                "label": candidate.label,
+                "parameters": candidate.to_dict(),
+                "cost_bps": float(cost_bps),
+                **dict(record),
+                "score": _record_score(record),
+            }
+        )
+
+    def _evaluate(
+        self,
+        *,
+        stage: str,
+        fold_key: str,
+        candidate: CandidateParameters,
+        training: Mapping[str, pd.DataFrame],
+        validation: Mapping[str, pd.DataFrame],
+        cost_bps: float,
+    ) -> dict[str, object]:
+        cached = self.trial_cache.get((stage, fold_key, candidate.label))
+        if cached is not None:
+            if not isinstance(cached.get("metrics"), Mapping) or not cached.get(
+                "status"
+            ):
+                raise ValueError("Persisted admission trial is incomplete or malformed.")
+            return dict(cached)
+        record = _evaluation_record(
+            self.evaluator,
+            candidate,
+            training,
+            validation,
+            cost_bps,
+        )
+        self._notify_trial(
+            stage=stage,
+            fold_key=fold_key,
+            candidate=candidate,
+            cost_bps=cost_bps,
+            record=record,
+        )
+        return record
 
     def run(self, data: Mapping[str, pd.DataFrame]) -> dict[str, object]:
         if not data:
@@ -193,8 +305,10 @@ class NestedExpandingAdmissionRunner:
             outer_test_months=self.protocol.outer_test_months,
             minimum_outer_training_years=self.protocol.minimum_outer_training_years,
         )
+        baseline_candidate = fixed_current_baseline_candidate(self.protocol)
 
         outer_results: list[dict[str, object]] = []
+        baseline_outer_results: list[dict[str, object]] = []
         all_trials: list[dict[str, object]] = []
         base_cost = 7.0
         for outer_number, nested in enumerate(folds, start=1):
@@ -203,18 +317,23 @@ class NestedExpandingAdmissionRunner:
             }
             for candidate in self.protocol.candidates:
                 trial_folds: list[dict[str, object]] = []
-                for inner in nested.inner:
+                for inner_number, inner in enumerate(nested.inner, start=1):
                     training = _slice_data(
                         data, inner.training_start, inner.training_end
                     )
                     validation = _slice_data(
                         data, inner.validation_start, inner.validation_end
                     )
-                    record = _evaluation_record(
-                        self.evaluator, candidate, training, validation, base_cost
+                    record = self._evaluate(
+                        stage="inner_selection",
+                        fold_key=f"outer-{outer_number:03d}/inner-{inner_number:03d}",
+                        candidate=candidate,
+                        training=training,
+                        validation=validation,
+                        cost_bps=base_cost,
                     )
                     candidate_scores[candidate.label].append(
-                        float(record["metrics"]["excess_sharpe"])
+                        _record_score(record)
                     )
                     trial_folds.append({"fold": asdict(inner), **record})
                 all_trials.append(
@@ -223,11 +342,7 @@ class NestedExpandingAdmissionRunner:
                         "outer_fold": outer_number,
                         "parameters": candidate.to_dict(),
                         "folds": trial_folds,
-                        "status": (
-                            "failed"
-                            if any(item["status"] == "failed" for item in trial_folds)
-                            else "evaluated"
-                        ),
+                        "status": _trial_status(trial_folds),
                         "score": float(np.mean(candidate_scores[candidate.label])),
                     }
                 )
@@ -254,8 +369,13 @@ class NestedExpandingAdmissionRunner:
             )
             scenarios = {}
             for cost in self.protocol.cost_scenarios_bps:
-                record = _evaluation_record(
-                    self.evaluator, selected, outer_training, outer_test, cost
+                record = self._evaluate(
+                    stage="outer_evaluation",
+                    fold_key=f"outer-{outer_number:03d}/cost-{cost:.1f}",
+                    candidate=selected,
+                    training=outer_training,
+                    validation=outer_test,
+                    cost_bps=cost,
                 )
                 scenarios[str(cost)] = {
                     **record["metrics"],
@@ -270,13 +390,38 @@ class NestedExpandingAdmissionRunner:
                     "cost_scenarios": scenarios,
                 }
             )
+            baseline_scenarios = {}
+            for cost in self.protocol.cost_scenarios_bps:
+                record = self._evaluate(
+                    stage="replacement_baseline",
+                    fold_key=f"outer-{outer_number:03d}/cost-{cost:.1f}",
+                    candidate=baseline_candidate,
+                    training=outer_training,
+                    validation=outer_test,
+                    cost_bps=cost,
+                )
+                baseline_scenarios[str(cost)] = {
+                    **record["metrics"],
+                    "evaluation_status": record["status"],
+                    **({"error": record["error"]} if "error" in record else {}),
+                }
+            baseline_outer_results.append(
+                {
+                    "outer_fold": outer_number,
+                    "fold": asdict(nested.outer),
+                    "baseline_label": baseline_candidate.label,
+                    "cost_scenarios": baseline_scenarios,
+                }
+            )
 
         # Freeze-date selection repeats the same expanding annual rule using
         # every completed historical year. Future paper rows are not part of
         # ``data`` and therefore cannot affect this decision.
         dates = shared_index.sort_values().unique()
         selection_start = _first_on_or_after(
-            dates, pd.Timestamp(dates[0]) + pd.DateOffset(years=3)
+            dates,
+            pd.Timestamp(dates[0])
+            + pd.DateOffset(years=self.protocol.minimum_outer_training_years),
         )
         final_folds: list[ExpandingFold] = []
         while selection_start is not None:
@@ -302,30 +447,29 @@ class NestedExpandingAdmissionRunner:
         final_trials: list[dict[str, object]] = []
         for candidate in self.protocol.candidates:
             evaluations = []
-            for fold in final_folds:
-                record = _evaluation_record(
-                    self.evaluator,
-                    candidate,
-                    _slice_data(data, fold.training_start, fold.training_end),
-                    _slice_data(data, fold.validation_start, fold.validation_end),
-                    base_cost,
+            for fold_number, fold in enumerate(final_folds, start=1):
+                record = self._evaluate(
+                    stage="final_selection",
+                    fold_key=f"final-{fold_number:03d}",
+                    candidate=candidate,
+                    training=_slice_data(
+                        data, fold.training_start, fold.training_end
+                    ),
+                    validation=_slice_data(
+                        data, fold.validation_start, fold.validation_end
+                    ),
+                    cost_bps=base_cost,
                 )
                 evaluations.append({"fold": asdict(fold), **record})
             score = float(
-                np.mean(
-                    [item["metrics"]["excess_sharpe"] for item in evaluations]
-                )
+                np.mean([_record_score(item) for item in evaluations])
             )
             final_trials.append(
                 {
                     "label": candidate.label,
                     "parameters": candidate.to_dict(),
                     "folds": evaluations,
-                    "status": (
-                        "failed"
-                        if any(item["status"] == "failed" for item in evaluations)
-                        else "evaluated"
-                    ),
+                    "status": _trial_status(evaluations),
                     "score": score,
                 }
             )
@@ -361,7 +505,10 @@ class NestedExpandingAdmissionRunner:
                 continue
             validation_start = _first_on_or_after(
                 shifted_dates,
-                pd.Timestamp(shifted_dates[0]) + pd.DateOffset(years=3),
+                pd.Timestamp(shifted_dates[0])
+                + pd.DateOffset(
+                    years=self.protocol.minimum_outer_training_years
+                ),
             )
             scores: list[float] = []
             evaluations: list[dict[str, object]] = []
@@ -373,14 +520,20 @@ class NestedExpandingAdmissionRunner:
                 validation_end = _last_before(shifted_dates, end_exclusive)
                 if training_end is None or validation_end is None:
                     break
-                record = _evaluation_record(
-                    self.evaluator,
-                    selected_candidate,
-                    _slice_data(data, shifted_dates[0], training_end),
-                    _slice_data(data, validation_start, validation_end),
-                    base_cost,
+                record = self._evaluate(
+                    stage="start_date_robustness",
+                    fold_key=(
+                        f"offset-{offset:+d}/"
+                        f"validation-{pd.Timestamp(validation_start).date()}"
+                    ),
+                    candidate=selected_candidate,
+                    training=_slice_data(data, shifted_dates[0], training_end),
+                    validation=_slice_data(
+                        data, validation_start, validation_end
+                    ),
+                    cost_bps=base_cost,
                 )
-                score = float(record["metrics"]["excess_sharpe"])
+                score = _record_score(record)
                 scores.append(score)
                 evaluations.append(
                     {
@@ -409,6 +562,8 @@ class NestedExpandingAdmissionRunner:
             "protocol_hash": self.protocol.content_hash,
             "selection_uses_future_holdout": False,
             "outer_folds": outer_results,
+            "replacement_baseline_folds": baseline_outer_results,
+            "replacement_baseline_label": baseline_candidate.label,
             "trials": all_trials,
             "final_selection_trials": final_trials,
             "final_selected_label": final_selected["label"],
@@ -429,12 +584,36 @@ def historical_admission_gates(
     neighbor_pass_rate: float,
     start_date_pass_rate: float,
     elapsed_years: float,
-    replacement_excess_sharpe_improvement: float | None = None,
-    replacement_drawdown_improvement: float | None = None,
+    replacement_excess_sharpe_improvement: float,
+    replacement_drawdown_improvement: float,
 ) -> dict[str, bool]:
     base_metrics = [item["cost_scenarios"]["7.0"] for item in outer_results]
     stress_metrics = [item["cost_scenarios"]["20.0"] for item in outer_results]
     excess = [float(item["excess_sharpe"]) for item in base_metrics]
+    non_degenerate = bool(
+        base_metrics
+        and stress_metrics
+        and all(
+            item.get("evaluation_status") == "evaluated"
+            and not bool(item.get("degenerate_all_cash", False))
+            for item in [*base_metrics, *stress_metrics]
+        )
+    )
+    stress_net = (
+        float(np.prod([1.0 + float(item["net_return"]) for item in stress_metrics]) - 1.0)
+        if stress_metrics
+        else float("-inf")
+    )
+    stress_benchmark = (
+        float(
+            np.prod(
+                [1.0 + float(item["benchmark_return"]) for item in stress_metrics]
+            )
+            - 1.0
+        )
+        if stress_metrics
+        else float("inf")
+    )
     stop_count = sum(int(item["stop_count"]) for item in base_metrics)
     max_overshoot = max(
         (float(item["maximum_stop_overshoot"]) for item in base_metrics),
@@ -442,23 +621,32 @@ def historical_admission_gates(
     )
     thresholds = protocol.thresholds
     gates = {
+        "non_degenerate": non_degenerate,
         "median_excess_sharpe": bool(excess and np.median(excess) > thresholds.minimum_median_excess_sharpe),
         "aggregate_above_bil": aggregate_net_return > aggregate_bil_return,
-        "positive_outer_windows": bool(excess and np.mean(np.asarray(excess) > 0.0) >= thresholds.minimum_positive_outer_window_rate),
-        "stress_cost_positive": bool(stress_metrics and all(float(item["excess_sharpe"]) > 0.0 for item in stress_metrics)),
+        "positive_outer_windows": bool(
+            base_metrics
+            and np.mean(
+                [
+                    float(item["net_return"])
+                    > float(item["benchmark_return"])
+                    for item in base_metrics
+                ]
+            )
+            >= thresholds.minimum_positive_outer_window_rate
+        ),
+        "stress_cost_positive": stress_net > stress_benchmark,
         "neighbor_robustness": neighbor_pass_rate >= thresholds.minimum_neighbor_pass_rate,
         "start_date_robustness": start_date_pass_rate >= thresholds.minimum_start_date_pass_rate,
         "stop_overshoot": max_overshoot <= thresholds.maximum_stop_overshoot,
         "stop_frequency": stop_count <= (elapsed_years / 5.0) * thresholds.maximum_stops_per_five_years,
     }
-    if replacement_excess_sharpe_improvement is not None:
-        gates["replacement_sharpe"] = (
-            replacement_excess_sharpe_improvement
-            >= thresholds.replacement_excess_sharpe_improvement
-        )
-    if replacement_drawdown_improvement is not None:
-        gates["replacement_drawdown"] = (
-            replacement_drawdown_improvement
-            >= thresholds.replacement_drawdown_improvement
-        )
+    gates["replacement_sharpe"] = (
+        replacement_excess_sharpe_improvement
+        >= thresholds.replacement_excess_sharpe_improvement
+    )
+    gates["replacement_drawdown"] = (
+        replacement_drawdown_improvement
+        >= thresholds.replacement_drawdown_improvement
+    )
     return gates

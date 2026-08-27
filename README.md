@@ -8,7 +8,9 @@ A modular ETF rotation quant framework with:
 - Sample-covariance baseline plus separately gated dynamic-risk candidates
 - Risk engine
 - Backtesting engine
-- T+1 quantity/cash ledger and broker-isolated simulated OMS
+- T+1 backtest quantity/cash ledger
+- Persistent, broker-isolated local `REPLAY_OPEN` simulation with human
+  approval, T+1 settlement, reconciliation, incidents, and restart recovery
 - Two-switch connection-blocked IBKR adapter boundary for future manual use
 - Read-only external brokerage position snapshots
 - Reporting
@@ -24,6 +26,32 @@ Operational procedures are in
 The confirmed personal-research, tax-account, alert, and historical-universe
 decisions are recorded in
 [`docs/personal_research_operating_profile.md`](docs/personal_research_operating_profile.md).
+
+## Current capability boundary
+
+The formal application entry point is
+`streamlit_dashboard_db_v1_1_save_experiment.py`; `streamlit_dashboard_db.py`
+is legacy read-only. `main.py` and `DNU/` are also retained only for legacy
+audit/compatibility; the launcher does not use them. The formal Dashboard uses
+the `Config` sample-covariance baseline and a 35% maximum risky-asset weight.
+Daily and weekly runs are shown and stored as `exploratory_only`. A
+dynamic-factor choice appears only when the database contains an admitted
+risk-model result bound to a frozen strategy version.
+
+`services/paper_cycle.py` and `scripts/paper_cycle.py` provide one persistent
+local `REPLAY_OPEN` coordinator for signal, approval, raw-open replay fills,
+T+1 settlement, reconciliation, incidents, and restart recovery. SQLite is the
+source of truth and duplicate cycles/fills are rejected by stable identities.
+This is research simulation, not broker paper: it does not observe bid/ask,
+prove limit-order fill quality, or validate the 7 bp cost assumption. The local
+simulation clock must not start until the database contains an actionable
+snapshot, a complete admitted run, and a frozen strategy version.
+
+Research reports remain pre-tax and must retain
+`historical_universe_integrity=false`. IBKR connectivity, real-time market data,
+and news analysis are deferred. Local risk incidents are committed before a
+Pushover delivery is attempted; failed deliveries remain pending and can be
+retried without duplicating the incident. Database state remains authoritative.
 
 ## 1. Install
 
@@ -59,7 +87,7 @@ is current:
 
 ```powershell
 .\.venv\Scripts\python.exe -m scripts.validate_data_sources
-.\.venv\Scripts\alembic.exe upgrade head
+.\.venv\Scripts\python.exe -m alembic upgrade head
 .\.venv\Scripts\python.exe -m scripts.build_trusted_snapshot
 ```
 
@@ -74,17 +102,19 @@ The research database (`quant_research.db`) is **not** tracked in git — its
 schema is managed by Alembic and it is a runtime artifact. Build it on a fresh
 clone with:
 
-```bash
-alembic upgrade head            # create the schema (all tables) at the latest revision
+```powershell
+.\.venv\Scripts\python.exe -m alembic upgrade head
 ```
 
 This produces an empty database at v3 head. Existing rows without a v3 dataset
 snapshot are retained but marked `invalid_data_v1` and excluded from admission.
-To also import research runs from a legacy
-`SQLiteStore` database, run the one-off migration:
+The old `SQLiteStore` importer is retained as a legacy audit tool, not as part
+of normal setup. Do not point it at the active database without separately
+reviewing its input and output paths. If a reviewed legacy import is required:
 
-```bash
-python scripts/migrate_legacy_to_v2.py   # writes quant_research_v2.db, then copy it to quant_research.db
+```powershell
+.\.venv\Scripts\python.exe scripts\migrate_legacy_to_v2.py `
+  --old-db <reviewed-legacy.db> --new-db <new-output.db>
 ```
 
 The database backend is configured by `Config.db_url` (default
@@ -131,8 +161,11 @@ install `requirements.txt` with `-c constraints.lock` before trying again.
 
 The Dashboard charges trading costs, slippage, and impact separately. Sample
 covariance is the reproducible default. The dynamic risk model is not admitted
-by default; only the six preregistered half-life/stress combinations may be
-evaluated after the core strategy is frozen.
+by default; it is selectable only after a matching admitted record exists for a
+frozen strategy version. Only the six preregistered half-life/stress
+combinations may be evaluated after the core strategy is frozen. Daily and
+weekly Dashboard runs carry a prominent `exploratory_only` label and cannot
+enter admission ranking.
 
 The **Factor Monitor** tab calculates lagged rolling exposures, return
 attribution, risk contribution, and historical-percentile alerts on demand for
@@ -148,13 +181,15 @@ change strategy, risk, execution, or target-weight state.
 
 ### Manual commands
 
-```bash
-python main_with_db.py                                   # backtest + save a run to the database
-streamlit run streamlit_dashboard_db_v1_1_save_experiment.py   # browse history / save experiments
-python -m scripts.validate_dynamic_factor_model --snapshot-id <id> --strategy-version <version>
-python -m scripts.analyze_factor_attribution --snapshot-id <id>
-python -m scripts.analyze_monte_carlo --snapshot-id <id>
-python -m scripts.optimize_mirrored_portfolio            # strict local-cache mirror walk-forward
+```powershell
+.\.venv\Scripts\python.exe main_with_db.py
+.\.venv\Scripts\python.exe -m streamlit run streamlit_dashboard_db_v1_1_save_experiment.py
+.\.venv\Scripts\python.exe -m scripts.validate_dynamic_factor_model --snapshot-id <id> --strategy-version <version>
+.\.venv\Scripts\python.exe -m scripts.run_core_admission --help
+.\.venv\Scripts\python.exe -m scripts.paper_cycle --help
+.\.venv\Scripts\python.exe -m scripts.analyze_factor_attribution --snapshot-id <id>
+.\.venv\Scripts\python.exe -m scripts.analyze_monte_carlo --snapshot-id <id>
+.\.venv\Scripts\python.exe -m scripts.optimize_mirrored_portfolio
 ```
 
 The mirror optimizer uses expanding pre-holdout validation folds and evaluates
@@ -173,8 +208,10 @@ not include login credentials, tokens, or full account identifiers in the input
 file. The import command rejects sensitive fields at any nesting level, while
 the repository stores only the normalized last four account-reference
 characters and requires finite, non-negative position values. Use
-`python scripts/import_brokerage_snapshot.py snapshot.json` for normalized JSON
-exports; applying `alembic upgrade head` creates the required tables.
+`.\.venv\Scripts\python.exe scripts\import_brokerage_snapshot.py snapshot.json`
+for normalized JSON exports; applying
+`.\.venv\Scripts\python.exe -m alembic upgrade head` creates the required
+tables.
 
 New experiment rows persist the complete daily implementation audit in
 `portfolio_daily`: gross return, net daily return, turnover, estimated trading
@@ -205,16 +242,16 @@ Install `requirements-dev.txt` with `constraints.lock` before running the suite.
 The environment check fails early when Python, direct pins, or any transitive
 dependency differs from the validated contract:
 
-```bash
-python -m scripts.check_environment
-python -m pytest -q
-python -m compileall -q backtest config data execution report research risk scripts services storage strategy tests utils
-python -m pip check
-alembic current
+```powershell
+.\.venv\Scripts\python.exe -m scripts.check_environment
+.\.venv\Scripts\python.exe -m pytest -q
+.\.venv\Scripts\python.exe -m compileall -q backtest config data execution report research risk scripts services storage strategy tests utils
+.\.venv\Scripts\python.exe -m pip check
+.\.venv\Scripts\python.exe -m alembic current
 ```
 
-The expected result is a fully passing suite and Alembic revision
-`a14f0c9d7e62 (head)`. Project code emits no compatibility
+The expected result is a fully passing suite and an Alembic `current` revision
+that matches the repository's reported head. Project code emits no compatibility
 deprecation warnings in the current suite. A local pytest cache ACL warning may
 still appear on this Windows checkout and does not come from application code.
 

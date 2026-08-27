@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
 from typing import Iterable, Mapping, Sequence
 
 import numpy as np
@@ -11,6 +12,8 @@ from config.settings import Config
 from data.calendar import NyseCalendar
 from data.models import (
     CorporateAction,
+    DataQualityDecision,
+    DataQualityDisposition,
     DataQualityIssue,
     DataQualityReport,
     DataQualityStatus,
@@ -61,32 +64,44 @@ def dataset_content_hash(
     return digest.hexdigest()
 
 
-def _action_key(action: CorporateAction) -> tuple[str, str, str]:
-    action = action.normalized()
-    return action.ticker, str(action.ex_date.date()), action.action_type
-
-
-def _quality_snapshot_hash(
+def raw_market_data_hash(
     primary: ProviderPayload,
     secondary: ProviderPayload | None,
-    *,
-    status: DataQualityStatus,
-    expected_session: str,
-    latest_session: str | None,
-    stale_sessions: int | None,
-    issues: Sequence[DataQualityIssue],
 ) -> str:
+    """Hash both immutable vendor payloads, independent of QA conclusions."""
     material = {
-        "primary_hash": dataset_content_hash(
+        "primary": dataset_content_hash(
             primary.bars, primary.actions, source=primary.source
         ),
-        "secondary_hash": (
+        "secondary": (
             None
             if secondary is None
             else dataset_content_hash(
                 secondary.bars, secondary.actions, source=secondary.source
             )
         ),
+    }
+    return hashlib.sha256(
+        json.dumps(material, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _action_key(action: CorporateAction) -> tuple[str, str, str]:
+    action = action.normalized()
+    return action.ticker, str(action.ex_date.date()), action.action_type
+
+
+def _quality_snapshot_hash(
+    *,
+    status: DataQualityStatus,
+    expected_session: str,
+    latest_session: str | None,
+    stale_sessions: int | None,
+    issues: Sequence[DataQualityIssue],
+    raw_data_hash: str,
+) -> str:
+    material = {
+        "raw_data_hash": raw_data_hash,
         "status": status.value,
         "expected_session": expected_session,
         "latest_session": latest_session,
@@ -100,6 +115,7 @@ def _quality_snapshot_hash(
                     "session": issue.session,
                     "value": issue.value,
                     "message": issue.message,
+                    "fingerprint": issue.fingerprint,
                 }
                 for issue in issues
             ],
@@ -114,6 +130,156 @@ def _quality_snapshot_hash(
     return hashlib.sha256(
         json.dumps(material, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
+
+
+def apply_data_quality_decisions(
+    report: DataQualityReport,
+    decisions: Sequence[DataQualityDecision],
+    *,
+    source_snapshot_id: int,
+    primary: ProviderPayload | None = None,
+    secondary: ProviderPayload | None = None,
+    config: Config | None = None,
+) -> DataQualityReport:
+    """Apply exact, immutable issue decisions without mutating the source report."""
+    if not decisions:
+        return report
+    if report.status != DataQualityStatus.BLOCKED:
+        raise ValueError("Data quality decisions can be applied only to a blocked snapshot.")
+    if not report.raw_data_hash:
+        raise ValueError("The source snapshot has no raw_data_hash; decisions cannot apply.")
+
+    blocked = {
+        issue.fingerprint: issue
+        for issue in report.issues
+        if issue.severity == QualitySeverity.BLOCK
+    }
+    accepted: set[str] = set()
+    decision_hashes: set[str] = set()
+    for decision in decisions:
+        if decision.source_snapshot_id != int(source_snapshot_id):
+            raise ValueError("Decision source_snapshot_id does not match the source snapshot.")
+        if decision.raw_data_hash != report.raw_data_hash:
+            raise ValueError("Decision raw_data_hash is stale for this snapshot.")
+        issue = blocked.get(decision.issue_fingerprint)
+        if issue is None:
+            raise ValueError("Decision fingerprint does not identify a current blocking issue.")
+        if (
+            issue.code != decision.issue_code
+            or issue.ticker != decision.ticker
+            or issue.session is None
+            or not decision.start_date <= issue.session <= decision.end_date
+        ):
+            raise ValueError("Decision code, ticker, or date scope does not match its issue.")
+        decision_hashes.add(decision.decision_hash)
+        if decision.disposition == DataQualityDisposition.ACCEPTED_EXCEPTION:
+            accepted.add(issue.fingerprint)
+            accepted.update(
+                _bounded_close_normalization_matches(
+                    report,
+                    decision,
+                    issue,
+                    primary=primary,
+                    secondary=secondary,
+                    config=config,
+                )
+            )
+
+    decision_set_hash = hashlib.sha256(
+        json.dumps(sorted(decision_hashes), separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    unresolved = set(blocked).difference(accepted)
+    status = (
+        DataQualityStatus.BLOCKED
+        if unresolved
+        else DataQualityStatus.TRUSTED_WITH_EXCEPTIONS
+    )
+    content_hash = hashlib.sha256(
+        json.dumps(
+            {
+                "source_content_hash": report.content_hash,
+                "source_snapshot_id": int(source_snapshot_id),
+                "raw_data_hash": report.raw_data_hash,
+                "decision_set_hash": decision_set_hash,
+                "status": status.value,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return replace(
+        report,
+        status=status,
+        content_hash=content_hash,
+        source_snapshot_id=int(source_snapshot_id),
+        decision_set_hash=decision_set_hash,
+        adjudicated_issue_fingerprints=tuple(sorted(accepted)),
+    )
+
+
+def _bounded_close_normalization_matches(
+    report: DataQualityReport,
+    decision: DataQualityDecision,
+    source_issue: DataQualityIssue,
+    *,
+    primary: ProviderPayload | None,
+    secondary: ProviderPayload | None,
+    config: Config | None,
+) -> set[str]:
+    normalization = decision.normalization
+    if normalization.get("kind") != "bounded_close_factor":
+        return set()
+    if primary is None or secondary is None or config is None:
+        raise ValueError("Bounded close normalization requires both raw sources and config.")
+    if decision.end_date != source_issue.session:
+        raise ValueError("Close normalization must end at its corporate-action issue date.")
+    transform_start = pd.Timestamp(normalization["start_date"])
+    transform_end = pd.Timestamp(normalization["end_date"])
+    event_date = pd.Timestamp(source_issue.session)
+    if not 1 <= (event_date - transform_end).days <= 7:
+        raise ValueError("Close normalization must stop immediately before its event.")
+    if report.latest_session is None or pd.Timestamp(report.latest_session) <= event_date:
+        raise ValueError("Close normalization requires post-event observations.")
+
+    ticker = decision.ticker
+    if ticker not in primary.bars or ticker not in secondary.bars:
+        raise ValueError("Close normalization ticker is missing from a raw source.")
+    left = _split_normalized_close(primary, ticker).copy()
+    right = _split_normalized_close(secondary, ticker).copy()
+    target = left if normalization["role"] == "primary" else right
+    mask = (target.index >= transform_start) & (target.index <= transform_end)
+    if not mask.any() or mask.all():
+        raise ValueError("Close normalization must cover a finite pre-event subset.")
+    factor = float(normalization["factor"])
+    if normalization["operation"] == "multiply":
+        target.loc[mask] *= factor
+    else:
+        target.loc[mask] /= factor
+
+    aligned = pd.concat(
+        [left.rename("primary"), right.rename("secondary")], axis=1, join="inner"
+    ).dropna()
+    difference_bps = (
+        (aligned["primary"] / aligned["secondary"] - 1.0).abs() * 10000.0
+    )
+    derivative_issues = [
+        issue
+        for issue in report.issues
+        if issue.severity == QualitySeverity.BLOCK
+        and issue.code == "CROSS_SOURCE_CLOSE_MISMATCH"
+        and issue.ticker == ticker
+        and issue.session is not None
+        and str(transform_start.date()) <= issue.session <= str(transform_end.date())
+    ]
+    if not derivative_issues:
+        raise ValueError("Close normalization has no bounded derivative mismatch issues.")
+    return {
+        issue.fingerprint
+        for issue in derivative_issues
+        if pd.Timestamp(issue.session) in difference_bps.index
+        and float(difference_bps.loc[pd.Timestamp(issue.session)])
+        <= config.source_block_bps
+    }
 
 
 def _split_normalized_close(payload: ProviderPayload, ticker: str) -> pd.Series:
@@ -185,6 +351,7 @@ def _compare_actions(
                     f"Corporate action {key} exists in only one provider.",
                     ticker=key[0],
                     session=key[1],
+                    context={"action_type": key[2]},
                 )
             )
             continue
@@ -231,6 +398,7 @@ def _compare_actions(
                     f"Corporate action values disagree for {key}.",
                     ticker=key[0],
                     session=key[1],
+                    context={"action_type": key[2]},
                 )
             )
     return issues
@@ -395,6 +563,7 @@ def assess_market_data_quality(
         status = DataQualityStatus.TRUSTED
     expected_text = str(expected.date())
     latest_text = None if latest is None else str(latest.date())
+    raw_data_hash = raw_market_data_hash(primary, secondary)
     return DataQualityReport(
         status=status,
         primary_source=primary.source,
@@ -403,13 +572,13 @@ def assess_market_data_quality(
         latest_session=latest_text,
         stale_sessions=None if freshness is None else freshness.stale_sessions,
         issues=tuple(issues),
+        raw_data_hash=raw_data_hash,
         content_hash=_quality_snapshot_hash(
-            primary,
-            secondary,
             status=status,
             expected_session=expected_text,
             latest_session=latest_text,
             stale_sessions=None if freshness is None else freshness.stale_sessions,
             issues=issues,
+            raw_data_hash=raw_data_hash,
         ),
     )

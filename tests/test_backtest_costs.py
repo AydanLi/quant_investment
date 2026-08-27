@@ -82,6 +82,7 @@ def test_backtest_daily_return_matches_equity_after_costs_and_t_plus_one():
 
     previous_equity = config.initial_capital
     for _, row in portfolio.iterrows():
+        assert row["previous_nav"] == pytest.approx(previous_equity)
         realized_return = row["equity"] / previous_equity - 1.0
         assert abs(realized_return - row["daily_return"]) < 1e-12
         expected_gross = (row["equity"] + row["cost_dollars"]) / previous_equity - 1.0
