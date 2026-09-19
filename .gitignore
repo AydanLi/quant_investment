@@ -37,3 +37,7 @@ quant_research_before_snapshot_*.db*
 # Local project review and progress notes
 CHANGELOG.md
 PROJECT_STATUS.md
+
+# Local audit and code review reports (including capitalized filenames)
+*[Aa][Uu][Dd][Ii][Tt]*.md
+*[Rr][Ee][Vv][Ii][Ee][Ww]*.md
