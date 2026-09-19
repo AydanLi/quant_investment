@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from functools import partial
 import re
 from typing import Union
 
@@ -17,6 +18,7 @@ from report.benchmarks import build_benchmark_returns
 from report.reporter import ReportGenerator
 from risk.engine import RiskEngine
 from services.dashboard_display import format_parameter_display_value
+from services.dashboard_i18n import localize_frame, translate, translate_warning
 from services.experiment_validation import validate_experiment_parameters
 from services.factor_monitor import FACTOR_LABELS, build_factor_monitor
 from services.monte_carlo_monitor import build_monte_carlo_monitor
@@ -144,6 +146,7 @@ def synced_numeric_parameter(
     value: Numeric,
     step: Numeric,
     number_format: str,
+    language: str = "zh",
 ) -> Numeric:
     """Render a slider and direct-entry box backed by synchronized state."""
     slider_key = f"{key}_slider"
@@ -165,7 +168,7 @@ def synced_numeric_parameter(
     slider_col, input_col = st.columns([2, 1], gap="small")
     with slider_col:
         st.slider(
-            f"{label} slider",
+            translate("{label} slider", language, label=label),
             min_value=min_value,
             max_value=max_value,
             step=step,
@@ -176,7 +179,7 @@ def synced_numeric_parameter(
         )
     with input_col:
         st.number_input(
-            f"{label} direct input",
+            translate("{label} direct input", language, label=label),
             min_value=min_value,
             max_value=max_value,
             step=step,
@@ -358,161 +361,214 @@ def execute_experiment_and_save(
 
 def main() -> None:
     baseline_config = Config()
-    st.set_page_config(page_title="Quant Research DB Dashboard v1.1", layout="wide")
-    st.title("Quant Research DB Dashboard v1.1")
+    if "dashboard_language" not in st.session_state:
+        requested_language = st.query_params.get("lang", "zh")
+        st.session_state["dashboard_language"] = (
+            requested_language if requested_language in {"zh", "en"} else "zh"
+        )
+
+    def refresh_option_labels() -> None:
+        # Streamlit keeps the selected display string when format_func changes.
+        # Re-send the same canonical values to refresh their translated labels.
+        for key in ("rebalance_frequency", "risk_model"):
+            if key in st.session_state:
+                st.session_state[key] = st.session_state[key]
+
+    language = st.sidebar.selectbox(
+        "Language / 语言",
+        options=["zh", "en"],
+        format_func=lambda value: {"zh": "中文", "en": "English"}[value],
+        key="dashboard_language",
+        on_change=refresh_option_labels,
+    )
+    # Keep refreshes and shared dashboard URLs in the selected language.
+    if st.query_params.get("lang") != language:
+        st.query_params["lang"] = language
+    t = partial(translate, language=language)
+    st.set_page_config(page_title=t("Quant Research DB Dashboard v1.1"), layout="wide")
+    st.title(t("Quant Research DB Dashboard v1.1"))
     st.caption(
-        "正式研究入口：读取SQLite历史实验，并保存受治理标记约束的新实验。"
+        t("正式研究入口：读取SQLite历史实验，并保存受治理标记约束的新实验。")
     )
 
     with st.sidebar:
-        st.header("数据库设置")
+        st.header(t("数据库设置"))
         limit = int(
             synced_numeric_parameter(
-                "读取最近实验数量",
+                t("读取最近实验数量"),
                 "history_limit",
                 min_value=5,
                 max_value=100,
                 value=20,
                 step=5,
                 number_format="%d",
+                language=language,
             )
         )
-        st.write(f"当前数据库文件：`{DB_PATH}`")
+        st.write(t("当前数据库文件：`{path}`", path=DB_PATH))
 
-        st.header("新实验参数")
-        scenario_name = st.text_input("Scenario Name", value="dashboard_manual_run")
-        start_date = st.text_input("Start Date", value=baseline_config.start_date)
+        st.header(t("新实验参数"))
+        scenario_name = st.text_input(
+            t("Scenario Name"), value="dashboard_manual_run", key="scenario_name"
+        )
+        start_date = st.text_input(
+            t("Start Date"), value=baseline_config.start_date, key="start_date"
+        )
         frequency_options = ["D", "W", "M"]
+        if "rebalance_frequency" not in st.session_state:
+            st.session_state["rebalance_frequency"] = baseline_config.rebalance_frequency
         rebalance_frequency = st.selectbox(
-            "Rebalance Frequency",
+            t("Rebalance Frequency"),
             frequency_options,
-            index=frequency_options.index(baseline_config.rebalance_frequency),
+            key="rebalance_frequency",
             format_func=lambda value: (
-                f"{value} — exploratory_only"
+                f"{value} — {t('仅供探索')}"
                 if value in EXPLORATORY_FREQUENCIES
-                else f"{value} — admission protocol"
+                else f"{value} — {t('准入协议')}"
             ),
         )
         if frequency_governance_status(rebalance_frequency) == "exploratory_only":
             st.warning(
-                "EXPLORATORY_ONLY：日频/周频结果不得进入准入排名或称为正式候选。"
+                t("EXPLORATORY_ONLY：日频/周频结果不得进入准入排名或称为正式候选。")
             )
         top_n = int(
             synced_numeric_parameter(
-                "Top N Assets",
+                t("Top N Assets"),
                 "top_n",
                 min_value=1,
                 max_value=6,
                 value=baseline_config.top_n,
                 step=1,
                 number_format="%d",
+                language=language,
             )
         )
         min_momentum_threshold = float(
             synced_numeric_parameter(
-                "Min Momentum Threshold",
+                t("Min Momentum Threshold"),
                 "min_momentum_threshold",
                 min_value=-0.10,
                 max_value=0.20,
                 value=baseline_config.min_momentum_threshold,
                 step=0.01,
                 number_format="%.2f",
+                language=language,
             )
         )
         target_annual_vol = float(
             synced_numeric_parameter(
-                "Target Annual Vol",
+                t("Target Annual Vol"),
                 "target_annual_vol",
                 min_value=0.05,
                 max_value=0.30,
                 value=baseline_config.target_annual_vol,
                 step=0.01,
                 number_format="%.2f",
+                language=language,
             )
         )
         max_asset_weight = float(
             synced_numeric_parameter(
-                "Max Asset Weight",
+                t("Max Asset Weight"),
                 "max_asset_weight",
                 min_value=0.10,
                 max_value=baseline_config.max_asset_weight,
                 value=baseline_config.max_asset_weight,
                 step=0.05,
                 number_format="%.2f",
+                language=language,
             )
         )
         risk_off_cash_weight = float(
             synced_numeric_parameter(
-                "Risk-Off Cash Weight",
+                t("Risk-Off Cash Weight"),
                 "risk_off_cash_weight",
                 min_value=0.00,
                 max_value=1.00,
                 value=baseline_config.risk_off_cash_weight,
                 step=0.05,
                 number_format="%.2f",
+                language=language,
             )
         )
         vix_risk_off_threshold = float(
             synced_numeric_parameter(
-                "VIX Risk-Off Threshold",
+                t("VIX Risk-Off Threshold"),
                 "vix_risk_off_threshold",
                 min_value=15.0,
                 max_value=50.0,
                 value=baseline_config.vix_risk_off_threshold,
                 step=1.0,
                 number_format="%.1f",
+                language=language,
             )
         )
         vix_high_threshold = float(
             synced_numeric_parameter(
-                "VIX High Threshold",
+                t("VIX High Threshold"),
                 "vix_high_threshold",
                 min_value=12.0,
                 max_value=40.0,
                 value=baseline_config.vix_high_threshold,
                 step=1.0,
                 number_format="%.1f",
+                language=language,
             )
         )
         trading_cost_bps = float(
             synced_numeric_parameter(
-                "Trading Cost (bps)",
+                t("Trading Cost (bps)"),
                 "trading_cost_bps",
                 min_value=0.0,
                 max_value=30.0,
                 value=baseline_config.trading_cost_bps,
                 step=0.5,
                 number_format="%.1f",
+                language=language,
             )
         )
         slippage_bps = float(
             synced_numeric_parameter(
-                "Slippage (bps)",
+                t("Slippage (bps)"),
                 "slippage_bps",
                 min_value=0.0,
                 max_value=30.0,
                 value=baseline_config.slippage_bps,
                 step=0.5,
                 number_format="%.1f",
+                language=language,
             )
         )
         admitted_dynamic_factor = load_admitted_dynamic_factor()
         risk_model_options = dashboard_risk_model_options(admitted_dynamic_factor)
         risk_model_label = st.selectbox(
-            "Risk Model",
+            t("Risk Model"),
             options=list(risk_model_options),
             index=0,
+            key="risk_model",
+            format_func=lambda value: (
+                t("Sample covariance（基准）")
+                if value == "Sample covariance（基准）"
+                else t(
+                    "Dynamic factor（已准入：{label}）",
+                    label=risk_model_options[value]["admission_label"],
+                )
+            ),
         )
         risk_model_settings = risk_model_options[risk_model_label]
         if admitted_dynamic_factor is None:
             st.caption(
-                "当前仅可选择sample covariance基准；数据库没有可验证的"
-                "dynamic_factor已准入记录。"
+                t(
+                    "当前仅可选择sample covariance基准；数据库没有可验证的"
+                    "dynamic_factor已准入记录。"
+                )
             )
         else:
             st.caption(
-                "dynamic_factor选项来自已准入记录及对应的冻结策略版本；"
-                "未被记录选中的参数不会显示。"
+                t(
+                    "dynamic_factor选项来自已准入记录及对应的冻结策略版本；"
+                    "未被记录选中的参数不会显示。"
+                )
             )
 
         auto_name = (
@@ -523,9 +579,11 @@ def main() -> None:
             f"_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}"
         )
 
-        use_auto_name = st.checkbox("自动生成实验名称", value=True)
+        use_auto_name = st.checkbox(
+            t("自动生成实验名称"), value=True, key="use_auto_name"
+        )
         final_scenario_name = auto_name if use_auto_name else scenario_name
-        st.caption(f"当前将保存为：{final_scenario_name}")
+        st.caption(t("当前将保存为：{name}", name=final_scenario_name))
 
         validation_errors = validate_experiment_parameters(
             history_limit=limit,
@@ -544,17 +602,21 @@ def main() -> None:
         )
         if validation_errors:
             st.error(
-                "请修正以下参数：\n\n"
-                + "\n".join(f"- {message}" for message in validation_errors)
+                t("请修正以下参数：\n\n")
+                + "\n".join(
+                    f"- {translate_warning(message, language)}"
+                    for message in validation_errors
+                )
             )
 
         if st.button(
-            "保存当前参数为新实验",
+            t("保存当前参数为新实验"),
             type="primary",
             width="stretch",
             disabled=bool(validation_errors),
+            key="save_experiment",
         ):
-            with st.spinner("正在回测并写入数据库..."):
+            with st.spinner(t("正在回测并写入数据库...")):
                 try:
                     run_id = execute_experiment_and_save(
                         scenario_name=final_scenario_name,
@@ -578,47 +640,48 @@ def main() -> None:
                         ),
                     )
                     st.cache_data.clear()
-                    st.success(f"保存成功，run_id = {run_id}")
+                    st.success(t("保存成功，run_id = {run_id}", run_id=run_id))
                 except Exception as exc:
-                    st.error(f"保存失败：{exc}")
+                    st.error(t("保存失败：{error}", error=exc))
 
     effective_limit = limit if 5 <= limit <= 100 else 20
     try:
         runs = load_runs(effective_limit)
     except Exception as exc:
-        st.error(f"读取数据库失败：{exc}")
+        st.error(t("读取数据库失败：{error}", error=exc))
         return
 
     if runs.empty:
         st.warning(
-            "数据库里还没有实验记录。先点击左侧按钮保存一条新实验，"
-            "或运行 `.\\.venv\\Scripts\\python.exe main_with_db.py`。"
+            t("数据库里还没有实验记录。请使用左侧按钮保存一条新实验。")
         )
         return
 
-    st.subheader("最近实验记录")
-    st.dataframe(runs, width="stretch")
+    st.subheader(t("最近实验记录"))
+    st.dataframe(localize_frame(runs, language), width="stretch")
 
     run_id_list = runs["id"].tolist()
-    selected_run_id = st.selectbox("选择 run_id", options=run_id_list, index=0)
+    selected_run_id = st.selectbox(
+        t("选择 run_id"), options=run_id_list, index=0, key="selected_run_id"
+    )
     selected_row = runs[runs["id"] == selected_run_id].iloc[0]
 
-    st.subheader(f"实验摘要 · run_id={selected_run_id}")
+    st.subheader(t("实验摘要 · run_id={run_id}", run_id=selected_run_id))
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Scenario", str(selected_row.get("scenario_name", "N/A")))
-    c2.metric("CAGR", format_pct(selected_row.get("cagr")))
-    c3.metric("Sharpe", f"{selected_row['sharpe']:.2f}" if pd.notna(selected_row.get("sharpe")) else "N/A")
-    c4.metric("Sortino", f"{selected_row['sortino']:.2f}" if pd.notna(selected_row.get("sortino")) else "N/A")
-    c5.metric("Max Drawdown", format_pct(selected_row.get("max_drawdown")))
+    c1.metric(t("Scenario"), str(selected_row.get("scenario_name", "N/A")))
+    c2.metric(t("CAGR"), format_pct(selected_row.get("cagr")))
+    c3.metric(t("Sharpe"), f"{selected_row['sharpe']:.2f}" if pd.notna(selected_row.get("sharpe")) else "N/A")
+    c4.metric(t("Sortino"), f"{selected_row['sortino']:.2f}" if pd.notna(selected_row.get("sortino")) else "N/A")
+    c5.metric(t("Max Drawdown"), format_pct(selected_row.get("max_drawdown")))
 
     c6, c7, c8, c9, c10 = st.columns(5)
-    c6.metric("Annual Vol", format_pct(selected_row.get("annual_vol")))
-    c7.metric("Avg Turnover", f"{selected_row['avg_turnover']:.4f}" if pd.notna(selected_row.get("avg_turnover")) else "N/A")
-    c8.metric("Rebalance", str(selected_row.get("rebalance_frequency", "N/A")))
-    c9.metric("Top N", str(selected_row.get("top_n", "N/A")))
-    c10.metric("Latest Regime", str(selected_row.get("latest_regime", "N/A")))
+    c6.metric(t("Annual Vol"), format_pct(selected_row.get("annual_vol")))
+    c7.metric(t("Avg Turnover"), f"{selected_row['avg_turnover']:.4f}" if pd.notna(selected_row.get("avg_turnover")) else "N/A")
+    c8.metric(t("Rebalance"), str(selected_row.get("rebalance_frequency", "N/A")))
+    c9.metric(t("Top N"), str(selected_row.get("top_n", "N/A")))
+    c10.metric(t("Latest Regime"), str(selected_row.get("latest_regime", "N/A")))
 
-    st.subheader("参数快照")
+    st.subheader(t("参数快照"))
     param_cols = [
         "start_date",
         "rebalance_frequency",
@@ -642,7 +705,7 @@ def main() -> None:
     param_df = pd.DataFrame(
         [
             {
-                "Parameter": col,
+                "Parameter": t(col),
                 "Value": format_parameter_display_value(
                     selected_row.get(col)
                     if pd.notna(selected_row.get(col))
@@ -652,12 +715,12 @@ def main() -> None:
             for col in param_cols
         ]
     )
-    st.dataframe(param_df, width="stretch")
+    st.dataframe(localize_frame(param_df, language), width="stretch")
 
     try:
         portfolio, orders, signals = load_run_details(int(selected_run_id))
     except Exception as exc:
-        st.error(f"读取 run 详情失败：{exc}")
+        st.error(t("读取 run 详情失败：{error}", error=exc))
         return
 
     if not portfolio.empty:
@@ -667,63 +730,65 @@ def main() -> None:
 
     tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
         [
-            "净值曲线",
-            "订单日志",
-            "信号快照",
-            "因子监控",
-            "蒙特卡洛监控",
-            "原始数据",
+            t("净值曲线"),
+            t("订单日志"),
+            t("信号快照"),
+            t("因子监控"),
+            t("蒙特卡洛监控"),
+            t("原始数据"),
         ]
     )
 
     with tab1:
-        st.subheader("净值曲线")
+        st.subheader(t("净值曲线"))
         if portfolio.empty:
-            st.info("该 run 没有 portfolio_daily 数据。")
+            st.info(t("该 run 没有 portfolio_daily 数据。"))
         else:
             chart_df = portfolio[["date", "equity"]].set_index("date")
-            st.line_chart(chart_df)
+            st.line_chart(localize_frame(chart_df, language))
 
             d1, d2, d3, d4 = st.columns(4)
-            d1.metric("Start Equity", f"${safe_float(portfolio['equity'].iloc[0]):,.2f}" if not portfolio.empty else "N/A")
-            d2.metric("End Equity", f"${safe_float(portfolio['equity'].iloc[-1]):,.2f}" if not portfolio.empty else "N/A")
-            d3.metric("Rows", str(len(portfolio)))
-            d4.metric("Last Regime", str(portfolio['regime'].iloc[-1]) if 'regime' in portfolio.columns and not portfolio.empty else "N/A")
+            d1.metric(t("Start Equity"), f"${safe_float(portfolio['equity'].iloc[0]):,.2f}" if not portfolio.empty else "N/A")
+            d2.metric(t("End Equity"), f"${safe_float(portfolio['equity'].iloc[-1]):,.2f}" if not portfolio.empty else "N/A")
+            d3.metric(t("Rows"), str(len(portfolio)))
+            d4.metric(t("Last Regime"), str(portfolio['regime'].iloc[-1]) if 'regime' in portfolio.columns and not portfolio.empty else "N/A")
 
-            st.subheader("Regime 分布")
+            st.subheader(t("Regime 分布"))
             if "regime" in portfolio.columns:
                 regime_counts = portfolio["regime"].value_counts().rename_axis("regime").reset_index(name="count")
-                st.bar_chart(regime_counts.set_index("regime"))
+                st.bar_chart(
+                    localize_frame(regime_counts.set_index("regime"), language)
+                )
 
     with tab2:
-        st.subheader("订单日志")
+        st.subheader(t("订单日志"))
         if orders.empty:
-            st.info("该 run 没有订单记录。")
+            st.info(t("该 run 没有订单记录。"))
         else:
-            st.dataframe(orders, width="stretch")
+            st.dataframe(localize_frame(orders, language), width="stretch")
 
     with tab3:
-        st.subheader("信号快照")
+        st.subheader(t("信号快照"))
         if signals.empty:
-            st.info("该 run 没有 signals 数据。")
+            st.info(t("该 run 没有 signals 数据。"))
         else:
             signals = signals.copy()
-            st.dataframe(signals, width="stretch")
+            st.dataframe(localize_frame(signals, language), width="stretch")
             if {"ticker", "weight"}.issubset(signals.columns):
                 signal_chart = signals[["ticker", "weight"]].copy()
                 signal_chart = signal_chart.set_index("ticker")
-                st.bar_chart(signal_chart)
+                st.bar_chart(localize_frame(signal_chart, language))
 
     with tab4:
-        st.subheader("因子诊断与监控")
-        st.info("当前为只读诊断层：不会修改策略信号、风险引擎或目标仓位。")
+        st.subheader(t("因子诊断与监控"))
+        st.info(t("当前为只读诊断层：不会修改策略信号、风险引擎或目标仓位。"))
         if portfolio.empty:
-            st.info("该 run 没有可用于因子归因的日收益数据。")
+            st.info(t("该 run 没有可用于因子归因的日收益数据。"))
         else:
             try:
                 monitor = load_factor_monitor(int(selected_run_id))
             except Exception as exc:
-                st.warning(f"暂时无法生成因子监控：{exc}")
+                st.warning(t("暂时无法生成因子监控：{error}", error=exc))
             else:
                 summary = monitor.rolling_summary
                 regression = monitor.static_regression
@@ -731,108 +796,119 @@ def main() -> None:
                     "residual", float("nan")
                 )
                 m1, m2, m3, m4, m5 = st.columns(5)
-                m1.metric("滚动 OOS R²", format_pct(summary["oos_r_squared"]))
+                m1.metric(t("滚动 OOS R²"), format_pct(summary["oos_r_squared"]))
                 m2.metric(
-                    "年化回归 Alpha",
+                    t("年化回归 Alpha"),
                     format_pct(regression.coefficients["alpha"] * 252.0),
                 )
-                m3.metric("Alpha t 值", f"{regression.t_statistics['alpha']:.2f}")
-                m4.metric("残差风险占比", format_pct(residual_share))
-                m5.metric("归因观测数", str(summary["observations"]))
+                m3.metric(t("Alpha t 值"), f"{regression.t_statistics['alpha']:.2f}")
+                m4.metric(t("残差风险占比"), format_pct(residual_share))
+                m5.metric(t("归因观测数"), str(summary["observations"]))
 
                 if monitor.status == "normal":
-                    st.success("当前因子暴露处于本次实验的历史正常区间。")
+                    st.success(t("当前因子暴露处于本次实验的历史正常区间。"))
                 else:
-                    st.warning("当前监控状态：需要观察。")
+                    st.warning(t("当前监控状态：需要观察。"))
                     for message in monitor.warnings:
-                        st.write(f"- {message}")
+                        st.write(f"- {translate_warning(message, language)}")
 
-                st.subheader("最新暴露与历史区间")
+                st.subheader(t("最新暴露与历史区间"))
                 st.dataframe(
-                    monitor.exposure_table.reset_index(drop=True),
+                    localize_frame(
+                        monitor.exposure_table.reset_index(drop=True),
+                        language,
+                        value_columns=("因子", "状态"),
+                    ),
                     width="stretch",
                 )
 
-                st.subheader("最近两年滚动因子暴露")
+                st.subheader(t("最近两年滚动因子暴露"))
                 exposure_chart = monitor.rolling_attribution.exposures[
                     list(FACTOR_LABELS)
-                ].rename(columns=FACTOR_LABELS)
+                ].rename(
+                    columns={key: t(value) for key, value in FACTOR_LABELS.items()}
+                )
                 st.line_chart(exposure_chart.tail(504))
 
                 component_labels = {
-                    "cash": "现金基线",
-                    "alpha": "回归 Alpha",
-                    "residual": "回归残差",
-                    **FACTOR_LABELS,
+                    "cash": t("现金基线"),
+                    "alpha": t("回归 Alpha"),
+                    "residual": t("回归残差"),
+                    **{key: t(value) for key, value in FACTOR_LABELS.items()},
                 }
-                st.subheader("年化算术收益贡献")
+                st.subheader(t("年化算术收益贡献"))
                 return_contribution = monitor.return_contribution.rename(
                     index=component_labels
-                ).rename("贡献")
+                ).rename(t("贡献"))
                 st.bar_chart(return_contribution)
 
-                st.subheader("收益波动风险贡献")
+                st.subheader(t("收益波动风险贡献"))
                 risk_contribution = monitor.risk_contribution.rename(
                     index=component_labels
-                ).rename("占比")
+                ).rename(t("占比"))
                 st.dataframe(
                     risk_contribution.to_frame(), width="stretch"
                 )
 
                 if abs(regression.t_statistics["alpha"]) < 1.96:
                     st.caption(
-                        "当前 Alpha 未达到 |t| ≥ 1.96，不能视为统计显著的独立超额收益。"
+                        t("当前 Alpha 未达到 |t| ≥ 1.96，不能视为统计显著的独立超额收益。")
                     )
 
     with tab5:
-        st.subheader("蒙特卡洛尾部风险监控")
-        st.info("当前为只读诊断层：模拟结果不会修改策略信号、风控参数或目标仓位。")
+        st.subheader(t("蒙特卡洛尾部风险监控"))
+        st.info(t("当前为只读诊断层：模拟结果不会修改策略信号、风控参数或目标仓位。"))
         if portfolio.empty:
-            st.info("该 run 没有可用于蒙特卡洛监控的日收益数据。")
+            st.info(t("该 run 没有可用于蒙特卡洛监控的日收益数据。"))
         else:
             try:
                 monte_carlo = load_monte_carlo_monitor(int(selected_run_id))
             except Exception as exc:
-                st.warning(f"暂时无法生成蒙特卡洛监控：{exc}")
+                st.warning(t("暂时无法生成蒙特卡洛监控：{error}", error=exc))
             else:
                 c1, c2, c3, c4, c5 = st.columns(5)
                 c1.metric(
-                    f"未来{monte_carlo.horizon}日亏损概率",
+                    t("未来{horizon}日亏损概率", horizon=monte_carlo.horizon),
                     format_pct(monte_carlo.probability_of_loss),
                 )
                 c2.metric(
-                    "5%尾部最大回撤",
+                    t("5%尾部最大回撤"),
                     format_pct(monte_carlo.tail_max_drawdown),
                 )
                 c3.metric(
-                    "中位最大回撤",
+                    t("中位最大回撤"),
                     format_pct(monte_carlo.median_max_drawdown),
                 )
                 c4.metric(
-                    "中位总收益",
+                    t("中位总收益"),
                     format_pct(monte_carlo.median_total_return),
                 )
-                c5.metric("中位 Sharpe", f"{monte_carlo.median_sharpe:.2f}")
+                c5.metric(t("中位 Sharpe"), f"{monte_carlo.median_sharpe:.2f}")
 
                 if monte_carlo.status == "normal":
-                    st.success("当前模拟尾部风险未触发观察阈值。")
+                    st.success(t("当前模拟尾部风险未触发观察阈值。"))
                 else:
-                    st.warning("当前蒙特卡洛状态：需要观察。")
+                    st.warning(t("当前蒙特卡洛状态：需要观察。"))
                     for message in monte_carlo.warnings:
-                        st.write(f"- {message}")
+                        st.write(f"- {translate_warning(message, language)}")
 
                 st.caption(
-                    f"使用 {monte_carlo.observations} 个历史观测、"
-                    f"{monte_carlo.simulations} 条路径、"
-                    f"{monte_carlo.block_length} 日区块；"
-                    f"模拟中位换手 {monte_carlo.median_turnover:.2f}，"
-                    f"中位估算成本 {monte_carlo.median_cost:.2%}。"
+                    t(
+                        "使用 {observations} 个历史观测、{simulations} 条路径、"
+                        "{block_length} 日区块；模拟中位换手 {median_turnover:.2f}，"
+                        "中位估算成本 {median_cost:.2%}。",
+                        observations=monte_carlo.observations,
+                        simulations=monte_carlo.simulations,
+                        block_length=monte_carlo.block_length,
+                        median_turnover=monte_carlo.median_turnover,
+                        median_cost=monte_carlo.median_cost,
+                    )
                 )
 
-                st.subheader("净值路径分位")
-                st.line_chart(monte_carlo.equity_quantiles)
+                st.subheader(t("净值路径分位"))
+                st.line_chart(localize_frame(monte_carlo.equity_quantiles, language))
 
-                st.subheader("模拟分布")
+                st.subheader(t("模拟分布"))
                 distribution_display = monte_carlo.distribution_table.copy()
                 for column in ("5%", "中位数", "95%"):
                     distribution_display[column] = distribution_display[
@@ -847,11 +923,15 @@ def main() -> None:
                             else f"{value:.3f}"
                         )
                 st.dataframe(
-                    distribution_display.drop(columns="单位"),
+                    localize_frame(
+                        distribution_display.drop(columns="单位"),
+                        language,
+                        value_columns=("指标",),
+                    ),
                     width="stretch",
                 )
 
-                st.subheader("区块长度敏感性")
+                st.subheader(t("区块长度敏感性"))
                 sensitivity_display = monte_carlo.sensitivity_table.copy()
                 for column in ("亏损概率", "5%尾部回撤", "中位总收益"):
                     sensitivity_display[column] = sensitivity_display[column].map(
@@ -860,21 +940,25 @@ def main() -> None:
                 sensitivity_display["中位Sharpe"] = sensitivity_display[
                     "中位Sharpe"
                 ].map(lambda value: f"{value:.3f}")
-                st.dataframe(sensitivity_display, width="stretch")
+                st.dataframe(
+                    localize_frame(sensitivity_display, language), width="stretch"
+                )
                 st.caption(
-                    "这里监控所选 run 自身的净收益分布；正式的同区间、"
-                    "同成本基线比较继续使用研究准入脚本。"
+                    t(
+                        "这里监控所选 run 自身的净收益分布；正式的同区间、"
+                        "同成本基线比较继续使用研究准入脚本。"
+                    )
                 )
 
     with tab6:
-        st.subheader("portfolio_daily")
+        st.subheader(t("portfolio_daily"))
         st.dataframe(portfolio, width="stretch")
-        st.subheader("orders")
+        st.subheader(t("orders"))
         st.dataframe(orders, width="stretch")
-        st.subheader("signals")
+        st.subheader(t("signals"))
         st.dataframe(signals, width="stretch")
 
-    st.subheader("实验横向比较")
+    st.subheader(t("实验横向比较"))
     compare_cols = [
         "id",
         "scenario_name",
@@ -894,7 +978,7 @@ def main() -> None:
         "created_at",
     ]
     existing_compare_cols = [c for c in compare_cols if c in runs.columns]
-    st.dataframe(runs[existing_compare_cols], width="stretch")
+    st.dataframe(localize_frame(runs[existing_compare_cols], language), width="stretch")
 
 
 if __name__ == "__main__":

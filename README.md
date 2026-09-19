@@ -1,246 +1,169 @@
 # Quant System v3
 
-A modular ETF rotation quant framework with:
-- Tiingo/Yahoo ETF data plus CBOE/FRED VIX ingestion with immutable snapshots
-- Feature engineering
-- Regime detection
-- Momentum rotation strategy
-- Sample-covariance baseline plus separately gated dynamic-risk candidates
-- Risk engine
-- Backtesting engine
-- T+1 backtest quantity/cash ledger
-- Persistent, broker-isolated local `REPLAY_OPEN` simulation with human
-  approval, T+1 settlement, reconciliation, incidents, and restart recovery
-- Two-switch connection-blocked IBKR adapter boundary for future manual use
-- Read-only external brokerage position snapshots
-- Reporting
-- Latest allocation signal service
-- Read-only factor diagnostics and exposure monitoring
-- Read-only Monte Carlo tail-risk monitoring
-- Automated unit, integration, migration, leakage, risk, and OMS tests
+语言：中文 | [English](README_EN.md)
 
-Current architecture and system boundaries are documented in
-[`quant_system_architecture_overview.md`](quant_system_architecture_overview.md).
-Operational procedures are in
-[`docs/upgrade_v3_runbook.md`](docs/upgrade_v3_runbook.md).
-The confirmed personal-research, tax-account, alert, and historical-universe
-decisions are recorded in
-[`docs/personal_research_operating_profile.md`](docs/personal_research_operating_profile.md).
+面向个人研究的 ETF 动量轮动平台。项目重点不是生成一条漂亮的历史净值，
+而是让每个研究结论都能追溯到代码提交、不可变数据快照、ETF 宇宙版本、
+预注册参数、成本假设和执行记录；任一关键证据缺失时，系统默认失败关闭
+（fail closed）。
 
-## Current capability boundary
+> 当前状态（2026-08-26）：工程链路已经实现并通过 270 项测试，但 5 个数据
+> 快照仍全部为 `BLOCKED`，最新快照还有 706 个未裁决阻断问题；`UV-001`
+> 为 `draft`，策略版本、准入运行和本地模拟成交均为 0。因此项目当前可以
+> 做诊断和工程验证，不能声称策略已准入、broker paper 已验证或可以实盘。
 
-The formal application entry point is
-`streamlit_dashboard_db_v1_1_save_experiment.py`; `streamlit_dashboard_db.py`
-is legacy read-only. `main.py` and `DNU/` are also retained only for legacy
-audit/compatibility; the launcher does not use them. The formal Dashboard uses
-the `Config` sample-covariance baseline and a 35% maximum risky-asset weight.
-Daily and weekly runs are shown and stored as `exploratory_only`. A
-dynamic-factor choice appears only when the database contains an admitted
-risk-model result bound to a frozen strategy version.
+## 文档入口
 
-`services/paper_cycle.py` and `scripts/paper_cycle.py` provide one persistent
-local `REPLAY_OPEN` coordinator for signal, approval, raw-open replay fills,
-T+1 settlement, reconciliation, incidents, and restart recovery. SQLite is the
-source of truth and duplicate cycles/fills are rejected by stable identities.
-This is research simulation, not broker paper: it does not observe bid/ask,
-prove limit-order fill quality, or validate the 7 bp cost assumption. The local
-simulation clock must not start until the database contains an actionable
-snapshot, a complete admitted run, and a frozen strategy version.
+| 文档 | 用途 |
+|---|---|
+| [项目简介](PROJECT_OVERVIEW.md) | 项目定位、策略轮廓、成熟度和当前结论 |
+| [架构说明](quant_system_architecture_overview.md) | 数据流、治理状态机、存储模型和执行边界 |
+| [运行手册](docs/upgrade_v3_runbook.md) | 数据事故、准入、本地模拟、停机和恢复流程 |
+| [个人研究运行档案](docs/personal_research_operating_profile.md) | 账户、税务、数据源、告警和历史宇宙约束 |
+| [2026-07-28 历史审计](reports/quant_system_audit_2026-07-28.md) | 历史问题与修正记录，不代表当前准入状态 |
 
-Research reports remain pre-tax and must retain
-`historical_universe_integrity=false`. IBKR connectivity, real-time market data,
-and news analysis are deferred. Local risk incidents are committed before a
-Pushover delivery is attempted; failed deliveries remain pending and can be
-retried without duplicating the incident. Database state remains authoritative.
+## 核心能力
 
-## 1. Install
+- Tiingo ETF 原始日线/公司行动为主源，Yahoo 为 ETF 交叉校验；VIX 使用
+  CBOE/FRED 路径。
+- 原始数据、公司行动、供应商修订和使用结果均保存为可追溯的不可变快照。
+- 数据质量裁决绑定具体快照、问题指纹、原始数据哈希、ticker、日期、证据和
+  操作人；禁止整个 ticker 或整段历史通配放行。
+- 月频 ETF 动量轮动、市场区制、波动率缩放和 sample covariance 风险模型。
+- 持股数量与现金账本、T+1 原始开盘执行、自然权重漂移、T+1 结算和成本/冲击
+  建模。
+- 固定 135 个候选的嵌套扩展窗口准入；所有候选和失败结果必须持久化。
+- SQLite 持久化的本地 `REPLAY_OPEN`：信号、人工批准、幂等成交、结算、对账、
+  风险事故和 Pushover 重试。
+- 只读因子归因、Monte Carlo、Robinhood 镜像和正式 Streamlit Dashboard。
 
-The validated Windows toolchain is CPython 3.14.3, recorded in
-`.python-version`. Confirm `py -3.14 --version` reports that patch version, then
-create the environment and install runtime dependencies through the complete
-constraint lock:
+## 能力边界
+
+| 能力 | 当前状态 | 不能据此证明 |
+|---|---|---|
+| 双源数据与裁决 | 已实现；当前快照仍 `BLOCKED` | 数据已可用于准入 |
+| 回测和 135 候选准入引擎 | 已实现、可恢复 | 已产生可信策略结论 |
+| 本地 `REPLAY_OPEN` | 已实现并通过重启幂等测试 | 真实 bid/ask、限价成交或 7 bp 真实成本 |
+| Pushover | 事故先落库、发送失败可重试 | 事故已对账或已恢复 |
+| IBKR 适配器边界 | 默认断开、双开关保护 | broker paper 或实盘可用 |
+| 税务与历史 ETF 宇宙 | 仅记录约束 | 税后绩效或无幸存者偏差 |
+| 实时新闻与实时行情 | 未实现 | 盘中事件驱动交易能力 |
+
+所有历史 ETF 结果必须标记为 `CURRENT_UNIVERSE_BACKCAST`，并保留
+`historical_universe_integrity=false`。当前绩效口径为税前。
+
+## 环境安装
+
+项目验证环境为 Windows 和 CPython 3.14.3（见 `.python-version`）。
 
 ```powershell
 py -3.14 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt -c constraints.lock
-```
-
-For development and tests, use the separate development entry point:
-
-```powershell
 .\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt -c constraints.lock
 .\.venv\Scripts\python.exe -m scripts.check_environment
 ```
 
-`requirements.txt` and `requirements-dev.txt` contain exact direct pins;
-`constraints.lock` fixes the complete 68-package runtime and test dependency
-closure validated by this project. The environment check rejects Python or
-package-version drift, incomplete locks, and stale lock entries. Dependency
-updates should change the roots and lock together, followed by the full
-validation suite.
+`requirements.txt` 固定 9 个直接运行依赖，`constraints.lock` 固定当前验证过的
+68 个运行/测试依赖。依赖升级时必须同步更新根依赖和完整约束，并重跑全套验证。
 
-### Trusted data credential
+## 数据库与凭据
 
-Never place a real token in the repository or command line. Validate provider
-access with a hidden prompt, then build the full snapshot only after the schema
-is current:
+运行数据库默认为 `sqlite:///quant_research.db`，由 Alembic 管理且不进入 Git。
+SQLite 是当前唯一完成迁移、完整性、外键和重启恢复验证的后端；其他数据库 URL
+属于未验证扩展，不应仅通过修改配置直接投入使用。
+
+```powershell
+.\.venv\Scripts\python.exe -m alembic upgrade head
+.\.venv\Scripts\python.exe -m alembic current
+```
+
+真实凭据只能放在环境变量、忽略的本地 `.env` 或操作系统密钥存储中。仓库中的
+`.env.example` 只能保留空值。开始无人值守任务前，应轮换任何曾在聊天、截图或
+命令参数中暴露过的 Tiingo/Pushover 凭据。
+
+数据源授权测试和完整快照构建：
 
 ```powershell
 .\.venv\Scripts\python.exe -m scripts.validate_data_sources
-.\.venv\Scripts\python.exe -m alembic upgrade head
 .\.venv\Scripts\python.exe -m scripts.build_trusted_snapshot
 ```
 
-The smoke/build commands report `BLOCKED` instead of suppressing stale data,
-corporate-action conflicts, or source differences above 20 bp. Provider quota
-failures are reported as `provider_rate_limit` and never trigger a Yahoo
-fallback. A blocked snapshot is auditable but cannot generate orders.
+HTTP 429 或供应商失败不会静默切换主源。构建结果可以是 `BLOCKED`；这表示证据
+已保存，不表示任务失败得可以忽略。裁决和派生快照流程见
+[运行手册](docs/upgrade_v3_runbook.md)。
 
-## 2. Database setup
+## 运行入口
 
-The research database (`quant_research.db`) is **not** tracked in git — its
-schema is managed by Alembic and it is a runtime artifact. Build it on a fresh
-clone with:
+### 正式 Dashboard
 
-```powershell
-.\.venv\Scripts\python.exe -m alembic upgrade head
-```
-
-This produces an empty database at v3 head. Existing rows without a v3 dataset
-snapshot are retained but marked `invalid_data_v1` and excluded from admission.
-The old `SQLiteStore` importer is retained as a legacy audit tool, not as part
-of normal setup. Do not point it at the active database without separately
-reviewing its input and output paths. If a reviewed legacy import is required:
-
-```powershell
-.\.venv\Scripts\python.exe scripts\migrate_legacy_to_v2.py `
-  --old-db <reviewed-legacy.db> --new-db <new-output.db>
-```
-
-The database backend is configured by `Config.db_url` (default
-`sqlite:///quant_research.db`). To move to Postgres/MySQL, change that URL and
-install the matching driver — no code or schema changes are required.
-
-## 3. Run
-
-### Windows one-click Dashboard
-
-After the virtual environment and dependencies are installed, double-click:
+双击：
 
 ```text
 Open Quant Dashboard.cmd
 ```
 
-The launcher starts Streamlit in the background and opens
-`http://localhost:8501` in the default browser. Repeated clicks reuse the
-running Dashboard instead of starting duplicate processes. It fingerprints the
-Dashboard and application Python sources; after a code change, the next click
-automatically replaces the stale managed process before opening the page.
+正式入口是 `streamlit_dashboard_db_v1_1_save_experiment.py`，默认使用 sample
+covariance 和 35% 风险资产上限。只有数据库存在绑定冻结策略的正式风险模型准入
+记录时，才会显示 `dynamic_factor`。日频/周频实验始终标记为
+`exploratory_only`。
 
-Double-click `Open Robinhood Mirror.cmd` to open the separate read-only
-Robinhood mirror at `http://localhost:8502`. It displays the local position
-snapshot and only a version 2 strict walk-forward result for that same snapshot.
-The three read-only views show current positions, current-versus-diagnostic
-allocation deltas, and every admission gate. Snapshot/result timestamps, result
-age, source fingerprint, holdout metrics, failed gates, and position-change
-authorization are visible without presenting the diagnostic delta as an order.
-Legacy single-split, stale-snapshot, source-mismatched, expired, incomplete, or
-internally inconsistent output is blocked. Results must be timezone-aware, no
-more than seven days old, contain finite holdout metrics and normalized target
-weights, and preserve the recorded admission decision. Invalid or zero recorded
-cost basis is displayed safely without dividing by zero. The mirror reuses an
-existing healthy process only while its application-source fingerprint is
-unchanged. After a source change, the next launch replaces only the verified
-managed project-Python process before serving the page. It refuses to take over
-an unmanaged service on the same port and has no order-submission capability.
-Startup logs, source state, and the process ID are written to the ignored
-`.runtime/` directory.
+侧栏顶部的 **Language / 语言** 可在 **中文**（默认）和 **English** 之间切换。
+界面标签、提示、诊断表格及图表随之切换；已输入参数和当前选中的实验保持不变。
+所选语言通过地址中的 `?lang=zh` 或 `?lang=en` 保留，刷新或分享该地址仍使用同一语言。
+原始数据页保留数据库字段名，用户输入、存储值和底层异常详情保持原样。
 
-If the launcher reports that the project Python is missing, create `.venv` and
-install `requirements.txt` with `-c constraints.lock` before trying again.
+`streamlit_dashboard_db.py`、`main.py`、`main_with_db.py` 和 `DNU/` 仅作历史兼容
+或审计，不是正式准入入口。
 
-The Dashboard charges trading costs, slippage, and impact separately. Sample
-covariance is the reproducible default. The dynamic risk model is not admitted
-by default; it is selectable only after a matching admitted record exists for a
-frozen strategy version. Only the six preregistered half-life/stress
-combinations may be evaluated after the core strategy is frozen. Daily and
-weekly Dashboard runs carry a prominent `exploratory_only` label and cannot
-enter admission ranking.
+### Robinhood 只读镜像
 
-The **Factor Monitor** tab calculates lagged rolling exposures, return
-attribution, risk contribution, and historical-percentile alerts on demand for
-any stored run. It reads the existing portfolio and market-data cache, requires
-no database migration, and is deliberately isolated from signals, the risk
-engine, and target weights.
+双击：
 
-The **Monte Carlo Monitor** tab generates 3,000 reproducible one-year net-return
-paths for the selected stored run. It shows loss probability, tail and median
-drawdown, return and Sharpe distributions, turnover, recorded total cost, path
-quantiles, and 10/20/40-day block sensitivity. It is also read-only and does not
-change strategy, risk, execution, or target-weight state.
-
-### Manual commands
-
-```powershell
-.\.venv\Scripts\python.exe main_with_db.py
-.\.venv\Scripts\python.exe -m streamlit run streamlit_dashboard_db_v1_1_save_experiment.py
-.\.venv\Scripts\python.exe -m scripts.validate_dynamic_factor_model --snapshot-id <id> --strategy-version <version>
-.\.venv\Scripts\python.exe -m scripts.run_core_admission --help
-.\.venv\Scripts\python.exe -m scripts.paper_cycle --help
-.\.venv\Scripts\python.exe -m scripts.analyze_factor_attribution --snapshot-id <id>
-.\.venv\Scripts\python.exe -m scripts.analyze_monte_carlo --snapshot-id <id>
-.\.venv\Scripts\python.exe -m scripts.optimize_mirrored_portfolio
+```text
+Open Robinhood Mirror.cmd
 ```
 
-The mirror optimizer uses expanding pre-holdout validation folds and evaluates
-one frozen candidate in the final untouched holdout. Its safe default reads
-only the local cache. The optional `--allow-external-symbol-disclosure` flag
-sends the mirrored ticker list to Yahoo Finance and requires informed approval.
-Results remain diagnostic because the signal is still momentum-derived and the
-historical universe comes from today's snapshot; neither gate authorizes
-position changes. See
-[`reports/mirror_walk_forward_protocol_2026-07-15.md`](reports/mirror_walk_forward_protocol_2026-07-15.md).
+镜像只显示导入的持仓快照和诊断性 walk-forward 结果，不连接下单链路，也不授权
+仓位变化。
 
-Robinhood Individual-account positions can be mirrored as immutable snapshots
-in `brokerage_mirror_snapshots` and `brokerage_mirror_positions`. The mirror is
-isolated from execution and is designed for pre-masked account references; do
-not include login credentials, tokens, or full account identifiers in the input
-file. The import command rejects sensitive fields at any nesting level, while
-the repository stores only the normalized last four account-reference
-characters and requires finite, non-negative position values. Use
-`.\.venv\Scripts\python.exe scripts\import_brokerage_snapshot.py snapshot.json`
-for normalized JSON exports; applying
-`.\.venv\Scripts\python.exe -m alembic upgrade head` creates the required
-tables.
+## 研究准入
 
-New experiment rows persist the complete daily implementation audit in
-`portfolio_daily`: gross return, net daily return, turnover, estimated trading
-cost, estimated slippage, and their existing combined cost. The component
-columns are nullable by design, so records created before migration
-`d4c91f7a2e6b` remain explicitly unknown instead of being reconstructed from
-assumptions.
+只有在存在可执行快照、人工批准的宇宙版本和冻结前研究协议时，才应运行以下流程：
 
-The admission and diagnostic commands read immutable trusted snapshot rows,
-never the legacy `market_data` cache. They compare identical dates and costs,
-report annual walk-forward
-windows, parameter and start-date sensitivity, market regimes, crisis periods,
-turnover, costs, slippage, and signal independence.
+```powershell
+.\.venv\Scripts\python.exe -m scripts.approve_universe `
+  --version <universe-version> --approved-by <operator>
 
-The factor-attribution command uses lagged 252-session regressions with no
-network dependency. It reports static exposures, Newey-West alpha statistics,
-one-day-ahead rolling attribution, and exact return reconciliation for both the
-sample-covariance baseline and a separately evaluated dynamic-factor candidate.
+$commit = git rev-parse HEAD
+.\.venv\Scripts\python.exe -m scripts.create_research_protocol `
+  --version <protocol-version> `
+  --code-commit $commit `
+  --dataset-snapshot-id <snapshot-id> `
+  --universe-version <universe-version> `
+  --output .runtime\core_protocol.json
 
-The Monte Carlo command resamples identical net-return blocks for the baseline
-and current system. It reports paired Sharpe, drawdown, return, turnover, cost,
-block-length, start-date, regime, and crisis distributions. It is a robustness
-diagnostic only and does not generate signals or change target weights.
+.\.venv\Scripts\python.exe -m scripts.run_core_admission `
+  --protocol .runtime\core_protocol.json `
+  --strategy-version <strategy-version>
+```
 
-## 4. Validate
+准入命令必须留下恰好 135 个最终候选结果。全部候选被拒绝是有效研究结论；不得
+在查看结果后临时扩展参数网格。当前数据库尚无可执行快照，因此不应运行正式准入。
 
-Install `requirements-dev.txt` with `constraints.lock` before running the suite.
-The environment check fails early when Python, direct pins, or any transitive
-dependency differs from the validated contract:
+## 本地模拟
+
+本地模拟仅在策略已准入、冻结并启动未来时钟后使用：
+
+```powershell
+.\.venv\Scripts\python.exe -m scripts.paper_cycle `
+  --strategy-version <strategy-version> --help
+```
+
+它使用 T+1 原始开盘价加预注册成本做确定性回放，并持久化决策、订单、成交、三类
+现金、结算、对账和风险事故。它不是 broker paper；不能验证 09:35 限价单、盘口、
+真实冲击成本或碎股路由。
+
+## 验证
 
 ```powershell
 .\.venv\Scripts\python.exe -m scripts.check_environment
@@ -248,15 +171,26 @@ dependency differs from the validated contract:
 .\.venv\Scripts\python.exe -m compileall -q backtest config data execution report research risk scripts services storage strategy tests utils
 .\.venv\Scripts\python.exe -m pip check
 .\.venv\Scripts\python.exe -m alembic current
+.\.venv\Scripts\python.exe -m alembic check
 ```
 
-The expected result is a fully passing suite and an Alembic `current` revision
-that matches the repository's reported head. Project code emits no compatibility
-deprecation warnings in the current suite. A local pytest cache ACL warning may
-still appear on this Windows checkout and does not come from application code.
+2026-08-26 的当前提交验证结果为：270 项测试通过、依赖一致、SQLite
+`integrity_check=ok`、外键检查为空、Alembic 位于 `5f74c1a9d2b0 (head)`。
 
-Mirror Dashboard end-to-end tests use temporary SQLite databases and temporary
-optimization JSON through `QUANT_MIRROR_DB_URL` and
-`QUANT_MIRROR_OPTIMIZATION_PATH`. Production launches do not set these variables
-and continue to use `quant_research.db` and
-`.runtime/mirror_optimization.json`.
+## 目录结构
+
+| 路径 | 职责 |
+|---|---|
+| `config/` | 策略、风险、执行模式和 ETF 宇宙默认值 |
+| `data/` | 供应商、交易日历、复权、质量检查和可信加载 |
+| `strategy/` | 动量轮动和市场区制 |
+| `risk/` | 协方差、仓位约束、风险控制和敞口 |
+| `backtest/` | T+1 回测引擎与数量/现金账本 |
+| `research/` | 协议、嵌套 walk-forward、准入和诊断 |
+| `services/` | 信号、Dashboard 视图、本地模拟和 Pushover |
+| `execution/` | 预交易检查、OMS 和 broker 隔离边界 |
+| `storage/` | SQLAlchemy 表结构和仓储 |
+| `scripts/` | 唯一可审计的运维/研究 CLI |
+| `tests/` | 单元、集成、迁移、前视、治理和重启测试 |
+
+本项目仅供研究与软件工程验证，不构成投资、税务或法律建议。

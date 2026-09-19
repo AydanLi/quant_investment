@@ -1,6 +1,6 @@
 # Personal research operating profile
 
-Updated: 2026-08-13
+Updated: 2026-08-26
 
 ## Confirmed scope
 
@@ -12,10 +12,10 @@ Updated: 2026-08-13
 - Account: regular taxable individual brokerage account.
 - Capital assumption: USD 10,000, cash only, no margin, leverage, shorting, or
   automatic broker orders.
-- Current mode: `PERSONAL_RESEARCH`. Local simulation interfaces exist, but the
-  end-to-end paper cycle is not operational and its clock has not started.
-  External broker connectivity and live order submission are disabled
-  independently.
+- Current mode: `PERSONAL_RESEARCH`. The persistent local `REPLAY_OPEN` cycle is
+  implemented and restart-tested, but it has no operating records and its clock
+  has not started because no strategy is admitted. External broker connectivity
+  and live order submission are disabled independently.
 - Future path: broker paper first, then separately authorized manual live mode;
   the adapter boundary and per-order human approval remain in place.
 - Future tax results will report annual estimated liability separately and will
@@ -62,11 +62,11 @@ ignored local `.env`; neither value may be committed to the repository. The
 Pushover API accepted an end-to-end test message on 2026-07-28 and the
 application usage counter increased to one; receipt on the registered iOS
 device was confirmed by the owner.
-The sender is not yet connected to persisted `RiskIncident` creation, retry, or
-resolution. Operational alert status must therefore be determined from current
-code call sites and database records, not from the successful transport test.
-Alerts supplement rather than replace Dashboard state, structured logs, and
-persisted `RiskIncident` records.
+The local replay coordinator commits `RiskIncident` before attempting delivery.
+Failed sends remain persisted for idempotent retry, and notification attempts
+and request IDs are recorded. A received alert does not prove that the account
+has reconciled or that recovery was authorized. Alerts supplement rather than
+replace Dashboard state, structured logs, and persisted incident records.
 
 References: https://pushover.net/api, https://docs.ntfy.sh/publish/ and
 https://core.telegram.org/bots/api
