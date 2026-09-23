@@ -14,6 +14,15 @@ import pandas as pd
 # Chinese source text already supplies the Chinese display; only its English
 # counterpart is needed here. English labels have the inverse catalog below.
 _EN = {
+    "结果状态：{status}；指标状态：{metric_status}；运行身份：{runtime_status}":
+        "Result status: {status}; metric status: {metric_status}; runtime identity: {runtime_status}",
+    "该结果不满足有效比较条件：可能未准入、已失效、缺少运行身份或指标样本不足。":
+        "This result is excluded from valid comparisons: admission, current runtime verification, or sufficient metric coverage is missing.",
+    "收益为税前估计；卖出订单胜率不等同于完整往返交易胜率。当前投资池回溯不代表已消除幸存者偏差。":
+        "Returns are pre-tax estimates. Sell-order win rate is not a round-trip win rate. Backcasting today's universe does not remove survivorship bias.",
+    "完整指标与计算口径": "Complete metrics and methodology",
+    "仅比较已准入、运行身份有效且指标完整的实验；其余 {count} 条保留在历史记录中。":
+        "Comparisons include only admitted experiments with verified runtime identity and complete metrics; {count} other results remain in history.",
     "正式研究入口：读取SQLite历史实验，并保存受治理标记约束的新实验。":
         "Research dashboard: browse historical SQLite experiments and save new experiments under research governance controls.",
     "数据库设置": "Database settings",
@@ -225,6 +234,38 @@ _ZH = {
 # Database keys are translated for display only, never changed in result frames
 # used by calculations or persistence. The labels share the UI terminology.
 _COLUMN_LABELS = {
+    "summary_json": ("Complete Metric Snapshot", "完整指标快照"),
+    "runtime_hash": ("Frozen Runtime Identity", "冻结运行身份"),
+    "runtime_verified": ("Runtime Verified", "运行身份有效"),
+    "LEGACY_UNVERIFIED": ("Unverified", "未验证"),
+    "VERIFIED": ("Verified", "已验证"),
+    "PROVISIONAL": ("Provisional / short sample", "暂定／样本不足"),
+    "PROVISIONAL_CASH_FLOWS": ("Provisional / unconfirmed dividend payments", "暂定／股息支付未确认"),
+    "Cash-flow Evidence": ("Cash-flow Evidence", "现金流证据"),
+    "UNCONFIRMED_PAYMENT": ("Unconfirmed payment", "支付未确认"),
+    "CONFIRMED": ("Confirmed", "已确认"),
+    "FINAL": ("Complete historical metrics", "完整历史指标"),
+    "RF_MISSING": ("Risk-free data missing", "无风险收益缺失"),
+    "RF_INCOMPLETE": ("Risk-free coverage incomplete", "无风险收益覆盖不足"),
+    "BENCHMARK_INCOMPLETE": ("Benchmark coverage incomplete", "基准收益覆盖不足"),
+    "invalid_data_v1": ("Legacy data invalid", "旧数据结果失效"),
+    "invalid_governance": ("Governance verification failed", "治理验证未通过"),
+    "blocked_data": ("Data blocked", "数据已阻断"),
+    "exploratory_only": ("Exploratory only", "仅供探索"),
+    "complete": ("Calculation complete", "计算已完成"),
+    "Accounting Model": ("Accounting Model", "会计口径"),
+    "Execution Model": ("Execution Model", "执行模型"),
+    "Metric Status": ("Metric Status", "指标状态"),
+    "Metric Schema Version": ("Metric Schema Version", "指标口径版本"),
+    "Risk-free Coverage": ("Risk-free Coverage", "无风险收益覆盖率"),
+    "Risk-free Source": ("Risk-free Source", "无风险收益来源"),
+    "Risk-free Status": ("Risk-free Status", "无风险收益状态"),
+    "Tax Basis": ("Tax Basis", "税务口径"),
+    "Trade Metric Basis": ("Trade Metric Basis", "交易指标口径"),
+    "Sell Order Win Rate": ("Sell Order Win Rate", "卖出订单胜率"),
+    "Average Win / Average Loss": ("Average Win / Average Loss", "平均盈利／平均亏损"),
+    "Universe Research Basis": ("Universe Research Basis", "投资池研究口径"),
+    "dividend_receivable": ("Dividend Receivable", "股息应收"),
     "id": ("ID", "编号"),
     "run_id": ("Run ID", "实验编号"),
     "scenario_name": ("Scenario Name", "实验名称"),

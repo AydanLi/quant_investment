@@ -27,14 +27,20 @@ def locally_adjust_ohlcv(
     if "Close" not in frame:
         raise ValueError("Raw OHLCV data must contain Close.")
 
+    actions = tuple(actions)
     result = frame.copy().sort_index()
     result.index = pd.DatetimeIndex(result.index).tz_localize(None).normalize()
-    result = result[~result.index.duplicated(keep="last")]
+    if result.index.duplicated().any():
+        raise ValueError("Corporate-action adjustment requires unique daily bars.")
 
     dividends: dict[pd.Timestamp, float] = defaultdict(float)
     splits: dict[pd.Timestamp, float] = defaultdict(lambda: 1.0)
+    seen_actions: set[str] = set()
     for raw_action in actions:
         action = raw_action.normalized()
+        if action.action_key in seen_actions:
+            raise ValueError(f"Duplicate corporate action: {action.action_key}.")
+        seen_actions.add(action.action_key)
         session = action.ex_date
         if action.status != "active":
             continue
@@ -61,4 +67,6 @@ def locally_adjust_ohlcv(
     result["Adjustment Factor"] = factors
     result["Dividend"] = pd.Series(dividends, dtype=float).reindex(result.index).fillna(0.0)
     result["Split Factor"] = pd.Series(splits, dtype=float).reindex(result.index).fillna(1.0)
+    result.attrs["corporate_actions"] = actions
+    result.attrs["price_split_basis"] = "as_traded"
     return result

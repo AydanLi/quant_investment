@@ -95,13 +95,15 @@ class ResearchStore:
         latest_signal: Mapping[str, Any],
         **kwargs: Any,
     ) -> int:
-        """Save an experiment and all its child data in one call."""
-        run_id = self.save_experiment_run(
-            scenario_name, config, summary, latest_signal, **kwargs
-        )
-        self.save_portfolio_daily(run_id, portfolio)
-        self.save_orders(run_id, order_df)
-        self.save_signals(run_id, latest_signal)
+        """Commit the experiment, NAV, orders and signals as one unit of work."""
+        with self.engine.begin() as connection:
+            run_id = self.experiments.save_run(
+                scenario_name=scenario_name, config=config, summary=summary,
+                latest_signal=latest_signal, connection=connection, **kwargs,
+            )
+            self.portfolio.save(run_id, portfolio, connection=connection)
+            self.orders.save(run_id, order_df, connection=connection)
+            self.signals.save(run_id, latest_signal, connection=connection)
         return run_id
 
     # -- reads --------------------------------------------------------------- #

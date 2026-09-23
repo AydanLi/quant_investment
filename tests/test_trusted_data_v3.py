@@ -11,6 +11,7 @@ from data.adjustments import locally_adjust_ohlcv
 from data.calendar import NyseCalendar
 from data.features import FeatureEngineer
 from data.models import (
+    DATA_QUALITY_MODEL_VERSION,
     CorporateAction,
     DataQualityReport,
     DataQualityStatus,
@@ -525,6 +526,7 @@ def test_nyse_calendar_and_feature_frame_exclude_non_benchmark_dates():
     calendar = NyseCalendar()
     assert calendar.is_session("2024-07-04") is False
     spy = _bars([100.0, 101.0], ["2024-07-03", "2024-07-05"])
+    spy.attrs["corporate_actions"] = ()
     vix = _bars([12.0, 13.0, 14.0], ["2024-07-03", "2024-07-04", "2024-07-05"])
     prices = FeatureEngineer(
         {"SPY": spy, "^VIX": vix}, Config(universe=["SPY"])
@@ -556,13 +558,15 @@ def test_snapshot_hash_is_order_independent_and_revisions_are_audited():
     assert revisions[0]["new_value"] == 101.0
 
 
-def test_dataset_snapshot_payload_is_immutable_and_reconstructable():
+@pytest.mark.parametrize("payment_date,payment_source", [(None, None), ("2024-01-05", "https://issuer.test/payment")])
+def test_dataset_snapshot_payload_is_immutable_and_reconstructable(payment_date, payment_source):
     engine = create_db_engine("sqlite:///:memory:")
     create_all(engine)
     repository = TrustedMarketDataRepository(engine=engine)
     bars = {"SPY": _bars([100.0, 101.0], ["2024-01-02", "2024-01-03"])}
     action = CorporateAction(
-        "SPY", pd.Timestamp("2024-01-03"), "dividend", cash_amount=0.5, source="test"
+        "SPY", pd.Timestamp("2024-01-03"), "dividend", cash_amount=0.5, source="test",
+        payment_date=None if payment_date is None else pd.Timestamp(payment_date), payment_source=payment_source,
     )
     content_hash = dataset_content_hash(bars, [action], source="test")
     report = DataQualityReport(
@@ -598,6 +602,8 @@ def test_dataset_snapshot_payload_is_immutable_and_reconstructable():
 
     assert restored.bars["SPY"].loc["2024-01-03", "Close"] == 101.0
     assert len(restored.actions) == 1
+    assert restored.actions[0].payment_date == action.payment_date
+    assert restored.actions[0].payment_source == payment_source
     assert set(sources) == {"primary", "secondary"}
     assert sources["secondary"].bars["SPY"].loc["2024-01-03", "Close"] == 101.0
     assert sources["secondary"].actions[0].source == "check"
@@ -605,6 +611,26 @@ def test_dataset_snapshot_payload_is_immutable_and_reconstructable():
     assert dataset_content_hash(
         restored.bars, restored.actions, source=restored.source
     ) == content_hash
+
+
+def test_payment_metadata_revisions_are_audited_alongside_numeric_revisions():
+    engine = create_db_engine("sqlite:///:memory:")
+    create_all(engine)
+    repository = TrustedMarketDataRepository(engine=engine)
+    old = CorporateAction("SPY", pd.Timestamp("2024-01-03"), "dividend", cash_amount=.5, source="test")
+    updated = replace(old, cash_amount=.6, payment_date=pd.Timestamp("2024-01-05"), payment_source="issuer-confirmation")
+    repository.upsert_actions([old])
+    repository.upsert_actions([updated])
+    with engine.connect() as connection:
+        rows = connection.execute(select(data_revisions)).mappings().all()
+    by_field = {row["field"]: row for row in rows}
+    assert by_field["cash_amount"]["old_value"] == .5
+    assert by_field["cash_amount"]["new_value"] == .6
+    assert by_field["payment_date"]["old_text"] is None
+    assert by_field["payment_date"]["new_text"] == "2024-01-05"
+    assert by_field["payment_source"]["new_text"] == "issuer-confirmation"
+    restored = repository.get_actions(["SPY"], source="test")
+    assert restored[0].payment_date == updated.payment_date
 
 
 def test_model_admission_rejects_a_stale_immutable_snapshot(tmp_path):
@@ -621,6 +647,7 @@ def test_model_admission_rejects_a_stale_immutable_snapshot(tmp_path):
         latest_session="2024-01-02",
         stale_sessions=1,
         content_hash=dataset_content_hash(bars, (), source="stale-test"),
+        quality_model_version=DATA_QUALITY_MODEL_VERSION,
     )
     snapshot_id = repository.create_snapshot(
         report,

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -9,8 +9,11 @@ from typing import Mapping, Sequence
 import numpy as np
 import pandas as pd
 from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
 
 from config.universe import UniverseVersion
+from data.models import DATA_QUALITY_MODEL_VERSION
+from research.runtime import FrozenRuntimeManifest, assert_code_identity, assert_runtime_matches, canonical_hash
 from storage.repositories.base import BaseRepository, upsert
 from storage.schema import (
     admission_runs,
@@ -19,10 +22,50 @@ from storage.schema import (
     parameter_trials,
     strategy_versions,
     universe_versions,
+    validation_runs,
 )
 
 
 class GovernanceRepository(BaseRepository):
+    def start_validation_run(
+        self, version: str, *, account_ref: str,
+        environment: str = "PAPER", execution_model: str = "REPLAY_OPEN",
+    ) -> int:
+        """Start a prospective observation clock, never backdate to research freeze."""
+        if not account_ref.strip():
+            raise ValueError("Validation requires an account reference.")
+        if environment != "PAPER" or execution_model != "REPLAY_OPEN":
+            raise ValueError("Only the implemented PAPER/REPLAY_OPEN validation is supported.")
+        manifest = self.load_frozen_runtime(version)
+        active = select(validation_runs).where(
+            validation_runs.c.strategy_version == version,
+            validation_runs.c.account_ref == account_ref,
+            validation_runs.c.environment == environment,
+            validation_runs.c.execution_model == execution_model,
+            validation_runs.c.status == "active",
+        )
+        with self.engine.begin() as conn:
+            row = conn.execute(active).mappings().one_or_none()
+            if row is not None:
+                if row["runtime_hash"] != manifest.runtime_hash:
+                    raise ValueError("Active validation is bound to a different runtime.")
+                return int(row["id"])
+            try:
+                with conn.begin_nested():
+                    result = conn.execute(validation_runs.insert().values(
+                        strategy_version=version, runtime_hash=manifest.runtime_hash,
+                        account_ref=account_ref, environment=environment,
+                        execution_model=execution_model,
+                        started_at=datetime.now(timezone.utc).replace(tzinfo=None),
+                        status="active",
+                    ))
+            except IntegrityError:
+                row = conn.execute(active).mappings().one_or_none()
+                if row is None or row["runtime_hash"] != manifest.runtime_hash:
+                    raise
+                return int(row["id"])
+            return int(result.inserted_primary_key[0])
+
     def create_universe_draft(
         self,
         version: UniverseVersion,
@@ -123,6 +166,12 @@ class GovernanceRepository(BaseRepository):
                 universe_version=universe_version,
                 dataset_snapshot_id=int(dataset_snapshot_id),
             )
+            universe = conn.execute(select(universe_versions).where(
+                universe_versions.c.version == universe_version)).mappings().one()
+            if isinstance(protocol.get("base_config"), Mapping) and bool(
+                protocol["base_config"].get("historical_universe_integrity", False)
+            ) != bool(universe["historical_universe_integrity"]):
+                raise ValueError("Historical universe integrity must match the approved universe evidence.")
             existing = conn.execute(
                 select(strategy_versions).where(
                     strategy_versions.c.version == version
@@ -151,6 +200,7 @@ class GovernanceRepository(BaseRepository):
         dataset_snapshot_id: int | None = None,
         code_commit: str | None = None,
         frozen: bool = False,
+        approved_by: str | None = None,
     ) -> None:
         """Thin compatibility wrapper around the explicit lifecycle."""
         if dataset_snapshot_id is None:
@@ -171,7 +221,7 @@ class GovernanceRepository(BaseRepository):
                 dataset_snapshot_id=dataset_snapshot_id,
                 code_commit=code_commit,
             )
-            self.freeze_strategy_version(version)
+            self.freeze_strategy_version(version, approved_by=approved_by or "")
             return
         self.create_strategy_version(
             version=version,
@@ -182,8 +232,10 @@ class GovernanceRepository(BaseRepository):
         )
 
     def freeze_strategy_version(
-        self, version: str, *, admission_run_id: int | None = None
+        self, version: str, *, admission_run_id: int | None = None, approved_by: str,
     ) -> None:
+        if not approved_by.strip():
+            raise ValueError("Strategy approval requires nonempty approved_by.")
         now = datetime.now(timezone.utc)
         with self.engine.begin() as conn:
             strategy = self._strategy(conn, version)
@@ -200,15 +252,77 @@ class GovernanceRepository(BaseRepository):
                     "Strategy freezing requires an admitted AdmissionRun."
                 )
             self._require_complete_final_trials(conn, admission)
+            manifest_data = (admission["results_json"] or {}).get("runtime_manifest")
+            if not isinstance(manifest_data, Mapping):
+                raise ValueError("Strategy freezing requires a verified runtime manifest.")
+            manifest = FrozenRuntimeManifest.from_dict(manifest_data)
+            universe_integrity = conn.execute(select(universe_versions.c.historical_universe_integrity).where(
+                universe_versions.c.version == strategy["universe_version"])).scalar_one()
+            if bool(manifest.config["historical_universe_integrity"]) != bool(universe_integrity):
+                raise ValueError("Frozen runtime cannot override the approved historical universe evidence.")
+            if (manifest.config["strategy_version"] != version
+                    or manifest.dataset_snapshot_id != int(strategy["dataset_snapshot_id"])
+                    or manifest.config["universe_version"] != strategy["universe_version"]):
+                raise ValueError("Runtime manifest does not match the strategy identity.")
+            if (manifest.protocol_hash != canonical_hash(strategy["protocol_json"])
+                    or manifest.code_identity.get("code_commit") != strategy["code_commit"]):
+                raise ValueError("Runtime manifest is not bound to the admitted protocol/code.")
+            protocol = strategy["protocol_json"]
+            if not isinstance(protocol.get("base_config"), Mapping):
+                raise ValueError("Freezing requires a complete preregistered base configuration.")
+            expected_base = replace(manifest, config=protocol["base_config"]).to_config()
+            expected_config = replace(expected_base, strategy_version=version)
+            if protocol.get("protocol_version") == "risk-extension-v1":
+                from research.risk_model_protocol import dynamic_factor_candidate_grid
+                selected = next((candidate for candidate in dynamic_factor_candidate_grid()
+                                 if candidate.label == manifest.selected_label), None)
+                if selected is None or manifest.parent_runtime_hash != protocol.get("parent_runtime_hash"):
+                    raise ValueError("Risk runtime must bind the selected candidate and frozen parent.")
+                expected_config = replace(expected_config, risk_model="dynamic_factor",
+                    ewma_half_life_days=selected.half_life_days, pca_stress_multiplier=selected.stress_multiplier)
+            elif protocol.get("candidates"):
+                from research.protocol import ResearchProtocol, apply_candidate
+                core_protocol = ResearchProtocol.from_dict(dict(protocol))
+                selected = next((candidate for candidate in core_protocol.candidates
+                                 if candidate.label == manifest.selected_label), None)
+                if selected is None:
+                    raise ValueError("Runtime must bind the selected preregistered core candidate.")
+                expected_config = replace(apply_candidate(expected_base, selected), strategy_version=version)
+            assert_runtime_matches(expected_config, manifest, verify_code=False)
+            assert_code_identity(manifest.code_identity)
             if strategy["status"] == "frozen":
+                if strategy["runtime_hash"] != manifest.runtime_hash:
+                    raise ValueError("Frozen runtime is immutable; create a new version.")
                 return
             if strategy["status"] != "draft":
                 raise ValueError("Only a draft strategy version can be frozen.")
             conn.execute(
                 update(strategy_versions)
                 .where(strategy_versions.c.version == version)
-                .values(status="frozen", frozen_at=now)
+                .values(status="frozen", frozen_at=now,
+                        approved_by=approved_by.strip(), approved_at=now,
+                        runtime_manifest_json=manifest.to_dict(),
+                        runtime_hash=manifest.runtime_hash)
             )
+
+    def load_frozen_runtime(
+        self, version: str, *, verify_code: bool = True,
+    ) -> FrozenRuntimeManifest:
+        """Load complete admitted policy; old name-only freezes fail closed."""
+        with self.engine.connect() as conn:
+            row = self._strategy(conn, version)
+        if row["status"] != "frozen" or not row["runtime_manifest_json"]:
+            raise ValueError("Strategy has no verified frozen runtime manifest.")
+        if not str(row["approved_by"] or "").strip() or row["approved_at"] is None:
+            raise ValueError("Frozen runtime requires explicit human strategy-version approval.")
+        manifest = FrozenRuntimeManifest.from_dict(row["runtime_manifest_json"])
+        if manifest.runtime_hash != row["runtime_hash"]:
+            raise ValueError("Stored frozen runtime hash does not match its manifest.")
+        if manifest.config["strategy_version"] != version:
+            raise ValueError("Frozen runtime configuration belongs to another version.")
+        if verify_code:
+            assert_code_identity(manifest.code_identity)
+        return manifest
 
     def is_universe_approved(self, version: str) -> bool:
         with self.engine.connect() as conn:
@@ -229,6 +343,7 @@ class GovernanceRepository(BaseRepository):
         return status == "frozen"
 
     def start_local_sim_clock(self, version: str) -> None:
+        self.load_frozen_runtime(version)
         started_at = datetime.now(timezone.utc)
         with self.engine.begin() as conn:
             strategy = self._strategy(conn, version)
@@ -255,21 +370,36 @@ class GovernanceRepository(BaseRepository):
         """Compatibility alias; caller-supplied historical timestamps are forbidden."""
         self.start_local_sim_clock(version)
 
-    def restart_paper_clock(self, version: str, *, reason: str) -> None:
+    def restart_paper_clock(self, version: str, *, account_ref: str, reason: str) -> int:
         if not reason.strip():
-            raise ValueError("A material strategy change requires a restart reason.")
+            raise ValueError("Observation restart requires a reason; policy changes require a new version.")
+        manifest = self.load_frozen_runtime(version)
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
         with self.engine.begin() as conn:
-            strategy = self._strategy(conn, version)
-            if strategy["status"] != "frozen":
-                raise ValueError("Only a frozen strategy can restart its local clock.")
+            current = conn.execute(select(validation_runs).where(
+                validation_runs.c.strategy_version == version,
+                validation_runs.c.account_ref == account_ref,
+                validation_runs.c.environment == "PAPER",
+                validation_runs.c.execution_model == "REPLAY_OPEN",
+                validation_runs.c.status == "active",
+            )).mappings().one_or_none()
+            if current is None:
+                raise ValueError("No active validation stage exists for this account/version.")
+            conn.execute(update(validation_runs).where(validation_runs.c.id == current["id"]).values(
+                status="restarted", ended_at=now, restart_reason=reason.strip()))
+            inserted = conn.execute(validation_runs.insert().values(
+                strategy_version=version, runtime_hash=manifest.runtime_hash,
+                account_ref=account_ref, environment="PAPER", execution_model="REPLAY_OPEN",
+                started_at=now, status="active", restart_reason=reason.strip()))
             conn.execute(
                 update(strategy_versions)
                 .where(strategy_versions.c.version == version)
                 .values(
-                    local_sim_start=datetime.now(timezone.utc),
+                    local_sim_start=now,
                     paper_clock_restart_reason=reason.strip(),
                 )
             )
+            return int(inserted.inserted_primary_key[0])
 
     def start_admission(
         self,
@@ -312,6 +442,36 @@ class GovernanceRepository(BaseRepository):
             ).scalar_one_or_none()
             if running is not None:
                 return int(running)
+            if methodology == "nested_risk_extension_v1":
+                protocol = strategy["protocol_json"]
+                parent_hash = protocol.get("parent_runtime_hash")
+                if not parent_hash or results.get("parent_runtime_hash") != parent_hash:
+                    raise ValueError("Risk admission must bind the preregistered parent runtime.")
+                parent = conn.execute(select(strategy_versions).where(
+                    strategy_versions.c.runtime_hash == parent_hash,
+                    strategy_versions.c.status == "frozen",
+                )).mappings().one_or_none()
+                if parent is None:
+                    raise ValueError("Risk admission requires a real frozen parent runtime.")
+                parent_manifest = FrozenRuntimeManifest.from_dict(parent["runtime_manifest_json"])
+                if (protocol.get("base_config") != dict(parent_manifest.config)
+                        or protocol.get("code_identity") != dict(parent_manifest.code_identity)):
+                    raise ValueError("Risk protocol changes the frozen core configuration/code.")
+                previous = conn.execute(select(admission_runs, dataset_snapshots.c.end_date).join(
+                    strategy_versions, admission_runs.c.strategy_version == strategy_versions.c.version
+                ).join(dataset_snapshots, strategy_versions.c.dataset_snapshot_id == dataset_snapshots.c.id).where(
+                    admission_runs.c.parent_runtime_hash == parent_hash,
+                    admission_runs.c.evidence_role == "post_core_holdout",
+                )).mappings().all()
+                for prior in previous:
+                    prior_result = prior["results_json"] or {}
+                    # An insufficient run exits before any protected trial is
+                    # evaluated. Every other attempt consumes its holdout,
+                    # including failed/abandoned attempts, not just winners.
+                    if prior_result.get("status") == "INSUFFICIENT_EVIDENCE":
+                        continue
+                    if pd.Timestamp(protocol["holdout_start"]) <= pd.Timestamp(prior["end_date"]):
+                        raise ValueError("This parent already consumed or reserved the requested holdout; use new observations.")
             result = conn.execute(
                 admission_runs.insert().values(
                     strategy_version=strategy_version,
@@ -322,6 +482,9 @@ class GovernanceRepository(BaseRepository):
                     updated_at=now,
                     completed_at=None,
                     error_message=None,
+                    runtime_hash=results.get("runtime_hash"),
+                    parent_runtime_hash=results.get("parent_runtime_hash"),
+                    evidence_role=results.get("evidence_role", "research_selector"),
                 )
             )
             return int(result.inserted_primary_key[0])
@@ -442,6 +605,9 @@ class GovernanceRepository(BaseRepository):
                     updated_at=now,
                     completed_at=now,
                     error_message=normalized_error,
+                    runtime_hash=results.get("runtime_hash", run["runtime_hash"]),
+                    parent_runtime_hash=results.get("parent_runtime_hash", run["parent_runtime_hash"]),
+                    evidence_role=results.get("evidence_role", run["evidence_role"]),
                 )
             )
 
@@ -512,6 +678,8 @@ class GovernanceRepository(BaseRepository):
     @staticmethod
     def _snapshot_is_actionable(snapshot: Mapping[str, object]) -> bool:
         quality = snapshot["quality_json"] or {}
+        if quality.get("quality_model_version") != DATA_QUALITY_MODEL_VERSION:
+            return False
         status = str(snapshot["status"])
         if status not in {"TRUSTED", "WARNING", "TRUSTED_WITH_EXCEPTIONS"}:
             return False

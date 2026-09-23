@@ -15,6 +15,7 @@ from config.settings import Config
 from data.adjustments import locally_adjust_ohlcv
 from data.calendar import NyseCalendar
 from data.features import FeatureEngineer
+from data.models import DATA_QUALITY_MODEL_VERSION
 from research.model_admission import evaluate_admission
 from research.risk_model_protocol import (
     dynamic_factor_candidate_grid,
@@ -67,6 +68,8 @@ def load_snapshot_market_data(
     if str(row.status) == "BLOCKED":
         raise ValueError("A blocked dataset snapshot cannot enter model admission.")
     stale_sessions = (row.quality_json or {}).get("stale_sessions")
+    if require_actionable and (row.quality_json or {}).get("quality_model_version") != DATA_QUALITY_MODEL_VERSION:
+        raise ValueError("Model admission requires a newly audited current-quality snapshot.")
     if require_actionable and stale_sessions != 0:
         raise ValueError("Model admission requires a zero-staleness dataset snapshot.")
 
@@ -142,11 +145,15 @@ def run_portfolio(
     *,
     execution_prices: pd.DataFrame,
     median_dollar_volume: pd.DataFrame,
+    raw_close_prices: pd.DataFrame,
+    corporate_actions: tuple = (),
 ) -> pd.DataFrame:
     return Backtester(
         config=config,
         prices=prices,
         execution_prices=execution_prices,
+        raw_close_prices=raw_close_prices,
+        corporate_actions=corporate_actions,
         returns=returns,
         median_dollar_volume=median_dollar_volume,
         features=features,
@@ -216,138 +223,72 @@ def _jsonable(value: object) -> object:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Evaluate the six preregistered dynamic risk models on an immutable snapshot."
-    )
+    from research.risk_admission import build_risk_protocol, run_risk_admission
+    from research.runtime import canonical_hash
+    from scripts.run_core_admission import load_immutable_snapshot
+
+    parser = argparse.ArgumentParser(description="Evaluate a risk extension against untouched post-core evidence.")
     parser.add_argument("--snapshot-id", type=int, required=True)
-    parser.add_argument("--strategy-version", required=True)
+    parser.add_argument("--strategy-version", required=True, help="Frozen parent core version")
+    parser.add_argument("--candidate-version", help="New child version; never edits the parent")
     parser.add_argument("--database", default="quant_research.db")
-    parser.add_argument("--oos-start", default="2022-01-01")
+    parser.add_argument("--holdout-start", required=True)
+    parser.add_argument("--diagnostic-only", action="store_true")
     args = parser.parse_args()
-
-    db_url = _database_url(args.database)
-    engine = create_db_engine(db_url)
+    engine = create_db_engine(_database_url(args.database))
     governance = GovernanceRepository(engine=engine)
-    with engine.connect() as connection:
-        frozen_record = connection.execute(
-            select(
-                strategy_versions.c.status,
-                strategy_versions.c.dataset_snapshot_id,
-            ).where(strategy_versions.c.version == args.strategy_version)
-        ).one_or_none()
-    if frozen_record is None or frozen_record.status != "frozen":
-        raise ValueError("Risk-model admission requires a frozen core strategy version.")
-    if int(frozen_record.dataset_snapshot_id or -1) != args.snapshot_id:
-        raise ValueError(
-            "Risk-model admission must use the dataset snapshot bound to the frozen core strategy."
+    parent = governance.load_frozen_runtime(args.strategy_version)
+    if pd.Timestamp(args.holdout_start) <= pd.Timestamp(parent.research_cutoff):
+        output = {"status": "CONDITIONAL_DIAGNOSTIC_ONLY", "admitted": False,
+                  "risk_model_default_remains": "sample",
+                  "reason": "The requested interval was used to discover the frozen core.",
+                  "parent_runtime_hash": parent.runtime_hash}
+        print(json.dumps(output, indent=2))
+        return
+    if not args.diagnostic_only and not args.candidate_version:
+        parser.error("Formal risk research requires a distinct --candidate-version.")
+    if args.diagnostic_only:
+        parser.error("Diagnostic mode cannot inspect protected post-core holdout; register a formal child version.")
+    child = args.candidate_version or args.strategy_version + "-diagnostic"
+    if child == args.strategy_version:
+        parser.error("The child version must differ from the frozen parent.")
+    protocol = build_risk_protocol(parent, dataset_snapshot_id=args.snapshot_id,
+                                   holdout_start=args.holdout_start)
+    run_id = None
+    if not args.diagnostic_only:
+        governance.create_strategy_version(
+            version=child, universe_version=str(parent.config["universe_version"]),
+            protocol=protocol, dataset_snapshot_id=args.snapshot_id,
+            code_commit=str(parent.code_identity["code_commit"]),
         )
-    baseline_config = Config(
-        risk_model="sample",
-        trading_cost_bps=5.0,
-        slippage_bps=2.0,
-        strategy_version=args.strategy_version,
-        db_url=db_url,
-    )
-    candidates = dynamic_factor_candidate_grid()
-    validate_risk_model_stage(
-        core_strategy_frozen=governance.is_strategy_frozen(args.strategy_version),
-        baseline_model=baseline_config.risk_model,
-        evaluated_labels={candidate.label for candidate in candidates},
-    )
-
-    (
-        snapshot_id,
-        _,
-        prices,
-        execution_prices,
-        returns,
-        features,
-        median_dollar_volume,
-    ) = prepare_snapshot_inputs(
-        baseline_config,
-        database=args.database,
-        snapshot_id=args.snapshot_id,
-        require_actionable=True,
-    )
-    common = {
-        "execution_prices": execution_prices,
-        "median_dollar_volume": median_dollar_volume,
-    }
-    baseline = run_portfolio(
-        baseline_config, prices, returns, features, **common
-    )
-    configurations = {
-        candidate.label: replace(
-            baseline_config,
-            risk_model="dynamic_factor",
-            ewma_half_life_days=candidate.half_life_days,
-            pca_stress_multiplier=candidate.stress_multiplier,
+        run_id = governance.start_admission(
+            strategy_version=child, methodology="nested_risk_extension_v1",
+            protocol_hash=canonical_hash(protocol),
+            results={"parent_runtime_hash": parent.runtime_hash,
+                     "evidence_role": "post_core_holdout"},
         )
-        for candidate in candidates
-    }
-    portfolios = {
-        label: run_portfolio(config, prices, returns, features, **common)
-        for label, config in configurations.items()
-    }
-
-    oos_start = pd.Timestamp(args.oos_start)
-    start_dates = [
-        pd.Timestamp(year, 1, 1)
-        for year in range(oos_start.year, int(prices.index.max().year) + 1)
-        if pd.Timestamp(year, 1, 1) <= prices.index.max()
-    ]
-    crisis_periods = {
-        "covid_2020": (pd.Timestamp("2020-02-19"), pd.Timestamp("2020-04-30")),
-        "inflation_bear_2022": (
-            pd.Timestamp("2022-01-03"),
-            pd.Timestamp("2022-10-12"),
-        ),
-    }
-    evaluations: dict[str, object] = {}
-    for label, config in configurations.items():
-        momentum_signal, model_signal = build_independence_signals(
-            config, prices, returns, features, oos_start
-        )
-        evaluations[label] = evaluate_admission(
-            baseline=baseline,
-            candidate=portfolios[label],
-            parameter_candidates=portfolios,
-            momentum_signal=momentum_signal,
-            model_signal=model_signal,
-            oos_start=oos_start,
-            first_test_year=oos_start.year,
-            start_dates=start_dates,
-            crisis_periods=crisis_periods,
-        )
-
-    admitted = [
-        label for label, result in evaluations.items() if bool(result["admitted"])
-    ]
-    selected = (
-        max(
-            admitted,
-            key=lambda label: float(
-                evaluations[label]["overall_oos"]["sharpe_improvement"]
-            ),
-        )
-        if admitted
-        else None
-    )
-    output = {
-        "dataset_snapshot_id": snapshot_id,
-        "strategy_version": args.strategy_version,
-        "core_strategy_frozen": True,
-        "baseline_model": "sample",
-        "risk_model_default_remains": "sample" if selected is None else selected,
-        "selected_admitted_candidate": selected,
-        "candidate_count": len(candidates),
-        "evaluations": evaluations,
-    }
-    print(
-        json.dumps(
-            _jsonable(output), ensure_ascii=False, indent=2, allow_nan=False
-        )
-    )
+    def record(trial):
+        if run_id is not None:
+            governance.save_admission_trial(run_id, **trial)
+    finished = False
+    try:
+        data = load_immutable_snapshot(args.database, args.snapshot_id)
+        output = run_risk_admission(parent, data, protocol, strategy_version=child,
+                                    trial_callback=record)
+        if args.diagnostic_only:
+            output.update(admitted=False, status="CONDITIONAL_DIAGNOSTIC_ONLY",
+                          risk_model_default_remains="sample")
+        elif run_id is not None:
+            governance.finish_admission(run_id,
+                status="admitted" if output["admitted"] else "rejected", results=output)
+            finished = True
+            output["strategy_approval"] = "SEPARATE_MANUAL_STEP"
+    except Exception as exc:
+        if run_id is not None and not finished:
+            governance.finish_admission(run_id, status="failed",
+                results={"admitted": False, "error": str(exc)}, error_message=str(exc))
+        raise
+    print(json.dumps(_jsonable(output), ensure_ascii=False, indent=2, allow_nan=False))
 
 
 if __name__ == "__main__":

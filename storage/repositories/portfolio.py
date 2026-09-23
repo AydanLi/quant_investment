@@ -12,6 +12,7 @@ from __future__ import annotations
 from typing import Any, Optional
 
 import pandas as pd
+from sqlalchemy.engine import Connection
 
 from storage.repositories.base import BaseRepository
 from storage.schema import portfolio_daily, portfolio_weights
@@ -30,7 +31,7 @@ def _opt_float(value: Any) -> Optional[float]:
 
 
 class PortfolioRepository(BaseRepository):
-    def save(self, run_id: int, portfolio: pd.DataFrame) -> None:
+    def save(self, run_id: int, portfolio: pd.DataFrame, *, connection: Connection | None = None) -> None:
         """Persist daily rows and per-asset weights in one transaction."""
         if portfolio.empty:
             return
@@ -60,6 +61,7 @@ class PortfolioRepository(BaseRepository):
                     "cash": _opt_float(row.get("cash")),
                     "settled_cash": _opt_float(row.get("settled_cash")),
                     "unsettled_cash": _opt_float(row.get("unsettled_cash")),
+                    "dividend_receivable": _opt_float(row.get("dividend_receivable")),
                     "drawdown": _opt_float(row.get("drawdown")),
                     "high_water": _opt_float(row.get("high_water")),
                     "risk_status": row.get("risk_status"),
@@ -80,7 +82,7 @@ class PortfolioRepository(BaseRepository):
                     }
                 )
 
-        with self.engine.begin() as conn:
+        with self.transaction(connection) as conn:
             conn.execute(portfolio_daily.insert(), daily_rows)
             if weight_rows:
                 conn.execute(portfolio_weights.insert(), weight_rows)

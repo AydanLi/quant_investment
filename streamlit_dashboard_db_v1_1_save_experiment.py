@@ -17,7 +17,7 @@ from data.providers import FredRiskFreeProvider, ProviderError
 from report.benchmarks import build_benchmark_returns
 from report.reporter import ReportGenerator
 from risk.engine import RiskEngine
-from services.dashboard_display import format_parameter_display_value
+from services.dashboard_display import equity_chart, eligible_comparison_runs, format_parameter_display_value, runtime_is_verified
 from services.dashboard_i18n import localize_frame, translate, translate_warning
 from services.experiment_validation import validate_experiment_parameters
 from services.factor_monitor import FACTOR_LABELS, build_factor_monitor
@@ -106,13 +106,12 @@ def dashboard_risk_model_options(
     return options
 
 
-@st.cache_data(show_spinner=False)
 def load_admitted_dynamic_factor() -> dict[str, object] | None:
     """Load the latest dynamic model backed by an admitted, frozen version."""
     store = ResearchStore()
     try:
         statement = (
-            select(admission_runs.c.results_json)
+            select(admission_runs.c.results_json, strategy_versions.c.version)
             .select_from(
                 admission_runs.join(
                     strategy_versions,
@@ -122,18 +121,23 @@ def load_admitted_dynamic_factor() -> dict[str, object] | None:
             .where(
                 admission_runs.c.status == "admitted",
                 strategy_versions.c.status == "frozen",
+                admission_runs.c.runtime_hash == strategy_versions.c.runtime_hash,
             )
             .order_by(admission_runs.c.id.desc())
         )
         with store.engine.connect() as connection:
-            results = connection.execute(statement).scalars().all()
+            results = connection.execute(statement).all()
+        for result, version in results:
+            try:
+                manifest = store.governance.load_frozen_runtime(version)
+            except ValueError:
+                continue
+            parsed = parse_admitted_dynamic_factor(result)
+            if parsed is not None and manifest.config["risk_model"] == "dynamic_factor":
+                return {**parsed, "strategy_version": version}
     finally:
         store.close()
 
-    for result in results:
-        parsed = parse_admitted_dynamic_factor(result)
-        if parsed is not None:
-            return parsed
     return None
 
 
@@ -191,11 +195,19 @@ def synced_numeric_parameter(
     return st.session_state[input_key]
 
 
-@st.cache_data(show_spinner=False)
 def load_runs(limit: int) -> pd.DataFrame:
     store = ResearchStore()
     try:
         df = store.get_experiment_runs(limit)
+        verified_versions = {}
+        for version in df.get("strategy_version", pd.Series(dtype=object)).dropna().unique():
+            try:
+                verified_versions[version] = store.governance.load_frozen_runtime(version).runtime_hash
+            except ValueError:
+                verified_versions[version] = None
+        if not df.empty:
+            df["runtime_verified"] = df.apply(lambda row: bool(
+                row.get("runtime_hash") and verified_versions.get(row.get("strategy_version")) == row.get("runtime_hash")), axis=1)
     finally:
         store.close()
     return df
@@ -272,6 +284,7 @@ def execute_experiment_and_save(
     risk_model: str,
     ewma_half_life_days: int,
     pca_stress_multiplier: float,
+    frozen_strategy_version: str | None = None,
 ) -> int:
     config = Config(
         start_date=start_date,
@@ -290,6 +303,23 @@ def execute_experiment_and_save(
         ewma_half_life_days=ewma_half_life_days,
         pca_stress_multiplier=pca_stress_multiplier,
     )
+    if frozen_strategy_version is not None:
+        store = ResearchStore(db_url=config.db_url)
+        try:
+            manifest = store.governance.load_frozen_runtime(frozen_strategy_version)
+            frozen = manifest.to_config(db_url=config.db_url)
+        finally:
+            store.close()
+        editable_fields = (
+            "start_date", "rebalance_frequency", "top_n", "min_momentum_threshold",
+            "target_annual_vol", "max_asset_weight", "risk_off_cash_weight",
+            "vix_risk_off_threshold", "vix_high_threshold", "trading_cost_bps",
+            "slippage_bps", "risk_model", "ewma_half_life_days", "pca_stress_multiplier",
+        )
+        changed = [field for field in editable_fields if getattr(config, field) != getattr(frozen, field)]
+        if changed:
+            raise ValueError("Frozen strategy fields cannot change in the dashboard: " + ", ".join(changed))
+        config = frozen
 
     loader = TrustedMarketDataLoader(config)
     data = loader.load()
@@ -297,6 +327,7 @@ def execute_experiment_and_save(
     fe = FeatureEngineer(data, config)
     prices = fe.make_price_frame()
     execution_prices = fe.make_open_frame().reindex(prices.index)
+    raw_close_prices = fe.make_raw_close_frame().reindex(prices.index)
     median_dollar_volume = fe.make_median_dollar_volume_frame().reindex(prices.index)
     returns = fe.make_returns_frame(prices)
     features = fe.compute_features(prices, returns)
@@ -314,6 +345,8 @@ def execute_experiment_and_save(
         strategy=strategy,
         risk_engine=risk_engine,
         execution_prices=execution_prices,
+        raw_close_prices=raw_close_prices,
+        corporate_actions=fe.corporate_actions(),
         median_dollar_volume=median_dollar_volume,
     )
     results = bt.run()
@@ -330,6 +363,7 @@ def execute_experiment_and_save(
     summary = reporter.summarize(
         portfolio,
         risk_free_returns=risk_free,
+        risk_free_source="FRED DGS3MO",
         benchmark_returns=build_benchmark_returns(prices),
         orders=orders,
         asset_returns=returns,
@@ -638,6 +672,7 @@ def main() -> None:
                         pca_stress_multiplier=float(
                             risk_model_settings["pca_stress_multiplier"]
                         ),
+                        frozen_strategy_version=risk_model_settings.get("strategy_version"),
                     )
                     st.cache_data.clear()
                     st.success(t("保存成功，run_id = {run_id}", run_id=run_id))
@@ -667,6 +702,18 @@ def main() -> None:
     selected_row = runs[runs["id"] == selected_run_id].iloc[0]
 
     st.subheader(t("实验摘要 · run_id={run_id}", run_id=selected_run_id))
+    metric_snapshot = selected_row.get("summary_json")
+    if not isinstance(metric_snapshot, dict):
+        metric_snapshot = {}
+    st.caption(t("结果状态：{status}；指标状态：{metric_status}；运行身份：{runtime_status}",
+        status=t(str(selected_row.get("status", "LEGACY_UNVERIFIED"))),
+        metric_status=t(str(metric_snapshot.get("Metric Status", "LEGACY_UNVERIFIED"))),
+        runtime_status=t("VERIFIED" if runtime_is_verified(selected_row.get("runtime_verified")) else "LEGACY_UNVERIFIED")))
+    if eligible_comparison_runs(runs[runs["id"] == selected_run_id]).empty:
+        st.warning(t("该结果不满足有效比较条件：可能未准入、已失效、缺少运行身份或指标样本不足。"))
+    if selected_row.get("invalidated_reason"):
+        st.caption(str(selected_row["invalidated_reason"]))
+    st.caption(t("收益为税前估计；卖出订单胜率不等同于完整往返交易胜率。当前投资池回溯不代表已消除幸存者偏差。"))
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric(t("Scenario"), str(selected_row.get("scenario_name", "N/A")))
     c2.metric(t("CAGR"), format_pct(selected_row.get("cagr")))
@@ -682,6 +729,12 @@ def main() -> None:
     c10.metric(t("Latest Regime"), str(selected_row.get("latest_regime", "N/A")))
 
     st.subheader(t("参数快照"))
+    if metric_snapshot:
+        with st.expander(t("完整指标与计算口径")):
+            metrics_frame = pd.DataFrame([
+                {"Parameter": t(key), "Value": format_parameter_display_value(value)}
+                for key, value in metric_snapshot.items()])
+            st.dataframe(localize_frame(metrics_frame, language), width="stretch")
     param_cols = [
         "start_date",
         "rebalance_frequency",
@@ -744,11 +797,12 @@ def main() -> None:
         if portfolio.empty:
             st.info(t("该 run 没有 portfolio_daily 数据。"))
         else:
-            chart_df = portfolio[["date", "equity"]].set_index("date")
+            chart_df = equity_chart(portfolio, metric_snapshot)
             st.line_chart(localize_frame(chart_df, language))
 
             d1, d2, d3, d4 = st.columns(4)
-            d1.metric(t("Start Equity"), f"${safe_float(portfolio['equity'].iloc[0]):,.2f}" if not portfolio.empty else "N/A")
+            opening_nav = metric_snapshot.get("Start Equity") if metric_snapshot.get("Metric Schema Version") == 2 else None
+            d1.metric(t("Start Equity"), f"${safe_float(opening_nav):,.2f}" if opening_nav is not None else "N/A")
             d2.metric(t("End Equity"), f"${safe_float(portfolio['equity'].iloc[-1]):,.2f}" if not portfolio.empty else "N/A")
             d3.metric(t("Rows"), str(len(portfolio)))
             d4.metric(t("Last Regime"), str(portfolio['regime'].iloc[-1]) if 'regime' in portfolio.columns and not portfolio.empty else "N/A")
@@ -978,7 +1032,10 @@ def main() -> None:
         "created_at",
     ]
     existing_compare_cols = [c for c in compare_cols if c in runs.columns]
-    st.dataframe(localize_frame(runs[existing_compare_cols], language), width="stretch")
+    comparison_runs = eligible_comparison_runs(runs)
+    st.caption(t("仅比较已准入、运行身份有效且指标完整的实验；其余 {count} 条保留在历史记录中。",
+                 count=len(runs) - len(comparison_runs)))
+    st.dataframe(localize_frame(comparison_runs[existing_compare_cols], language), width="stretch")
 
 
 if __name__ == "__main__":

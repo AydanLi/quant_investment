@@ -17,7 +17,7 @@ from config.settings import Config
 from data.features import FeatureEngineer
 from research.mirror_walk_forward import evaluate_mirror_walk_forward
 from risk.engine import RiskEngine
-from storage.db import get_engine
+from storage.db import create_db_engine
 from storage.repositories.brokerage_mirror import BrokerageMirrorRepository
 from storage.repositories.market_data import MarketDataRepository
 from strategy.momentum_rotation import MomentumRotationStrategy
@@ -147,7 +147,9 @@ def _metrics(portfolio: pd.DataFrame) -> dict[str, float]:
     }
 
 
-def _run(config: Config, prices: pd.DataFrame, features: dict) -> pd.DataFrame:
+def _run(config: Config, prices: pd.DataFrame, features: dict, *,
+         execution_prices: pd.DataFrame, raw_close_prices: pd.DataFrame,
+         median_dollar_volume: pd.DataFrame, corporate_actions=()) -> pd.DataFrame:
     returns = prices.pct_change(fill_method=None).replace([np.inf, -np.inf], np.nan)
     return Backtester(
         config=config,
@@ -157,6 +159,10 @@ def _run(config: Config, prices: pd.DataFrame, features: dict) -> pd.DataFrame:
         regime_detector=RegimeDetector(config),
         strategy=MomentumRotationStrategy(config),
         risk_engine=RiskEngine(config),
+        execution_prices=execution_prices,
+        raw_close_prices=raw_close_prices,
+        median_dollar_volume=median_dollar_volume,
+        corporate_actions=corporate_actions,
     ).run()["portfolio"]
 
 
@@ -252,6 +258,9 @@ def _ranking_frame(result: dict[str, object]) -> pd.DataFrame:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--snapshot-id", type=int, required=True,
+                        help="Immutable trusted OHLCV snapshot covering the mirrored universe")
+    parser.add_argument("--database", default="quant_research.db")
     parser.add_argument("--start", default="2021-01-01")
     parser.add_argument("--first-validation", default="2023-01-01")
     parser.add_argument(
@@ -272,19 +281,12 @@ def main() -> None:
         type=Path,
         default=Path(".runtime/mirror_optimization"),
     )
-    parser.add_argument(
-        "--allow-external-symbol-disclosure",
-        action="store_true",
-        help=(
-            "Explicitly allow sending the mirrored symbol list to Yahoo "
-            "Finance. By default only the local cache is used."
-        ),
-    )
     args = parser.parse_args()
 
     first_validation = pd.Timestamp(args.first_validation)
     holdout_start = pd.Timestamp(args.holdout_start)
-    mirror = BrokerageMirrorRepository(get_engine()).get_latest(
+    database_url = args.database if "://" in args.database else f"sqlite:///{Path(args.database).as_posix()}"
+    mirror = BrokerageMirrorRepository(create_db_engine(database_url)).get_latest(
         "robinhood", "0908"
     )
     if mirror.empty:
@@ -292,28 +294,33 @@ def main() -> None:
     held = sorted(mirror["symbol"].unique().tolist())
     eligibility_cutoff = first_validation - pd.Timedelta(days=1)
     try:
-        if args.allow_external_symbol_disclosure:
-            prices, universe = _download(
-                held,
-                args.start,
-                args.minimum_price,
-                eligibility_cutoff,
-            )
-        else:
-            prices, universe = _load_cached(
-                MarketDataRepository(get_engine()),
-                held,
-                args.start,
-                args.minimum_price,
-                eligibility_cutoff,
-            )
+        from scripts.run_core_admission import load_immutable_snapshot
+        data = load_immutable_snapshot(args.database, args.snapshot_id)
+        requested = set(held) | {"BIL", "SPY", "^VIX"}
+        missing = requested - set(data)
+        if missing:
+            raise ValueError("Trusted snapshot is missing mirrored symbols; import raw OHLCV first. "
+                             "External symbol disclosure remains disabled.")
+        data = {ticker: frame.loc[args.start:].copy() for ticker, frame in data.items()
+                if ticker in requested}
+        preliminary = FeatureEngineer(data, Config(universe=list(requested)))
+        prices, universe = _select_eligible_universe(
+            preliminary.make_price_frame(), held, args.minimum_price, eligibility_cutoff,
+        )
     except ValueError as exc:
         raise SystemExit(f"Optimization stopped: {exc}") from None
     feature_config = Config(start_date=args.start, universe=universe)
-    features = FeatureEngineer({}, feature_config).compute_features(
+    engineer = FeatureEngineer(data, feature_config)
+    features = engineer.compute_features(
         prices,
         prices.pct_change(fill_method=None),
     )
+    market_inputs = {
+        "execution_prices": engineer.make_open_frame().reindex(prices.index),
+        "raw_close_prices": engineer.make_raw_close_frame().reindex(prices.index),
+        "median_dollar_volume": engineer.make_median_dollar_volume_frame().reindex(prices.index),
+        "corporate_actions": engineer.corporate_actions(),
+    }
 
     baseline_parameters = {
         "rebalance_frequency": "M",
@@ -331,6 +338,7 @@ def main() -> None:
         ),
         prices,
         features,
+        **market_inputs,
     )
     parameter_grid = _candidate_parameters()
     candidates = {
@@ -338,6 +346,7 @@ def main() -> None:
             _config(start=args.start, universe=universe, parameters=parameters),
             prices,
             features,
+            **market_inputs,
         )
         for label, parameters in parameter_grid.items()
     }
@@ -400,6 +409,8 @@ def main() -> None:
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "source_fingerprint": _source_fingerprint(project_root),
         "mirror_snapshot_id": int(mirror["snapshot_id"].iloc[0]),
+        "dataset_snapshot_id": args.snapshot_id,
+        "price_basis": "raw_ohlcv_execution_and_local_total_return_signals",
         "held_symbols": held,
         "eligible_universe": universe,
         "excluded_symbols": sorted(set(held) - set(universe)),

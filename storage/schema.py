@@ -86,6 +86,8 @@ experiment_runs = Table(
     Column("strategy_version", String(40), ForeignKey("strategy_versions.version")),
     Column("admissible", Integer, nullable=False, server_default="0"),
     Column("invalidated_reason", String),
+    Column("summary_json", JSON),
+    Column("runtime_hash", String(64)),
     Index("ix_experiment_runs_config_hash", "config_hash"),
     Index("ix_experiment_runs_scenario_name", "scenario_name"),
 )
@@ -118,6 +120,7 @@ portfolio_daily = Table(
     Column("cash", Float),
     Column("settled_cash", Float),
     Column("unsettled_cash", Float),
+    Column("dividend_receivable", Float),
     Column("drawdown", Float),
     Column("high_water", Float),
     Column("risk_status", String(30)),
@@ -270,6 +273,8 @@ corporate_actions = Table(
     Column("split_factor", Float, nullable=False, server_default="1"),
     Column("status", String(20), nullable=False, server_default="active"),
     Column("source", String(40), nullable=False),
+    Column("payment_date", String(20)),
+    Column("payment_source", String(200)),
     Column("fetched_at", DateTime, nullable=False, server_default=func.now()),
     UniqueConstraint(
         "ticker", "ex_date", "action_type", "source",
@@ -281,6 +286,8 @@ corporate_actions = Table(
 data_revisions = Table(
     "data_revisions",
     metadata,
+    Column("old_text", String(500)),
+    Column("new_text", String(500)),
     Column("id", Integer, primary_key=True),
     Column("dataset_table", String(40), nullable=False),
     Column("ticker", String(20), nullable=False),
@@ -341,6 +348,8 @@ dataset_snapshot_actions = Table(
     Column("split_factor", Float, nullable=False),
     Column("status", String(20), nullable=False),
     Column("source", String(40), nullable=False),
+    Column("payment_date", String(20)),
+    Column("payment_source", String(200)),
     UniqueConstraint("snapshot_id", "ticker", "ex_date", "action_type", "role", name="uq_dataset_snapshot_actions_snapshot_ticker_date_type_role"),
     Index("ix_dataset_snapshot_actions_snapshot_ticker", "snapshot_id", "ticker"),
 )
@@ -420,6 +429,10 @@ strategy_versions = Table(
     ),
     Column("code_commit", String(64)),
     Column("protocol_json", JSON, nullable=False),
+    Column("runtime_manifest_json", JSON),
+    Column("runtime_hash", String(64)),
+    Column("approved_by", String(100)),
+    Column("approved_at", DateTime),
     Column("paper_start", DateTime),
     Column("local_sim_start", DateTime),
     Column("paper_clock_restart_reason", String),
@@ -443,6 +456,9 @@ admission_runs = Table(
     Column("selection_uses_future_holdout", Integer, nullable=False, server_default="0"),
     Column("results_json", JSON, nullable=False),
     Column("error_message", String),
+    Column("runtime_hash", String(64)),
+    Column("parent_runtime_hash", String(64)),
+    Column("evidence_role", String(40), nullable=False, server_default="research_selector"),
     Index("ix_admission_runs_strategy_version", "strategy_version"),
 )
 
@@ -471,6 +487,7 @@ parameter_trials = Table(
 signal_decisions = Table(
     "signal_decisions",
     metadata,
+    Column("recorded_at", DateTime, server_default=func.now()),
     Column("id", Integer, primary_key=True),
     Column("decision_key", String(64), nullable=False, unique=True),
     Column("environment", String(20), nullable=False),
@@ -499,6 +516,7 @@ signal_decisions = Table(
     Column("status", String(20), nullable=False),
     Column("regime", String(40), nullable=False),
     Column("decision_json", JSON, nullable=False),
+    Column("runtime_hash", String(64)),
     Column("executed_at", DateTime),
     UniqueConstraint(
         "environment",
@@ -530,6 +548,7 @@ paper_cycles = Table(
     Column("approval_deadline", DateTime, nullable=False),
     Column("status", String(30), nullable=False),
     Column("missed_reason", String),
+    Column("execution_payload_json", JSON),
     Column("created_at", DateTime, nullable=False, server_default=func.now()),
     Column("updated_at", DateTime, nullable=False, server_default=func.now()),
     UniqueConstraint(
@@ -558,6 +577,9 @@ paper_accounts = Table(
     Column("positions_json", JSON, nullable=False),
     Column("high_water", Float, nullable=False),
     Column("risk_state", String(30), nullable=False, server_default="NORMAL"),
+    Column("halt_reasons_json", JSON, nullable=False, server_default="[]"),
+    Column("drift_state", String(30), nullable=False, server_default="NORMAL"),
+    Column("accounting_state_json", JSON, nullable=False, server_default="{}"),
     Column("last_valuation_session", String(20)),
     Column("version", Integer, nullable=False, server_default="1"),
     Column("updated_at", DateTime, nullable=False, server_default=func.now()),
@@ -567,6 +589,53 @@ paper_accounts = Table(
         name="uq_paper_accounts_environment_account_ref",
     ),
 )
+
+paper_account_closes = Table(
+    "paper_account_closes", metadata,
+    Column("id", Integer, primary_key=True),
+    Column("account_id", Integer, ForeignKey("paper_accounts.id", ondelete="CASCADE"), nullable=False),
+    Column("session", String(20), nullable=False),
+    Column("nav", Float, nullable=False),
+    Column("account_version", Integer, nullable=False),
+    Column("closed_at", DateTime, nullable=False),
+    Column("recorded_at", DateTime, nullable=False),
+    Column("source_snapshot_id", Integer, ForeignKey("dataset_snapshots.id")),
+    Column("input_hash", String(64), nullable=False),
+    Column("baseline_kind", String(30), nullable=False),
+    UniqueConstraint("account_id", "session", "baseline_kind", name="uq_paper_account_closes_account_session"),
+)
+
+paper_account_actions = Table(
+    "paper_account_actions", metadata,
+    Column("id", Integer, primary_key=True),
+    Column("account_id", Integer, ForeignKey("paper_accounts.id", ondelete="CASCADE"), nullable=False),
+    Column("action_key", String(200), nullable=False),
+    Column("phase", String(20), nullable=False),
+    Column("revision_hash", String(64), nullable=False),
+    Column("session", String(20), nullable=False),
+    Column("payload_json", JSON, nullable=False),
+    Column("recorded_at", DateTime, nullable=False),
+    UniqueConstraint("account_id", "action_key", "phase", name="uq_paper_account_action_phase"),
+)
+
+validation_runs = Table(
+    "validation_runs", metadata,
+    Column("id", Integer, primary_key=True),
+    Column("strategy_version", String(40), ForeignKey("strategy_versions.version"), nullable=False),
+    Column("runtime_hash", String(64), nullable=False),
+    Column("environment", String(20), nullable=False),
+    Column("execution_model", String(50), nullable=False),
+    Column("account_ref", String(80), nullable=False),
+    Column("started_at", DateTime, nullable=False),
+    Column("ended_at", DateTime),
+    Column("status", String(30), nullable=False),
+    Column("restart_reason", String),
+)
+Index("uq_validation_runs_active", validation_runs.c.strategy_version,
+      validation_runs.c.environment, validation_runs.c.execution_model,
+      validation_runs.c.account_ref, unique=True,
+      sqlite_where=validation_runs.c.status == "active",
+      postgresql_where=validation_runs.c.status == "active")
 
 paper_cash_movements = Table(
     "paper_cash_movements",
@@ -627,6 +696,7 @@ order_intents = Table(
 execution_fills = Table(
     "execution_fills",
     metadata,
+    Column("recorded_at", DateTime, server_default=func.now()),
     Column("id", Integer, primary_key=True),
     Column("order_intent_id", Integer, ForeignKey("order_intents.id", ondelete="CASCADE"), nullable=False),
     Column("environment", String(20), nullable=False),
@@ -749,6 +819,9 @@ __all__ = [
     "signal_decisions",
     "paper_cycles",
     "paper_accounts",
+    "paper_account_closes",
+    "paper_account_actions",
+    "validation_runs",
     "paper_cash_movements",
     "order_intents",
     "execution_fills",

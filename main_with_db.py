@@ -43,6 +43,8 @@ def run_backtest_and_save() -> None:
         strategy=strategy,
         risk_engine=risk_engine,
         execution_prices=execution_prices,
+        raw_close_prices=fe.make_raw_close_frame(),
+        corporate_actions=fe.corporate_actions(),
         median_dollar_volume=median_dollar_volume,
     )
     results = bt.run()
@@ -59,6 +61,7 @@ def run_backtest_and_save() -> None:
     summary = reporter.summarize(
         portfolio,
         risk_free_returns=risk_free,
+        risk_free_source="FRED DGS3MO",
         benchmark_returns=build_benchmark_returns(prices),
         orders=orders,
         asset_returns=returns,
@@ -73,18 +76,17 @@ def run_backtest_and_save() -> None:
     store = ResearchStore()
     store.init_db()
 
-    run_id = store.save_experiment_run(
+    run_id = store.save_full_run(
         scenario_name="baseline_monthly_top3",
         config=config,
         summary=summary,
         latest_signal=latest_signal,
+        portfolio=portfolio,
+        order_df=orders,
         dataset_snapshot_id=loader.dataset_snapshot_id,
         universe_version=config.universe_version,
         strategy_version=config.strategy_version,
     )
-    store.save_portfolio_daily(run_id, portfolio)
-    store.save_orders(run_id, orders)
-    store.save_signals(run_id, latest_signal)
 
     print(f"Saved run_id={run_id} to quant_research.db")
 

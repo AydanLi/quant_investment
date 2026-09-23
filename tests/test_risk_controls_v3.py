@@ -92,6 +92,7 @@ def _run_monthly(prices, opens, *, mode="next_month_end"):
     return Backtester(
         config=config,
         prices=prices,
+        raw_close_prices=prices,
         execution_prices=opens,
         returns=prices.pct_change(fill_method=None),
         features={},

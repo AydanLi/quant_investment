@@ -1,15 +1,44 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from config.settings import Config
 from data.calendar import NyseCalendar
-from data.models import DataQualityReport, DataQualityStatus
+from data.models import DATA_QUALITY_MODEL_VERSION, DataQualityReport, DataQualityStatus
 from services.models import SignalStatus
 from services.signal_service import SignalService
+from research.runtime import build_runtime_manifest
+
+
+def _frozen_config():
+    return Config(universe=["SPY", "BIL"], benchmark="SPY",
+                  strategy_version="SV-FROZEN-001", universe_version="UV-001")
+
+
+@pytest.fixture(autouse=True)
+def governed_runtime(monkeypatch):
+    """These are signal-window unit tests; storage binding has integration tests."""
+    class Governance:
+        def __init__(self, **kwargs):
+            pass
+
+        def load_frozen_runtime(self, version):
+            assert version == "SV-FROZEN-001"
+            return build_runtime_manifest(_frozen_config(), code_identity={"fixture": True},
+                                          research_cutoff="2023-12-31", dataset_snapshot_id=17)
+
+        def is_universe_approved(self, version):
+            return version == "UV-001"
+
+        def is_strategy_frozen(self, version):
+            return version == "SV-FROZEN-001"
+
+    monkeypatch.setattr("services.signal_service.GovernanceRepository", Governance)
 
 
 class _TrustedLoader:
@@ -25,8 +54,10 @@ class _TrustedLoader:
             stale_sessions=stale_sessions,
             issues=(),
             content_hash="a" * 64,
+            quality_model_version=DATA_QUALITY_MODEL_VERSION,
         )
         self.dataset_snapshot_id = snapshot_id
+        self.repository = SimpleNamespace(engine=object())
 
     @property
     def actionable(self):
@@ -58,12 +89,7 @@ def _signal_fixture():
         "BIL": frame(np.linspace(91.0, 93.0, len(sessions))),
         "^VIX": frame(np.full(len(sessions), 15.0)),
     }
-    config = Config(
-        universe=["SPY", "BIL"],
-        benchmark="SPY",
-        strategy_version="SV-FROZEN-001",
-        universe_version="UV-001",
-    )
+    config = _frozen_config()
     return config, data
 
 
@@ -83,7 +109,7 @@ def test_month_end_after_cutoff_produces_versioned_actionable_decision():
     assert abs(sum(decision.target_weights.values()) - 1.0) < 1e-12
 
 
-def test_before_cutoff_and_exploratory_frequency_are_diagnostic_only():
+def test_before_cutoff_is_diagnostic_and_frozen_frequency_change_is_blocked():
     config, data = _signal_fixture()
     before_cutoff = SignalService(config, loader=_TrustedLoader(data)).generate_decision(
         as_of=pd.Timestamp("2024-12-31 19:00", tz="America/New_York")
@@ -95,7 +121,8 @@ def test_before_cutoff_and_exploratory_frequency_are_diagnostic_only():
     )
 
     assert before_cutoff.status == SignalStatus.DIAGNOSTIC
-    assert exploratory.status == SignalStatus.DIAGNOSTIC
+    assert exploratory.status == SignalStatus.BLOCKED
+    assert any("rebalance_frequency" in reason for reason in exploratory.block_reasons)
 
 
 def test_month_end_signal_can_be_caught_up_only_before_t1_0925_et():

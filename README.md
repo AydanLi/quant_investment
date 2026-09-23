@@ -7,7 +7,8 @@
 预注册参数、成本假设和执行记录；任一关键证据缺失时，系统默认失败关闭
 （fail closed）。
 
-> 当前状态（2026-08-26）：工程链路已经实现并通过 270 项测试，但 5 个数据
+> 当前状态（2026-09-22）：本轮修改前基线为 283 项测试通过，修复与验收见
+> [经济链路修复记录](docs/remediation_status.md)。5 个数据
 > 快照仍全部为 `BLOCKED`，最新快照还有 706 个未裁决阻断问题；`UV-001`
 > 为 `draft`，策略版本、准入运行和本地模拟成交均为 0。因此项目当前可以
 > 做诊断和工程验证，不能声称策略已准入、broker paper 已验证或可以实盘。
@@ -18,6 +19,7 @@
 |---|---|
 | [项目简介](PROJECT_OVERVIEW.md) | 项目定位、策略轮廓、成熟度和当前结论 |
 | [架构说明](quant_system_architecture_overview.md) | 数据流、治理状态机、存储模型和执行边界 |
+| [经济链路修复与验收](docs/remediation_status.md) | 问题—修改—测试对应、迁移与外部关卡 |
 | [运行手册](docs/upgrade_v3_runbook.md) | 数据事故、准入、本地模拟、停机和恢复流程 |
 | [个人研究运行档案](docs/personal_research_operating_profile.md) | 账户、税务、数据源、告警和历史宇宙约束 |
 | [2026-07-28 历史审计](reports/quant_system_audit_2026-07-28.md) | 历史问题与修正记录，不代表当前准入状态 |
@@ -148,15 +150,26 @@ $commit = git rev-parse HEAD
 ```
 
 准入命令必须留下恰好 135 个最终候选结果。全部候选被拒绝是有效研究结论；不得
-在查看结果后临时扩展参数网格。当前数据库尚无可执行快照，因此不应运行正式准入。
+在查看结果后临时扩展参数网格。研究通过仅保存待人工批准结果，不自动冻结或启动观察期。
+人工审阅完整结果后，使用独立批准命令：
+
+```powershell
+.\.venv\Scripts\python.exe -m scripts.approve_strategy_version `
+  --version <strategy-version> --admission-run-id <run-id> --approved-by <operator>
+```
+
+批准记录绑定操作者、时间和冻结版本。当前数据库尚无可执行快照，因此不应运行正式准入。
 
 ## 本地模拟
 
-本地模拟仅在策略已准入、冻结并启动未来时钟后使用：
+本地模拟要求策略已准入并经人工批准冻结。显式初始化账户时才记录实际验证起点；批准日期不计为验证开始日期。先查看命令，再在条件满足后初始化：
 
 ```powershell
 .\.venv\Scripts\python.exe -m scripts.paper_cycle `
   --strategy-version <strategy-version> --help
+
+.\.venv\Scripts\python.exe -m scripts.paper_cycle `
+  --strategy-version <strategy-version> --account-ref <account> init-account --cash 10000
 ```
 
 它使用 T+1 原始开盘价加预注册成本做确定性回放，并持久化决策、订单、成交、三类
@@ -174,8 +187,9 @@ $commit = git rev-parse HEAD
 .\.venv\Scripts\python.exe -m alembic check
 ```
 
-2026-08-26 的当前提交验证结果为：270 项测试通过、依赖一致、SQLite
-`integrity_check=ok`、外键检查为空、Alembic 位于 `5f74c1a9d2b0 (head)`。
+2026-09-22 修改前基线为 283 项测试通过；本轮验证和迁移记录见
+[修复与验收](docs/remediation_status.md)，最终全量 **368 项通过**。新迁移版本为 `6b2e1d9a4f30`，
+运行就绪检查可读取实际版本和阻断条件；旧版本的测试结果不用于本轮验收。
 
 ## 目录结构
 

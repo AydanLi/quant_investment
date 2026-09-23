@@ -1,7 +1,7 @@
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
-from data.models import DataQualityReport, DataQualityStatus
+from data.models import DATA_QUALITY_MODEL_VERSION, DataQualityReport, DataQualityStatus
 from execution import (
     AccountSnapshot,
     PreTradeVerification,
@@ -39,6 +39,7 @@ def _quality():
         expected_session="2026-07-16",
         latest_session="2026-07-16",
         stale_sessions=0,
+        quality_model_version=DATA_QUALITY_MODEL_VERSION,
     )
 
 

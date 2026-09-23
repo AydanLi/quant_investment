@@ -38,10 +38,11 @@ class EvaluationMetrics:
     stop_count: int = 0
     maximum_stop_overshoot: float = 0.0
     degenerate_all_cash: bool = False
+    confirmed_cash_flows: bool = True
 
     @property
     def selection_score(self) -> float:
-        if self.degenerate_all_cash or not np.isfinite(self.excess_sharpe):
+        if self.degenerate_all_cash or not self.confirmed_cash_flows or not np.isfinite(self.excess_sharpe):
             return float("-inf")
         return float(self.excess_sharpe)
 
@@ -66,7 +67,7 @@ def _evaluation_record(
             "status": (
                 "DEGENERATE_ALL_CASH"
                 if metric.degenerate_all_cash
-                else "evaluated"
+                else "evaluated" if metric.confirmed_cash_flows else "PROVISIONAL_CASH_FLOWS"
             ),
             "metrics": asdict(metric),
         }
@@ -88,6 +89,8 @@ def _record_score(record: Mapping[str, object]) -> float:
     if record.get("status") != "evaluated":
         return float("-inf")
     metrics = record["metrics"]
+    if metrics.get("confirmed_cash_flows") is False:
+        return float("-inf")
     value = float(metrics["excess_sharpe"])
     return value if np.isfinite(value) else float("-inf")
 
@@ -98,6 +101,8 @@ def _trial_status(records: list[Mapping[str, object]]) -> str:
         return "failed"
     if "DEGENERATE_ALL_CASH" in statuses:
         return "DEGENERATE_ALL_CASH"
+    if "PROVISIONAL_CASH_FLOWS" in statuses:
+        return "PROVISIONAL_CASH_FLOWS"
     return "evaluated"
 
 
@@ -234,6 +239,8 @@ class NestedExpandingAdmissionRunner:
         self.calendar_key = calendar_key
         self.trial_callback = trial_callback
         self.trial_cache = dict(trial_cache or {})
+        self._outer_states: dict[tuple[str, float], object] = {}
+        self._outer_paths: dict[tuple[str, float], list[pd.DataFrame]] = {}
 
     def _notify_trial(
         self,
@@ -253,6 +260,7 @@ class NestedExpandingAdmissionRunner:
                 "label": candidate.label,
                 "parameters": candidate.to_dict(),
                 "cost_bps": float(cost_bps),
+                "protocol_hash": self.protocol.content_hash,
                 **dict(record),
                 "score": _record_score(record),
             }
@@ -268,8 +276,31 @@ class NestedExpandingAdmissionRunner:
         validation: Mapping[str, pd.DataFrame],
         cost_bps: float,
     ) -> dict[str, object]:
+        continuous = stage in {"outer_evaluation", "replacement_baseline"} and hasattr(
+            self.evaluator, "evaluate_path"
+        )
+        # Outer states are deliberately replayed, never restored from scalar
+        # cached scores. A score cannot reconstruct unsettled cash or orders.
+        if continuous:
+            key = (stage, cost_bps)
+            path = self.evaluator.evaluate_path(
+                candidate, training, validation, cost_bps,
+                initial_state=self._outer_states.get(key),
+            )
+            self._outer_states[key] = path["final_state"]
+            self._outer_paths.setdefault(key, []).append(path["portfolio"])
+            metric = path["metrics"]
+            record = {"status": "DEGENERATE_ALL_CASH" if metric.degenerate_all_cash else "evaluated",
+                      "metrics": asdict(metric)}
+            if not metric.confirmed_cash_flows:
+                record["status"] = "PROVISIONAL_CASH_FLOWS"
+            self._notify_trial(stage=stage, fold_key=fold_key, candidate=candidate,
+                               cost_bps=cost_bps, record=record)
+            return record
         cached = self.trial_cache.get((stage, fold_key, candidate.label))
         if cached is not None:
+            if cached.get("protocol_hash") != self.protocol.content_hash:
+                raise ValueError("Persisted trial runtime/protocol identity does not match.")
             if not isinstance(cached.get("metrics"), Mapping) or not cached.get(
                 "status"
             ):
@@ -292,6 +323,8 @@ class NestedExpandingAdmissionRunner:
         return record
 
     def run(self, data: Mapping[str, pd.DataFrame]) -> dict[str, object]:
+        self._outer_states.clear()
+        self._outer_paths.clear()
         if not data:
             raise ValueError("Research data cannot be empty.")
         calendar_frame = (
@@ -558,9 +591,26 @@ class NestedExpandingAdmissionRunner:
             else 0.0
         )
 
+        continuous_metrics = {}
+        continuous_paths = {}
+        if self._outer_paths:
+            from research.core_evaluator import path_metrics
+            for (stage, cost), frames in self._outer_paths.items():
+                path = pd.concat(frames)
+                if path.index.duplicated().any():
+                    raise ValueError("Continuous outer path contains overlapping sessions.")
+                key = f"{stage}/{cost:.1f}"
+                continuous_metrics[key] = asdict(path_metrics(path, self.protocol.make_base_config()))
+                continuous_paths[key] = path.reset_index().to_dict("records")
         return {
             "protocol_hash": self.protocol.content_hash,
             "selection_uses_future_holdout": False,
+            "continuous_outer_account": bool(self._outer_paths),
+            "continuous_outer_metrics": continuous_metrics,
+            "continuous_outer_paths": continuous_paths,
+            "evidence_role": "research_selector",
+            "final_candidate_independent_oos": False,
+            "parameter_change_timing": "next_scheduled_month_end_signal_then_next_session",
             "outer_folds": outer_results,
             "replacement_baseline_folds": baseline_outer_results,
             "replacement_baseline_label": baseline_candidate.label,

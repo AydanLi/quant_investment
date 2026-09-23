@@ -10,6 +10,7 @@ import pandas as pd
 from config.settings import Config
 from data.calendar import NEW_YORK, NyseCalendar
 from data.features import FeatureEngineer
+from data.models import DATA_QUALITY_MODEL_VERSION
 from data.trusted_loader import TrustedMarketDataLoader
 from risk.engine import RiskEngine
 from services.models import SignalDecision, SignalStatus
@@ -17,6 +18,7 @@ from strategy.momentum_rotation import MomentumRotationStrategy
 from strategy.regime import RegimeDetector
 from storage.repositories import GovernanceRepository
 from storage.repositories.signals import SignalRepository
+from research.runtime import assert_runtime_matches
 
 
 class SignalService:
@@ -61,6 +63,22 @@ class SignalService:
             for issue in (() if quality is None else quality.issues)
         )
         block_reasons: list[str] = []
+        if quality is not None and quality.quality_model_version != DATA_QUALITY_MODEL_VERSION:
+            block_reasons.append("Dataset requires a new audit under the current raw OHLCV/action quality model.")
+        runtime_hash = None
+        repository = getattr(loader, "repository", None)
+        if self.config.strategy_version != "UNFROZEN":
+            if repository is None:
+                block_reasons.append("Frozen runtime storage is unavailable.")
+            else:
+                try:
+                    manifest = GovernanceRepository(engine=repository.engine).load_frozen_runtime(
+                        self.config.strategy_version
+                    )
+                    assert_runtime_matches(self.config, manifest, verify_code=False)
+                    runtime_hash = manifest.runtime_hash
+                except ValueError as exc:
+                    block_reasons.append(str(exc))
         diagnostic_data_only = bool(
             quality is not None
             and quality.status.value != "BLOCKED"
@@ -201,6 +219,7 @@ class SignalService:
             data_issues=issues,
             risk_state=risk_state.upper(),
             block_reasons=tuple(dict.fromkeys(block_reasons)),
+            runtime_hash=runtime_hash,
         )
         if (
             self.signal_repository is not None

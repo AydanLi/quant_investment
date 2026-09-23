@@ -8,6 +8,8 @@ import pytest
 from sqlalchemy import func, select
 
 from config.settings import Config
+from data.models import DATA_QUALITY_MODEL_VERSION
+from research.runtime import build_runtime_manifest, capture_code_identity
 from execution.adapters import InMemoryPaperBroker
 from execution.models import ExecutionFill, OrderState, Quote
 from execution.oms import OrderManagementSystem
@@ -18,6 +20,7 @@ from storage.repositories.signals import SignalRepository
 from storage.schema import (
     admission_runs,
     dataset_snapshots,
+    dataset_snapshot_bars,
     execution_fills,
     order_intents,
     parameter_trials,
@@ -45,6 +48,7 @@ def _quality_payload(
     decision_set_hash: str | None = None,
 ) -> dict[str, object]:
     return {
+        "quality_model_version": DATA_QUALITY_MODEL_VERSION,
         "status": status,
         "primary_source": "tiingo",
         "secondary_source": "yahoo",
@@ -91,7 +95,13 @@ def _insert_snapshot(
     )
 
 
+def _test_runtime():
+    return build_runtime_manifest(Config(strategy_version="SV-001"), code_identity=capture_code_identity(),
+                                  research_cutoff="2026-07-31", dataset_snapshot_id=1)
+
+
 def _engine():
+    manifest = _test_runtime()
     engine = create_db_engine("sqlite:///:memory:")
     create_all(engine)
     with engine.begin() as conn:
@@ -106,6 +116,7 @@ def _engine():
                 content_hash="a" * 64,
                 status="TRUSTED",
                 quality_json={
+                    "quality_model_version": DATA_QUALITY_MODEL_VERSION,
                     "status": "TRUSTED",
                     "primary_source": "tiingo",
                     "secondary_source": "yahoo",
@@ -136,8 +147,12 @@ def _engine():
         conn.execute(
             strategy_versions.insert().values(
                 version="SV-001",
+                runtime_manifest_json=manifest.to_dict(),
+                runtime_hash=manifest.runtime_hash,
                 status="frozen",
                 frozen_at=datetime(2026, 7, 29, 13, 0, tzinfo=ET),
+                approved_by="strategy-reviewer",
+                approved_at=datetime(2026, 7, 29, 13, 0, tzinfo=ET),
                 universe_version="UV-001",
                 dataset_snapshot_id=1,
                 protocol_json={"name": "paper-test", "candidate_count": 1},
@@ -176,6 +191,7 @@ def _engine():
 def _decision() -> SignalDecision:
     return SignalDecision(
         strategy_version="SV-001",
+        runtime_hash=_test_runtime().runtime_hash,
         universe_version="UV-001",
         dataset_snapshot_id=1,
         signal_session="2026-07-31",
@@ -192,17 +208,61 @@ def _decision() -> SignalDecision:
     )
 
 
+def _execution_snapshot(engine, session, prices):
+    from hashlib import sha256
+    import json
+    material = json.dumps({"session": session, "prices": prices}, sort_keys=True)
+    content_hash = sha256(material.encode()).hexdigest()
+    with engine.begin() as conn:
+        existing = conn.execute(select(dataset_snapshots.c.id).where(dataset_snapshots.c.content_hash == content_hash)).scalar_one_or_none()
+        if existing is not None:
+            return int(existing)
+        snapshot_id = int(conn.execute(dataset_snapshots.insert().values(
+            as_of=f"{session}T20:30:00-04:00", start_date=session, end_date=session,
+            primary_source="tiingo", secondary_source="yahoo", content_hash=content_hash,
+            status="TRUSTED", quality_json=_quality_payload(session, content_hash=content_hash),
+        )).inserted_primary_key[0])
+        if prices:
+            conn.execute(dataset_snapshot_bars.insert(), [dict(snapshot_id=snapshot_id, ticker=ticker,
+                date=session, role="primary", source="tiingo", open=price, high=price,
+                low=price, close=price, volume=1000000) for ticker, price in prices.items()])
+    return snapshot_id
+
+
+def _draft_orders(cycle, decision_id, **kwargs):
+    return cycle.draft_orders(decision_id, **kwargs)
+
+
+def _materialize_open(cycle, decision_id, **kwargs):
+    session = kwargs["published_at"].astimezone(ET).date().isoformat()
+    snapshot_id = _execution_snapshot(cycle.execution.engine, session, kwargs["open_prices"])
+    return cycle.materialize_open(decision_id, source_snapshot_id=snapshot_id, **kwargs)
+
+
+def _materialize_liquidation_open(cycle, decision_id, **kwargs):
+    session = kwargs["published_at"].astimezone(ET).date().isoformat()
+    snapshot_id = _execution_snapshot(cycle.execution.engine, session, kwargs["open_prices"])
+    return cycle.materialize_liquidation_open(decision_id, source_snapshot_id=snapshot_id, **kwargs)
+
+
+def _value_account(cycle, **kwargs):
+    snapshot_id = _execution_snapshot(cycle.execution.engine, kwargs["valuation_session"], kwargs["prices"])
+    return cycle.value_account(source_snapshot_id=snapshot_id, **kwargs)
+
+
 def _prepare_cycle(engine, *, notifier=lambda _message, _title: "request-id"):
     cycle = PaperCycle(
         Config(strategy_version="SV-001"),
         engine=engine,
         notifier=notifier,
     )
-    cycle.initialize_account(strategy_version="SV-001")
+    cycle.initialize_account(strategy_version="SV-001", at=datetime(2026, 7, 31, 15, tzinfo=ET))
+    cycle.execution.record_session_close("local-paper", session="2026-07-31", prices={},
+        recorded_at=datetime(2026, 7, 31, 20, tzinfo=ET), source_snapshot_id=1)
     stored = cycle.persist_decision(
         _decision(), recorded_at=datetime(2026, 7, 31, 20, 32, tzinfo=ET)
     )
-    cycle.draft_orders(
+    _draft_orders(cycle,
         int(stored.decision.decision_id),
         reference_prices={"SPY": 100.0, "BIL": 100.0},
         median_daily_dollar_volume={"SPY": 100_000_000.0, "BIL": 100_000_000.0},
@@ -222,7 +282,9 @@ def _trigger_drawdown(engine):
         engine=engine,
         notifier=lambda _message, _title: "id",
     )
-    cycle.initialize_account(strategy_version="SV-001")
+    cycle.initialize_account(strategy_version="SV-001", at=datetime(2026, 7, 31, 15, tzinfo=ET))
+    cycle.execution.record_session_close("local-paper", session="2026-07-31", prices={},
+        recorded_at=datetime(2026, 7, 31, 20, tzinfo=ET), source_snapshot_id=1)
     with engine.begin() as conn:
         conn.execute(
             paper_accounts.update().values(
@@ -234,13 +296,14 @@ def _trigger_drawdown(engine):
                     "_meta": {"total_commission": 0.0},
                 },
                 high_water=10_000.0,
+                accounting_state_json={"average_costs": {"SPY": 100.0}, "started_session": "2026-07-31"},
             )
         )
     stored = cycle.persist_decision(
         _decision(), recorded_at=datetime(2026, 7, 31, 20, 32, tzinfo=ET)
     )
     decision_id = int(stored.decision.decision_id)
-    cycle.draft_orders(
+    _draft_orders(cycle,
         decision_id,
         reference_prices={"SPY": 100.0, "BIL": 100.0},
         median_daily_dollar_volume={
@@ -254,7 +317,7 @@ def _trigger_drawdown(engine):
         approved_by="operator",
         approved_at=datetime(2026, 8, 3, 9, 24, tzinfo=ET),
     )
-    halted = cycle.materialize_open(
+    halted = _materialize_open(cycle,
         decision_id,
         open_prices={"SPY": 80.0, "BIL": 100.0},
         published_at=datetime(2026, 8, 3, 9, 31, tzinfo=ET),
@@ -268,7 +331,7 @@ def test_replay_open_is_restart_idempotent_and_settles_t_plus_one():
     engine = _engine()
     cycle, decision_id = _prepare_cycle(engine)
 
-    first = cycle.materialize_open(
+    first = _materialize_open(cycle,
         decision_id,
         open_prices={"SPY": 100.0, "BIL": 100.0},
         published_at=datetime(2026, 8, 3, 9, 31, tzinfo=ET),
@@ -281,7 +344,7 @@ def test_replay_open_is_restart_idempotent_and_settles_t_plus_one():
     restarted = PaperCycle(
         Config(strategy_version="SV-001"), engine=engine, notifier=lambda _m, _t: "id"
     )
-    second = restarted.materialize_open(
+    second = _materialize_open(restarted,
         decision_id,
         open_prices={"SPY": 100.0, "BIL": 100.0},
         published_at=datetime(2026, 8, 3, 9, 31, tzinfo=ET),
@@ -303,7 +366,7 @@ def test_replay_open_is_restart_idempotent_and_settles_t_plus_one():
 def test_event_replay_reconciliation_detects_persisted_account_drift_after_restart():
     engine = _engine()
     cycle, decision_id = _prepare_cycle(engine)
-    cycle.materialize_open(
+    _materialize_open(cycle,
         decision_id,
         open_prices={"SPY": 100.0, "BIL": 100.0},
         published_at=datetime(2026, 8, 3, 9, 31, tzinfo=ET),
@@ -325,7 +388,7 @@ def test_event_replay_reconciliation_detects_persisted_account_drift_after_resta
     restarted = PaperCycle(
         Config(strategy_version="SV-001"), engine=engine, notifier=lambda _m, _t: "id"
     )
-    result = restarted.materialize_open(
+    result = _materialize_open(restarted,
         decision_id,
         open_prices={"SPY": 100.0, "BIL": 100.0},
         published_at=datetime(2026, 8, 3, 9, 32, tzinfo=ET),
@@ -355,12 +418,14 @@ def test_late_approval_is_missed_and_notification_retries_without_duplication():
     cycle = PaperCycle(
         Config(strategy_version="SV-001"), engine=engine, notifier=failing_sender
     )
-    cycle.initialize_account(strategy_version="SV-001")
+    cycle.initialize_account(strategy_version="SV-001", at=datetime(2026, 7, 31, 15, tzinfo=ET))
+    cycle.execution.record_session_close("local-paper", session="2026-07-31", prices={},
+        recorded_at=datetime(2026, 7, 31, 20, tzinfo=ET), source_snapshot_id=1)
     stored = cycle.persist_decision(
         _decision(), recorded_at=datetime(2026, 7, 31, 20, 32, tzinfo=ET)
     )
     decision_id = int(stored.decision.decision_id)
-    cycle.draft_orders(
+    _draft_orders(cycle,
         decision_id,
         reference_prices={"SPY": 100.0, "BIL": 100.0},
         median_daily_dollar_volume={"SPY": 100_000_000.0, "BIL": 100_000_000.0},
@@ -397,7 +462,7 @@ def test_drawdown_halt_persists_and_creates_unapproved_next_session_liquidation(
     restarted = PaperCycle(
         Config(strategy_version="SV-001"), engine=engine, notifier=lambda _m, _t: "id"
     )
-    again = restarted.materialize_open(
+    again = _materialize_open(restarted,
         decision_id,
         open_prices={"SPY": 80.0, "BIL": 100.0},
         published_at=datetime(2026, 8, 3, 9, 32, tzinfo=ET),
@@ -435,7 +500,7 @@ def test_drawdown_liquidation_requires_approval_fills_at_next_raw_open_and_is_re
         approved_at=datetime(2026, 8, 4, 9, 24, tzinfo=ET),
     )
     assert len(approved) == 1
-    first = restarted.materialize_liquidation_open(
+    first = _materialize_liquidation_open(restarted,
         decision_id,
         open_prices={"SPY": 79.0},
         published_at=datetime(2026, 8, 4, 9, 31, tzinfo=ET),
@@ -448,7 +513,7 @@ def test_drawdown_liquidation_requires_approval_fills_at_next_raw_open_and_is_re
     second_restart = PaperCycle(
         Config(strategy_version="SV-001"), engine=engine, notifier=lambda _m, _t: "id"
     )
-    second = second_restart.materialize_liquidation_open(
+    second = _materialize_liquidation_open(second_restart,
         decision_id,
         open_prices={"SPY": 79.0},
         published_at=datetime(2026, 8, 4, 9, 32, tzinfo=ET),
@@ -477,7 +542,7 @@ def test_drawdown_recovery_waits_until_next_month_end_and_resets_high_water():
         approved_by="risk-operator",
         approved_at=datetime(2026, 8, 4, 9, 24, tzinfo=ET),
     )
-    cycle.materialize_liquidation_open(
+    _materialize_liquidation_open(cycle,
         decision_id,
         open_prices={"SPY": 79.0},
         published_at=datetime(2026, 8, 4, 9, 31, tzinfo=ET),
@@ -487,6 +552,7 @@ def test_drawdown_recovery_waits_until_next_month_end_and_resets_high_water():
         decision_id,
         prices={},
         at=datetime(2026, 8, 5, 9, 0, tzinfo=ET),
+        source_snapshot_id=_execution_snapshot(engine, "2026-08-05", {}),
     )
     assert reconciliation.account.positions == {}
     with engine.connect() as conn:
@@ -503,16 +569,22 @@ def test_drawdown_recovery_waits_until_next_month_end_and_resets_high_water():
             note="Liquidation and account reconciliation reviewed.",
             at=datetime(2026, 8, 28, 16, 0, tzinfo=ET),
         )
+    cycle.execution.record_session_close("local-paper", session="2026-08-28", prices={},
+        recorded_at=datetime(2026, 8, 28, 20, tzinfo=ET))
+    reconciliation = cycle.reconcile_halted_account(decision_id, prices={},
+        at=datetime(2026, 8, 31, 20, 30, tzinfo=ET),
+        source_snapshot_id=_execution_snapshot(engine, "2026-08-31", {}))
     recovered = cycle.authorize_risk_recovery(
         reconciliation_id=int(reconciliation.reconciliation_id),
         authorized_by="risk-operator",
         note="Liquidation and account reconciliation reviewed.",
         at=datetime(2026, 8, 31, 20, 31, tzinfo=ET),
+        reasons=("DRAWDOWN_HALTED", "DAILY_LOSS_HALTED"),
     )
     assert recovered.risk_state == "NORMAL"
     assert recovered.high_water == pytest.approx(recovered.nav)
 
-    valued = cycle.value_account(
+    valued = _value_account(cycle,
         prices={},
         valuation_session="2026-08-31",
         at=datetime(2026, 8, 31, 20, 32, tzinfo=ET),
@@ -543,7 +615,7 @@ def test_halted_cross_day_retry_reuses_liquidation_and_missed_requires_explicit_
             approved_at=datetime(2026, 8, 4, 9, 25, tzinfo=ET),
         )
     with pytest.raises(ValueError, match="wrong execution session"):
-        restarted.materialize_open(
+        _materialize_open(restarted,
             decision_id,
             open_prices={"SPY": 80.0},
             published_at=datetime(2026, 8, 4, 9, 31, tzinfo=ET),
@@ -653,7 +725,9 @@ def test_daily_loss_halt_persists_without_automatic_liquidation_or_completion():
     cycle = PaperCycle(
         Config(strategy_version="SV-001"), engine=engine, notifier=lambda _m, _t: "id"
     )
-    cycle.initialize_account(strategy_version="SV-001")
+    cycle.initialize_account(strategy_version="SV-001", at=datetime(2026, 7, 31, 15, tzinfo=ET))
+    cycle.execution.record_session_close("local-paper", session="2026-07-31", prices={},
+        recorded_at=datetime(2026, 7, 31, 20, tzinfo=ET), source_snapshot_id=1)
     with engine.begin() as conn:
         conn.execute(
             paper_accounts.update().values(
@@ -665,13 +739,14 @@ def test_daily_loss_halt_persists_without_automatic_liquidation_or_completion():
                     "_meta": {"total_commission": 0.0},
                 },
                 high_water=10_000.0,
+                accounting_state_json={"average_costs": {"SPY": 100.0}, "started_session": "2026-07-31"},
             )
         )
     stored = cycle.persist_decision(
         _decision(), recorded_at=datetime(2026, 7, 31, 20, 32, tzinfo=ET)
     )
     decision_id = int(stored.decision.decision_id)
-    cycle.draft_orders(
+    _draft_orders(cycle,
         decision_id,
         reference_prices={"SPY": 100.0, "BIL": 100.0},
         median_daily_dollar_volume={"SPY": 100_000_000.0, "BIL": 100_000_000.0},
@@ -682,7 +757,7 @@ def test_daily_loss_halt_persists_without_automatic_liquidation_or_completion():
         approved_by="operator",
         approved_at=datetime(2026, 8, 3, 9, 24, tzinfo=ET),
     )
-    result = cycle.materialize_open(
+    result = _materialize_open(cycle,
         decision_id,
         open_prices={"SPY": 94.0, "BIL": 100.0},
         published_at=datetime(2026, 8, 3, 9, 31, tzinfo=ET),
@@ -714,13 +789,25 @@ def test_daily_loss_halt_persists_without_automatic_liquidation_or_completion():
             note="Daily loss and account reconciliation reviewed.",
             at=datetime(2026, 8, 3, 16, 0, tzinfo=ET),
         )
+    cycle.execution.record_session_close("local-paper", session="2026-08-03", prices={"SPY": 94},
+        recorded_at=datetime(2026, 8, 3, 21, tzinfo=ET),
+        source_snapshot_id=_execution_snapshot(engine, "2026-08-03", {"SPY": 94}))
+    before_reconciliation = cycle.execution.get_account("local-paper")
+    with pytest.raises(ValueError, match="current-session execution snapshot"):
+        cycle.reconcile_halted_account(decision_id, prices={"SPY": 94},
+            at=datetime(2026, 8, 4, 8, 59, tzinfo=ET))
+    assert cycle.execution.get_account("local-paper") == before_reconciliation
+    reconciliation = cycle.reconcile_halted_account(decision_id, prices={"SPY": 94},
+        at=datetime(2026, 8, 4, 8, 59, tzinfo=ET),
+        source_snapshot_id=_execution_snapshot(engine, "2026-08-04", {"SPY": 94}))
     recovered = cycle.authorize_risk_recovery(
         reconciliation_id=int(reconciliation.reconciliation_id),
         authorized_by="risk-operator",
         note="Daily loss and account reconciliation reviewed.",
         at=datetime(2026, 8, 4, 9, 0, tzinfo=ET),
     )
-    assert recovered.risk_state == "NORMAL"
+    assert recovered.risk_state == "DRIFT_REVIEW"
+    assert recovered.halt_reasons == ()
     assert recovered.high_water == pytest.approx(10_000.0)
 
 
@@ -729,7 +816,9 @@ def test_no_trade_cycle_still_has_independent_baseline_and_completes():
     cycle = PaperCycle(
         Config(strategy_version="SV-001"), engine=engine, notifier=lambda _m, _t: "id"
     )
-    cycle.initialize_account(strategy_version="SV-001")
+    cycle.initialize_account(strategy_version="SV-001", at=datetime(2026, 7, 31, 15, tzinfo=ET))
+    cycle.execution.record_session_close("local-paper", session="2026-07-31", prices={},
+        recorded_at=datetime(2026, 7, 31, 20, tzinfo=ET), source_snapshot_id=1)
     no_trade = replace(
         _decision(),
         target_weights={"CASH_USD": 1.0},
@@ -742,7 +831,7 @@ def test_no_trade_cycle_still_has_independent_baseline_and_completes():
         no_trade, recorded_at=datetime(2026, 7, 31, 20, 32, tzinfo=ET)
     )
     decision_id = int(stored.decision.decision_id)
-    assert cycle.draft_orders(
+    assert _draft_orders(cycle,
         decision_id,
         reference_prices={},
         median_daily_dollar_volume={},
@@ -753,7 +842,7 @@ def test_no_trade_cycle_still_has_independent_baseline_and_completes():
         approved_by="operator",
         approved_at=datetime(2026, 8, 3, 9, 24, tzinfo=ET),
     ) == ()
-    result = cycle.materialize_open(
+    result = _materialize_open(cycle,
         decision_id,
         open_prices={},
         published_at=datetime(2026, 8, 3, 9, 31, tzinfo=ET),
@@ -765,9 +854,11 @@ def test_no_trade_cycle_still_has_independent_baseline_and_completes():
 @pytest.mark.parametrize(
     "mutation,error",
     [
-        ({"strategy_status": "draft"}, "frozen strategy"),
-        ({"admission_status": "rejected"}, "ADMITTED run"),
-        ({"local_sim_start": None}, "simulation clock"),
+        ({"strategy_status": "draft"}, "frozen"),
+        ({"strategy_approved_by": None}, "approval"),
+        ({"strategy_approved_by": "   "}, "approval"),
+        ({"strategy_approved_at": None}, "approval"),
+        ({"admission_status": "rejected"}, "(?i)admitted (run|AdmissionRun)"),
         ({"snapshot_status": "BLOCKED"}, "admission snapshot"),
     ],
 )
@@ -778,12 +869,14 @@ def test_invalid_governance_cannot_create_paper_account_or_cycle(mutation, error
             conn.execute(
                 strategy_versions.update().values(status=mutation["strategy_status"])
             )
+        if "strategy_approved_by" in mutation:
+            conn.execute(strategy_versions.update().values(approved_by=mutation["strategy_approved_by"]))
+        if "strategy_approved_at" in mutation:
+            conn.execute(strategy_versions.update().values(approved_at=mutation["strategy_approved_at"]))
         if "admission_status" in mutation:
             conn.execute(
                 admission_runs.update().values(status=mutation["admission_status"])
             )
-        if "local_sim_start" in mutation:
-            conn.execute(strategy_versions.update().values(local_sim_start=None))
         if "snapshot_status" in mutation:
             row = conn.execute(select(dataset_snapshots)).mappings().one()
             quality = {**dict(row["quality_json"]), "status": "BLOCKED"}
@@ -796,7 +889,7 @@ def test_invalid_governance_cannot_create_paper_account_or_cycle(mutation, error
         Config(strategy_version="SV-001"), engine=engine, notifier=lambda _m, _t: "id"
     )
     with pytest.raises(ValueError, match=error):
-        cycle.initialize_account(strategy_version="SV-001")
+        cycle.initialize_account(strategy_version="SV-001", at=datetime(2026, 7, 31, 15, tzinfo=ET))
     with pytest.raises(ValueError, match=error):
         cycle.persist_decision(
             _decision(), recorded_at=datetime(2026, 7, 31, 20, 32, tzinfo=ET)
@@ -805,6 +898,27 @@ def test_invalid_governance_cannot_create_paper_account_or_cycle(mutation, error
         assert conn.execute(select(func.count()).select_from(paper_accounts)).scalar_one() == 0
         assert conn.execute(select(func.count()).select_from(paper_cycles)).scalar_one() == 0
         assert conn.execute(select(func.count()).select_from(signal_decisions)).scalar_one() == 0
+
+
+def test_explicit_account_initialization_starts_validation_after_human_approval():
+    from datetime import timezone
+    from storage.schema import validation_runs
+
+    engine = _engine()
+    with engine.begin() as conn:
+        conn.execute(strategy_versions.update().values(local_sim_start=None))
+    cycle = PaperCycle(Config(strategy_version="SV-001"), engine=engine, notifier=lambda *_: "test")
+    started_after = datetime.now(timezone.utc).replace(tzinfo=None)
+    cycle.initialize_account(strategy_version="SV-001", at=datetime(2026, 7, 31, 15, tzinfo=ET))
+    with engine.connect() as conn:
+        first_clock = conn.execute(select(strategy_versions.c.local_sim_start)).scalar_one()
+        first_stage = dict(conn.execute(select(validation_runs)).mappings().one())
+    assert first_clock >= started_after
+    assert first_stage["started_at"] >= started_after
+    cycle.initialize_account(strategy_version="SV-001")
+    with engine.connect() as conn:
+        assert conn.execute(select(strategy_versions.c.local_sim_start)).scalar_one() == first_clock
+        assert dict(conn.execute(select(validation_runs)).mappings().one()) == first_stage
 
 
 def test_direct_ensure_cycle_rechecks_governance_after_decision_persistence():

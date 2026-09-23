@@ -11,10 +11,12 @@ def _excess_returns(
 ) -> pd.Series:
     ret = returns.dropna().astype(float)
     if isinstance(rf, pd.Series):
-        aligned = pd.concat(
-            [ret.rename("return"), rf.astype(float).rename("rf")], axis=1
-        ).dropna()
-        return aligned["return"] - aligned["rf"]
+        if not rf.index.is_unique:
+            raise ValueError("Risk-free returns must have unique sessions.")
+        aligned = rf.astype(float).reindex(ret.index)
+        if not np.isfinite(aligned).all():
+            raise ValueError("Risk-free returns must cover every return observation.")
+        return ret - aligned
     return ret - float(rf) / periods_per_year
 
 

@@ -82,6 +82,10 @@ class AccountSnapshot:
     total_commission: float = 0.0
     last_valuation_session: str | None = None
     version: int = 1
+    halt_reasons: tuple[str, ...] = ()
+    drift_state: str = "NORMAL"
+    dividend_receivable: float = 0.0
+    accounting_state: Mapping[str, object] = field(default_factory=dict)
 
 
 @dataclass
@@ -149,6 +153,8 @@ class ReconciliationResult:
     available_cash_difference: float = 0.0
     nav_difference: float = 0.0
     commission_difference: float = 0.0
+    account_version: int | None = None
+    dividend_receivable_difference: float = 0.0
 
 
 @dataclass(frozen=True)

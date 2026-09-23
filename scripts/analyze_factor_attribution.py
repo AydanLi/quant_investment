@@ -7,6 +7,7 @@ from dataclasses import replace
 import pandas as pd
 
 from config.settings import Config
+from data.features import FeatureEngineer
 from research.factor_attribution import (
     PROXY_FACTOR_DEFINITIONS,
     RollingFactorAttribution,
@@ -79,7 +80,7 @@ def main() -> None:
 
     (
         snapshot_id,
-        _,
+        data,
         prices,
         execution_prices,
         returns,
@@ -91,6 +92,7 @@ def main() -> None:
         snapshot_id=args.snapshot_id,
     )
     factors, cash = build_proxy_factor_returns(prices)
+    engineer = FeatureEngineer(data, baseline_config)
 
     baseline = run_portfolio(
         baseline_config,
@@ -98,6 +100,8 @@ def main() -> None:
         returns,
         features,
         execution_prices=execution_prices,
+        raw_close_prices=engineer.make_raw_close_frame(),
+        corporate_actions=engineer.corporate_actions(),
         median_dollar_volume=median_dollar_volume,
     )
     dynamic = run_portfolio(
@@ -106,6 +110,8 @@ def main() -> None:
         returns,
         features,
         execution_prices=execution_prices,
+        raw_close_prices=engineer.make_raw_close_frame(),
+        corporate_actions=engineer.corporate_actions(),
         median_dollar_volume=median_dollar_volume,
     )
 

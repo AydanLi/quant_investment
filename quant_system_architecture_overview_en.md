@@ -2,7 +2,7 @@
 
 Language: [中文](quant_system_architecture_overview.md) | English
 
-Last updated: 2026-08-26
+Last updated: 2026-09-22
 
 ## 1. Architecture Goals
 
@@ -19,7 +19,7 @@ Core invariants:
 3. A signal calculated after the close on T can execute only on T+1 or later.
 4. Backtests and local replay use shares, cash, and settlement ledgers without
    implicit free rebalancing.
-5. Only a complete `ADMITTED` run can freeze a strategy; Dashboard experiments
+5. Only a complete `ADMITTED` run plus explicit human approval can freeze a strategy; Dashboard experiments
    cannot substitute for admission.
 6. Local `REPLAY_OPEN`, broker paper, and live trading are three distinct
    evidence levels.
@@ -148,6 +148,23 @@ degradation.
 `data/adjustments.py` produces local total-return prices with one deterministic
 algorithm. The system does not incrementally splice provider-adjusted history.
 
+Total-return prices serve signals only; execution and valuation require explicit
+raw Open/Close. `execution/accounting.py` shares corporate actions, NAV and fill
+accounting; `execution/budget.py` shares basket budgets including costs. Unpaid
+dividends enter NAV, not buying power; payment transfers receivables to cash.
+Unknown cost basis remains unknown. Memory and database repositories persist
+separately with account version checks and transactions. Official prior closes
+live in `paper_account_closes`; independent halt reasons project to legacy `risk_state`.
+
+`FrozenRuntimeManifest` binds complete economic configuration, source content,
+installed dependencies, protocol and research data identity. New trusted market
+data can advance without back-signing old identities or experiments.
+`validation_runs` starts at actual phase commencement; event and database receipt
+timestamps both gate evidence. `summary_json` preserves complete versioned metrics;
+whole experiments commit atomically. Missing coverage, admission or current runtime
+identity excludes results from valid comparisons while preserving history.
+See the [remediation record](docs/remediation_status_en.md) for interfaces and verification.
+
 ### 4.3 Quality Gate
 
 An actionable snapshot must satisfy all of the following:
@@ -274,8 +291,8 @@ stateDiagram-v2
     RunningAdmission --> Rejected: Gate failure
     RunningAdmission --> Failed: Runtime failure
     RunningAdmission --> Admitted: Every gate passes
-    Admitted --> FrozenStrategy: Freeze
-    FrozenStrategy --> LocalSimulation: Start the prospective clock at current time
+    Admitted --> FrozenStrategy: Explicit human approval and freeze
+    FrozenStrategy --> LocalSimulation: Initialize account and start actual validation stage
 ```
 
 Before a strategy can be frozen, the database must contain:
@@ -389,7 +406,7 @@ Runtime modes:
 
 ## 10. Current Operating State
 
-As of 2026-08-26:
+Rechecked on 2026-09-22:
 
 - All five `DatasetSnapshot` records are `BLOCKED`; the latest snapshot still
   has 706 unresolved issues.
@@ -397,8 +414,8 @@ As of 2026-08-26:
 - `StrategyVersion`, `AdmissionRun`, and `ParameterTrial` counts are all zero.
 - Signal, paper-cycle, account, order, fill, reconciliation, and incident counts
   are all zero.
-- All 270 engineering tests pass, and SQLite integrity and foreign-key checks
-  are clean.
+- The pre-change test baseline passed 283 tests; see the
+  [remediation record](docs/remediation_status_en.md) for current regressions, migration and integrity evidence.
 
 The current system state is therefore “infrastructure implemented, research
 conclusion not yet produced.” Do not start the prospective local replay clock

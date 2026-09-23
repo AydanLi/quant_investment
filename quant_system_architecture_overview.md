@@ -2,7 +2,7 @@
 
 语言：中文 | [English](quant_system_architecture_overview_en.md)
 
-更新日期：2026-08-26
+更新日期：2026-09-22
 
 ## 1. 架构目标
 
@@ -15,7 +15,7 @@ Quant System v3 是一个单人、长仓、现金账户 ETF 轮动研究系统�
 2. `BLOCKED` 数据不能进入正式回测、准入、策略冻结或订单。
 3. T 日收盘后计算的信号只能在 T+1 或更晚执行。
 4. 回测和本地模拟使用持股数量、现金和结算账本，不隐含免费再平衡。
-5. 只有完整 `ADMITTED` 运行才能冻结策略；Dashboard 实验不能替代准入。
+5. 只有完整 `ADMITTED` 运行并经独立人工批准才能冻结策略；Dashboard 实验不能替代准入。
 6. 本地 `REPLAY_OPEN`、broker paper 和实盘是三个不同证据等级。
 7. 外部 broker 连接和真实下单默认关闭，并由两个独立开关保护。
 
@@ -133,6 +133,18 @@ Tiingo Token 只从进程内存/环境读取，并通过请求头发送。供应
 
 本地总回报价格由 `data/adjustments.py` 统一生成，不增量拼接供应商的历史复权价。
 
+总收益仅用于信号；成交与估值分别要求原始 Open/Close。`execution/accounting.py`
+共享公司行动、净值和成交记账，`execution/budget.py` 共享含费用的批次预算。
+净值包含未支付股息应收，购买力不包含；支付仅把应收转为现金。未知成本基础保持未知。
+内存与数据库各自持久化，账户更新使用版本检查与事务。正式前收在
+`paper_account_closes` 中保存，停机原因独立保存，`risk_state` 仅为兼容投影。
+
+`FrozenRuntimeManifest` 绑定完整经济配置、代码内容、实际依赖、协议和研究数据身份。
+新可信行情允许推进，旧身份和旧实验不补签。`validation_runs` 从实际阶段开始计时，
+信号和成交同时核对事件时间与数据库入库时间。指标完整快照保存于 `summary_json`，
+全实验一次提交；缺 RF/基准覆盖、未准入或身份失效的结果保留历史但排除有效比较。
+详细接口、迁移及验收对应见[修复记录](docs/remediation_status.md)。
+
 ### 4.3 质量门
 
 可执行快照必须满足：
@@ -240,8 +252,8 @@ stateDiagram-v2
     RunningAdmission --> Rejected: 门槛失败
     RunningAdmission --> Failed: 运行异常
     RunningAdmission --> Admitted: 全部门槛通过
-    Admitted --> FrozenStrategy: 冻结
-    FrozenStrategy --> LocalSimulation: 启动当前时间的未来时钟
+    Admitted --> FrozenStrategy: 独立人工批准并冻结
+    FrozenStrategy --> LocalSimulation: 显式初始化账户并记录当前验证起点
 ```
 
 冻结策略前，数据库必须存在：
@@ -346,13 +358,13 @@ Alembic 当前 head 为 `5f74c1a9d2b0`。旧 `market_data` 和实验表保留用
 
 ## 10. 当前运行状态
 
-截至 2026-08-26：
+截至 2026-09-22 重新核对：
 
 - 5 个 `DatasetSnapshot` 全部为 `BLOCKED`；最新快照仍有 706 个未裁决问题；
 - `UV-001` 为 `draft`，`historical_universe_integrity=false`；
 - `StrategyVersion`、`AdmissionRun` 和 `ParameterTrial` 均为 0；
 - 信号、模拟周期、账户、订单、成交、对账和事故记录均为 0；
-- 工程测试 270 项通过，SQLite 完整性与外键检查正常。
+- 修改前测试基线为 283 项通过；本轮回归、迁移和完整性结果见[修复记录](docs/remediation_status.md)。
 
 所以当前系统状态是“基础设施已实现，研究结论尚未产生”。数据问题解决并通过正式
 准入之前，不得启动本地未来时钟或推断实盘日期。

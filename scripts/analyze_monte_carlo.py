@@ -7,6 +7,7 @@ from dataclasses import replace
 import pandas as pd
 
 from config.settings import Config
+from data.features import FeatureEngineer
 from research.monte_carlo import (
     PairedBootstrapResult,
     evaluate_monte_carlo_robustness,
@@ -80,7 +81,7 @@ def main() -> None:
 
     (
         snapshot_id,
-        _,
+        data,
         prices,
         execution_prices,
         returns,
@@ -92,6 +93,8 @@ def main() -> None:
         snapshot_id=args.snapshot_id,
     )
     run_kwargs = {
+        "raw_close_prices": FeatureEngineer(data, baseline_config).make_raw_close_frame(),
+        "corporate_actions": FeatureEngineer(data, baseline_config).corporate_actions(),
         "execution_prices": execution_prices,
         "median_dollar_volume": median_dollar_volume,
     }

@@ -267,6 +267,8 @@ class TrustedMarketDataRepository(BaseRepository):
                     "action_type": action.action_type,
                     "cash_amount": action.cash_amount,
                     "split_factor": action.split_factor,
+                    "payment_date": None if action.payment_date is None else _date_str(action.payment_date),
+                    "payment_source": action.payment_source,
                     "status": action.status,
                     "source": action.source,
                     "fetched_at": now,
@@ -310,10 +312,21 @@ class TrustedMarketDataRepository(BaseRepository):
                                 "field": field,
                                 "old_value": previous[field],
                                 "new_value": row[field],
+                                "old_text": None,
+                                "new_text": None,
                                 "source": row["source"],
                                 "detected_at": now,
                             }
                         )
+                for field in ("payment_date", "payment_source"):
+                    if previous[field] != row[field]:
+                        action_revisions.append({
+                            "dataset_table": "corporate_actions", "ticker": row["ticker"],
+                            "date": row["ex_date"], "field": field,
+                            "old_value": None, "new_value": None,
+                            "old_text": previous[field], "new_text": row[field],
+                            "source": row["source"], "detected_at": now,
+                        })
             if action_revisions:
                 conn.execute(data_revisions.insert(), action_revisions)
             upsert(
@@ -321,7 +334,7 @@ class TrustedMarketDataRepository(BaseRepository):
                 corporate_actions,
                 rows,
                 index_elements=["ticker", "ex_date", "action_type", "source"],
-                update_columns=["cash_amount", "split_factor", "status", "fetched_at"],
+                update_columns=["cash_amount", "split_factor", "status", "payment_date", "payment_source", "fetched_at"],
             )
         return len(rows)
 
@@ -383,6 +396,8 @@ class TrustedMarketDataRepository(BaseRepository):
                 action_type=row["action_type"],
                 cash_amount=row["cash_amount"],
                 split_factor=row["split_factor"],
+                payment_date=None if row.get("payment_date") is None else pd.Timestamp(row["payment_date"]),
+                payment_source=row.get("payment_source"),
                 status=row["status"],
                 source=row["source"],
             )
@@ -461,6 +476,8 @@ class TrustedMarketDataRepository(BaseRepository):
                             "role": role,
                             "cash_amount": action.cash_amount,
                             "split_factor": action.split_factor,
+                            "payment_date": None if action.payment_date is None else _date_str(action.payment_date),
+                            "payment_source": action.payment_source,
                             "status": action.status,
                             "source": action.source,
                         }
@@ -549,6 +566,8 @@ class TrustedMarketDataRepository(BaseRepository):
                 action_type=str(row["action_type"]),
                 cash_amount=float(row["cash_amount"]),
                 split_factor=float(row["split_factor"]),
+                payment_date=None if row.get("payment_date") is None else pd.Timestamp(row["payment_date"]),
+                payment_source=row.get("payment_source"),
                 status=str(row["status"]),
                 source=str(row["source"]),
             )

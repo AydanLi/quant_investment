@@ -9,6 +9,7 @@ from sqlalchemy import select
 
 from config.settings import Config
 from data.models import (
+    DATA_QUALITY_MODEL_VERSION,
     CorporateAction,
     DataQualityDecision,
     DataQualityDisposition,
@@ -60,6 +61,7 @@ def _report():
         issues=(issue,),
         content_hash="a" * 64,
         raw_data_hash="b" * 64,
+        quality_model_version=DATA_QUALITY_MODEL_VERSION,
     )
 
 
@@ -257,8 +259,12 @@ def test_bounded_corporate_action_normalization_resolves_only_derivative_closes(
         for issue in report.issues
         if issue.severity == QualitySeverity.BLOCK
     }
-    assert resolved.status == DataQualityStatus.TRUSTED_WITH_EXCEPTIONS
-    assert set(resolved.adjudicated_issue_fingerprints) == blocking
+    # A bounded Close decision cannot also approve the newly verified Open
+    # series. Its separate disagreement requires its own explicit evidence.
+    assert resolved.status == DataQualityStatus.BLOCKED
+    open_blocking = {issue.fingerprint for issue in report.issues if issue.code == "CROSS_SOURCE_OPEN_MISMATCH" and issue.severity == QualitySeverity.BLOCK}
+    assert open_blocking
+    assert set(resolved.adjudicated_issue_fingerprints) == blocking - open_blocking
 
 
 def test_loader_fails_closed_then_uses_snapshot_bound_decisions_and_saves_draft():

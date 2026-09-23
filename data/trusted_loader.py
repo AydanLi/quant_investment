@@ -14,7 +14,7 @@ from config.universe import (
 )
 from data.adjustments import locally_adjust_ohlcv
 from data.calendar import NyseCalendar
-from data.models import DataQualityReport, ProviderPayload
+from data.models import DataQualityReport, DataQualityStatus, ProviderPayload
 from data.providers import (
     CboeVixProvider,
     FredVixProvider,
@@ -285,7 +285,14 @@ class TrustedMarketDataLoader:
                 )
                 self.universe_version_recorded = True
         self.quality_report = report
-        self._loaded_data = self._adjusted_frames(primary)
+        # A blocked payload is diagnostic evidence, not a price series to
+        # normalize. In particular, preserve malformed/duplicate raw rows so
+        # diagnostics can explain the block without failing during adjustment.
+        self._loaded_data = (
+            {ticker: frame.copy(deep=True) for ticker, frame in primary.bars.items()}
+            if report.status == DataQualityStatus.BLOCKED
+            else self._adjusted_frames(primary)
+        )
         self._raise_if_not_actionable(require_actionable)
         return {
             ticker: frame.copy(deep=True)
@@ -299,7 +306,8 @@ class TrustedMarketDataLoader:
     def _raise_if_not_actionable(self, require_actionable: bool) -> None:
         if require_actionable and not self.actionable:
             status = None if self.quality_report is None else self.quality_report.status.value
+            model = None if self.quality_report is None else self.quality_report.quality_model_version
             raise ValueError(
-                f"Trusted market data is not actionable (status={status}); "
+                f"Trusted market data is not actionable (status={status}, quality_model_version={model}); "
                 "use require_actionable=False only for diagnostics."
             )

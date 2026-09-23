@@ -21,6 +21,7 @@ def main() -> None:
         dataset_snapshot_id=args.dataset_snapshot_id,
         universe_version=args.universe_version,
     )
+    protocol.validate_runtime()
     destination = protocol.write_once(args.output)
     print(f"Created immutable protocol {destination} ({protocol.content_hash}).")
 

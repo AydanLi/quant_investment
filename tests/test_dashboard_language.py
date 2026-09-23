@@ -235,6 +235,24 @@ def test_validation_errors_change_language_and_keep_save_disabled(monkeypatch):
     assert app.button(key="save_experiment").disabled
 
 
+def test_saved_summary_supplies_opening_nav_and_verified_runtime_display(monkeypatch):
+    app, data = _app(monkeypatch, populated=True, query={"lang": "en"})
+    runs = data[0]
+    runs["runtime_verified"] = True
+    runs["status"] = "complete"
+    runs["admissible"] = 1
+    runs["summary_json"] = [{"Metric Schema Version": 2, "Metric Status": "FINAL",
+                              "Start Equity": 125.0} for _ in range(len(runs))]
+    charts = []
+    monkeypatch.setattr(dashboard.st, "line_chart", lambda frame, **kwargs: charts.append(frame.copy()))
+    app.run()
+    _assert_no_exception(app)
+    assert next(metric.value for metric in app.metric if metric.label == "Start Equity") == "$125.00"
+    assert charts[0].iloc[:, 0].tolist() == [125., 100., 101., 102.]
+    assert charts[0].index[0] == pd.Timestamp("2023-12-29")
+    assert any("runtime identity: Verified" in caption.value for caption in app.caption)
+
+
 @pytest.mark.parametrize("loader", ["load_runs", "load_run_details"])
 def test_database_error_keeps_language_switch_available(monkeypatch, loader):
     app, _ = _app(monkeypatch, populated=True)

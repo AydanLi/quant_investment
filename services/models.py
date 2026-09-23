@@ -47,6 +47,7 @@ class SignalDecision:
     risk_state: str = "NORMAL"
     block_reasons: tuple[str, ...] = field(default_factory=tuple)
     decision_id: int | None = None
+    runtime_hash: str | None = None
 
     @property
     def actionable(self) -> bool:

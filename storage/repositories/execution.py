@@ -1,12 +1,16 @@
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
+from contextlib import nullcontext
 from datetime import datetime, timezone
+from hashlib import sha256
+import json
 from typing import Mapping, Sequence
 
 from sqlalchemy import and_, func, select
 
 from data.calendar import NEW_YORK, NyseCalendar
+from data.models import DATA_QUALITY_MODEL_VERSION
 from execution.models import (
     AccountSnapshot,
     BrokerEnvironment,
@@ -21,10 +25,19 @@ from execution.models import (
     Side,
 )
 from storage.repositories.base import BaseRepository
+from execution.validation import finite_number, validate_account, validate_fill
+from config.settings import Config
+from risk.controls import evaluate_account_risk, risk_state_projection
+from execution.accounting import CorporateActionState, apply_corporate_actions, apply_fill, portfolio_nav
 from storage.schema import (
     execution_fills,
+    dataset_snapshots,
+    dataset_snapshot_bars,
     order_intents,
     paper_accounts,
+    paper_account_closes,
+    paper_account_actions,
+    paper_cycles,
     paper_cash_movements,
     reconciliations,
     risk_incidents,
@@ -128,9 +141,13 @@ class ExecutionRepository(BaseRepository):
             ),
         )
 
-    def save_intent(self, intent: OrderIntent) -> int:
+    def save_intent(self, intent: OrderIntent, *, connection=None) -> int:
         if intent.environment.value != self.environment:
             raise ValueError("Execution repository environment mismatch.")
+        finite_number(intent.quantity, "Order quantity", positive=True)
+        finite_number(intent.limit_price, "Order price", positive=True)
+        finite_number(intent.arrival_quote.bid, "Arrival bid", positive=True)
+        finite_number(intent.arrival_quote.ask, "Arrival ask", positive=True)
         row = {
             "client_order_id": intent.client_order_id,
             "environment": intent.environment.value,
@@ -164,7 +181,7 @@ class ExecutionRepository(BaseRepository):
                 ),
             },
         }
-        with self.engine.begin() as conn:
+        with (nullcontext(connection) if connection is not None else self.engine.begin()) as conn:
             existing = conn.execute(
                 select(order_intents).where(
                     order_intents.c.environment == self.environment,
@@ -188,6 +205,46 @@ class ExecutionRepository(BaseRepository):
             inserted = conn.execute(order_intents.insert().values(**row))
             return int(inserted.inserted_primary_key[0])
 
+    @staticmethod
+    def _update_account(conn, account, **values) -> None:
+        """All account mutations use the same optimistic concurrency boundary."""
+        result = conn.execute(paper_accounts.update().where(
+            paper_accounts.c.id == account["id"], paper_accounts.c.version == account["version"]
+        ).values(**values, version=int(account["version"]) + 1))
+        if result.rowcount != 1:
+            raise RuntimeError("Concurrent paper-account update detected.")
+
+    def save_draft_batch(self, intents, *, account: AccountSnapshot, paper_cycle_id: int | None) -> None:
+        validate_account(account)
+        with self.engine.begin() as conn:
+            row = conn.execute(select(paper_accounts).where(
+                paper_accounts.c.environment == self.environment,
+                paper_accounts.c.account_ref == account.account_ref,
+            )).mappings().one()
+            if int(row["version"]) != account.version:
+                raise RuntimeError("Account changed while drafting orders.")
+            for intent in intents:
+                self.save_intent(intent, connection=conn)
+            if paper_cycle_id is not None:
+                exists = conn.execute(select(reconciliations.c.id).where(
+                    reconciliations.c.account_ref == account.account_ref,
+                    reconciliations.c.paper_cycle_id == paper_cycle_id,
+                    reconciliations.c.status == "baseline",
+                )).scalar_one_or_none()
+                if exists is None:
+                    conn.execute(reconciliations.insert().values(
+                        environment=self.environment, account_ref=account.account_ref,
+                        paper_cycle_id=paper_cycle_id, status="baseline", nav=account.nav,
+                        difference_value=0.0, details_json={"account_before": self._account_payload(account)},
+                    ))
+                result = conn.execute(paper_cycles.update().where(
+                    paper_cycles.c.id == paper_cycle_id,
+                    paper_cycles.c.status.in_(["PENDING", "DRAFTED"]),
+                ).values(status="DRAFTED"))
+                if result.rowcount != 1:
+                    raise ValueError("Paper cycle cannot accept a draft batch.")
+            self._update_account(conn, row)
+
     def get_intent(self, client_order_id: str) -> OrderIntent:
         with self.engine.connect() as conn:
             row = conn.execute(
@@ -199,6 +256,93 @@ class ExecutionRepository(BaseRepository):
         if row is None:
             raise KeyError(client_order_id)
         return self._intent_from_row(row)
+
+    @staticmethod
+    def _replay_inputs(order_type, prices, source_snapshot_id):
+        inputs = {"prices": {ticker: finite_number(price, f"{ticker} replay open", positive=True)
+                             for ticker, price in prices.items()},
+                  "order_type": order_type, "source_snapshot_id": source_snapshot_id}
+        digest = sha256(json.dumps(inputs, sort_keys=True, allow_nan=False).encode()).hexdigest()
+        return inputs, digest
+
+    def verify_frozen_replay_inputs(self, paper_cycle_id: int, *, order_type: str,
+                                   prices: Mapping[str, float], source_snapshot_id: int) -> None:
+        _, digest = self._replay_inputs(order_type, prices, source_snapshot_id)
+        with self.engine.connect() as conn:
+            payload = dict(conn.execute(select(paper_cycles.c.execution_payload_json).where(
+                paper_cycles.c.id == paper_cycle_id)).scalar_one() or {})
+        existing = payload.get(order_type)
+        if existing is not None and existing["input_hash"] != digest:
+            raise ValueError("Replay inputs differ from the immutable approved replay batch.")
+
+    def freeze_replay_inputs(self, paper_cycle_id: int, *, account: AccountSnapshot,
+                             order_type: str, prices: Mapping[str, float], at: datetime,
+                             source_snapshot_id: int) -> None:
+        inputs, digest = self._replay_inputs(order_type, prices, source_snapshot_id)
+        with self.engine.begin() as conn:
+            snapshot_as_of = conn.execute(select(dataset_snapshots.c.as_of).where(
+                dataset_snapshots.c.id == source_snapshot_id)).scalar_one()
+            row = conn.execute(select(paper_accounts).where(paper_accounts.c.environment == self.environment,
+                paper_accounts.c.account_ref == account.account_ref)).mappings().one()
+            if int(row["version"]) != account.version:
+                raise RuntimeError("Account changed during replay preflight.")
+            payload = dict(conn.execute(select(paper_cycles.c.execution_payload_json).where(
+                paper_cycles.c.id == paper_cycle_id)).scalar_one() or {})
+            existing = payload.get(order_type)
+            if existing is not None:
+                if existing["input_hash"] != digest:
+                    raise ValueError("Replay inputs differ from the immutable approved replay batch.")
+                return
+            payload[order_type] = {**inputs, "input_hash": digest, "recorded_at": _aware_utc(at).isoformat(),
+                                   "snapshot_as_of": str(snapshot_as_of)}
+            conn.execute(paper_cycles.update().where(paper_cycles.c.id == paper_cycle_id).values(execution_payload_json=payload))
+            self._update_account(conn, row)
+
+    def verify_known_snapshot(self, snapshot_id: int, *, known_at: datetime) -> None:
+        with self.engine.connect() as conn:
+            snapshot = conn.execute(select(dataset_snapshots).where(dataset_snapshots.c.id == snapshot_id)).mappings().one_or_none()
+        if snapshot is None or snapshot["status"] not in {"TRUSTED", "TRUSTED_WITH_EXCEPTIONS"}:
+            raise ValueError("Pre-open corporate action snapshot must pass the trusted-data gate.")
+        if dict(snapshot["quality_json"] or {}).get("quality_model_version") != DATA_QUALITY_MODEL_VERSION:
+            raise ValueError("Pre-open snapshot requires current raw OHLCV and corporate-action validation.")
+        captured = datetime.fromisoformat(str(snapshot["as_of"]))
+        if captured.tzinfo is None or _aware_utc(captured) > _aware_utc(known_at):
+            raise ValueError("Pre-open drafts cannot use a future or timezone-ambiguous snapshot.")
+
+    def verify_execution_snapshot(self, snapshot_id: int | None, *, session: str,
+                                  tickers, opens: Mapping[str, float] | None = None,
+                                  closes: Mapping[str, float] | None = None,
+                                  known_at: datetime | None = None, connection=None) -> None:
+        if snapshot_id is None:
+            raise ValueError("An explicit execution snapshot covering corporate actions is required.")
+        with (nullcontext(connection) if connection is not None else self.engine.connect()) as conn:
+            snapshot = conn.execute(select(dataset_snapshots).where(dataset_snapshots.c.id == snapshot_id)).mappings().one_or_none()
+            if snapshot is None or snapshot["status"] not in {"TRUSTED", "TRUSTED_WITH_EXCEPTIONS"}:
+                raise ValueError("Execution snapshot must pass the trusted-data gate.")
+            if dict(snapshot["quality_json"] or {}).get("quality_model_version") != DATA_QUALITY_MODEL_VERSION:
+                raise ValueError("Execution snapshot requires current raw OHLCV and corporate-action validation.")
+            if str(snapshot["end_date"] or "") < session:
+                raise ValueError("Execution snapshot does not cover this session's corporate actions.")
+            if known_at is not None:
+                captured = datetime.fromisoformat(str(snapshot["as_of"]))
+                if captured.tzinfo is None or _aware_utc(captured) > _aware_utc(known_at):
+                    raise ValueError("Formal close snapshot must already be known at recording time.")
+            rows = conn.execute(select(dataset_snapshot_bars).where(
+                dataset_snapshot_bars.c.snapshot_id == snapshot_id,
+                dataset_snapshot_bars.c.role == "primary", dataset_snapshot_bars.c.date == session,
+            )).mappings().all()
+            by_ticker = {row["ticker"]: row for row in rows}
+            missing = set(tickers) - set(by_ticker)
+            if missing:
+                raise ValueError(f"Execution snapshot is missing current-session bars: {', '.join(sorted(missing))}.")
+            for field, supplied in (("open", opens), ("close", closes)):
+                if supplied is None:
+                    continue
+                for ticker in tickers:
+                    price = finite_number(supplied.get(ticker), f"{ticker} {field}", positive=True)
+                    source_price = finite_number(by_ticker[ticker][field], f"{ticker} source {field}", positive=True)
+                    if abs(price - source_price) > max(price * 1e-10, 1e-8):
+                        raise ValueError(f"{ticker} replay {field} differs from its immutable execution snapshot.")
 
     def get_intent_id(self, client_order_id: str) -> int:
         with self.engine.connect() as conn:
@@ -283,20 +427,24 @@ class ExecutionRepository(BaseRepository):
 
     def save_fill(self, order_intent_id: int, fill: ExecutionFill) -> int:
         """Journal a fill idempotently and derive PARTIAL/FILLED from quantity."""
+        validate_fill(fill)
         with self.engine.begin() as conn:
             order = conn.execute(
                 select(order_intents).where(order_intents.c.id == order_intent_id)
             ).mappings().one_or_none()
             if order is None or order["environment"] != self.environment:
                 raise ValueError("Fill order does not belong to this execution environment.")
+            if order["client_order_id"] != fill.client_order_id:
+                raise ValueError("Fill client order identity differs from its order.")
             existing = conn.execute(
-                select(execution_fills.c.id).where(
+                select(execution_fills).where(
                     execution_fills.c.environment == self.environment,
                     execution_fills.c.broker_execution_id == fill.broker_execution_id,
                 )
-            ).scalar_one_or_none()
+            ).mappings().one_or_none()
             if existing is not None:
-                return int(existing)
+                self._verify_duplicate_fill(existing, order_intent_id, fill)
+                return int(existing["id"])
             if order["signal_decision_id"] is not None and order["status"] not in {
                 OrderState.SUBMITTED.value,
                 OrderState.PARTIAL.value,
@@ -324,12 +472,24 @@ class ExecutionRepository(BaseRepository):
                 if cumulative >= float(order["quantity"]) - 1e-8
                 else OrderState.PARTIAL
             )
-            conn.execute(
+            result = conn.execute(
                 order_intents.update()
-                .where(order_intents.c.id == order_intent_id)
+                .where(order_intents.c.id == order_intent_id,
+                       order_intents.c.filled_quantity == prior,
+                       order_intents.c.status == order["status"])
                 .values(filled_quantity=cumulative, status=target.value)
             )
+            if result.rowcount != 1:
+                raise RuntimeError("Concurrent order fill detected.")
             return int(inserted.inserted_primary_key[0])
+
+    @staticmethod
+    def _verify_duplicate_fill(existing, order_intent_id, fill) -> None:
+        expected = {"order_intent_id": order_intent_id, "quantity": fill.quantity, "price": fill.price,
+                    "commission": fill.commission, "settlement_date": fill.settlement_date,
+                    "filled_at": _utc_naive(fill.filled_at)}
+        if any(existing[name] != value for name, value in expected.items()):
+            raise ValueError("Duplicate broker execution identity has conflicting fill data.")
 
     def initialize_account(
         self,
@@ -339,8 +499,7 @@ class ExecutionRepository(BaseRepository):
         initial_cash: float,
         at: datetime | None = None,
     ) -> AccountSnapshot:
-        if initial_cash <= 0.0:
-            raise ValueError("Initial paper cash must be positive.")
+        initial_cash = finite_number(initial_cash, "Initial paper cash", positive=True)
         now = _utc_naive(at)
         with self.engine.begin() as conn:
             existing = conn.execute(
@@ -350,7 +509,7 @@ class ExecutionRepository(BaseRepository):
                 )
             ).mappings().one_or_none()
             if existing is None:
-                conn.execute(
+                inserted = conn.execute(
                     paper_accounts.insert().values(
                         environment=self.environment,
                         account_ref=account_ref,
@@ -361,13 +520,26 @@ class ExecutionRepository(BaseRepository):
                         positions_json={"_meta": {"total_commission": 0.0}},
                         high_water=initial_cash,
                         risk_state="NORMAL",
+                        accounting_state_json={"started_session": _aware_utc(now).astimezone(NEW_YORK).date().isoformat()},
                         version=1,
                         updated_at=now,
                     )
                 )
+                session = _aware_utc(now).astimezone(NEW_YORK).date().isoformat()
+                conn.execute(paper_account_closes.insert().values(
+                    account_id=int(inserted.inserted_primary_key[0]), session=session,
+                    nav=initial_cash, account_version=1, closed_at=now, recorded_at=now,
+                    input_hash=sha256(f"INCEPTION|{account_ref}|{initial_cash}|{now}".encode()).hexdigest(),
+                    baseline_kind="INCEPTION",
+                ))
             elif existing["strategy_version"] != strategy_version:
                 raise ValueError("Paper account strategy version is immutable.")
         return self.get_account(account_ref)
+
+    @staticmethod
+    def _receivable_total(payload) -> float:
+        return sum(finite_number(item["amount"], "Dividend receivable", nonnegative=True)
+                   for item in dict(payload or {}).get("receivables", ()))
 
     @staticmethod
     def _decode_positions(payload: Mapping[str, object]) -> dict[str, dict[str, float]]:
@@ -403,6 +575,11 @@ class ExecutionRepository(BaseRepository):
             "risk_state": account.risk_state,
             "total_commission": account.total_commission,
             "last_valuation_session": account.last_valuation_session,
+            "version": account.version,
+            "halt_reasons": list(account.halt_reasons),
+            "drift_state": account.drift_state,
+            "dividend_receivable": account.dividend_receivable,
+            "accounting_state": dict(account.accounting_state),
         }
 
     def save_cycle_baseline(
@@ -497,7 +674,7 @@ class ExecutionRepository(BaseRepository):
             )
             for item in movement_rows
         )
-        return AccountSnapshot(
+        account = AccountSnapshot(
             account_ref=account_ref,
             nav=float(row["nav"]),
             settled_cash=float(row["settled_cash"]),
@@ -516,7 +693,13 @@ class ExecutionRepository(BaseRepository):
                 else None
             ),
             version=int(row["version"]),
+            halt_reasons=tuple(row["halt_reasons_json"] or ()),
+            drift_state=str(row["drift_state"] or "NORMAL"),
+            accounting_state=dict(row["accounting_state_json"] or {}),
+            dividend_receivable=self._receivable_total(row["accounting_state_json"]),
         )
+        validate_account(account)
+        return account
 
     def get_account_strategy_version(self, account_ref: str) -> str:
         with self.engine.connect() as conn:
@@ -537,17 +720,19 @@ class ExecutionRepository(BaseRepository):
         *,
         at: datetime | None = None,
     ) -> AccountSnapshot:
+        if risk_state in {"NORMAL", "WARNING", "DRIFT_REVIEW"}:
+            raise ValueError("Use verified valuation or authorized recovery to clear risk controls.")
         with self.engine.begin() as conn:
-            result = conn.execute(
-                paper_accounts.update()
-                .where(
-                    paper_accounts.c.environment == self.environment,
-                    paper_accounts.c.account_ref == account_ref,
-                )
-                .values(risk_state=risk_state, updated_at=_utc_naive(at))
-            )
-            if result.rowcount != 1:
+            account = conn.execute(select(paper_accounts).where(paper_accounts.c.environment == self.environment,
+                paper_accounts.c.account_ref == account_ref)).mappings().one_or_none()
+            if account is None:
                 raise KeyError(account_ref)
+            reasons = set(account["halt_reasons_json"] or ())
+            if str(account["risk_state"]).endswith("HALTED"):
+                reasons.add(str(account["risk_state"]))
+            reasons.add(risk_state)
+            self._update_account(conn, account, halt_reasons_json=sorted(reasons),
+                risk_state=risk_state_projection(reasons, str(account["drift_state"])), updated_at=_utc_naive(at))
         return self.get_account(account_ref)
 
     def expected_account_from_cycle(
@@ -635,6 +820,19 @@ class ExecutionRepository(BaseRepository):
                     .order_by(execution_fills.c.id)
                 ).mappings()
             )
+            action_rows = conn.execute(select(paper_account_actions).where(
+                paper_account_actions.c.account_id == account_row["id"],
+                paper_account_actions.c.recorded_at <= _utc_naive(at),
+            ).order_by(paper_account_actions.c.id)).mappings().all()
+            action_changes = [dict(row["payload_json"]) for row in action_rows
+                              if int(dict(row["payload_json"]).get("account_version", 0)) > int(pre.get("version", 0))]
+            action_cash = sum(float(change.get("settled_cash_change", 0)) for change in action_changes)
+            dividend_receivable = float(pre.get("dividend_receivable", 0)) + sum(
+                float(change.get("receivable_change", 0)) for change in action_changes)
+            for change in action_changes:
+                for ticker, delta in dict(change.get("quantities_delta") or {}).items():
+                    current = positions.get(ticker, {"quantity": 0., "mark_price": 0.})
+                    positions[ticker] = {**current, "quantity": current["quantity"] + float(delta)}
             for fill in fills:
                 ticker = str(fill["ticker"])
                 current = positions.get(ticker, {"quantity": 0.0, "mark_price": 0.0})
@@ -668,7 +866,7 @@ class ExecutionRepository(BaseRepository):
             for key, row in movement_rows.items():
                 if row["order_intent_id"] is not None and int(row["order_intent_id"]) in order_ids:
                     relevant_movements[key] = row
-            settled_cash = float(pre["settled_cash"])
+            settled_cash = float(pre["settled_cash"]) + action_cash
             pending: list[PendingSettlement] = []
             for key, movement in relevant_movements.items():
                 amount = float(movement["amount"])
@@ -695,7 +893,7 @@ class ExecutionRepository(BaseRepository):
             )
             for ticker, item in positions.items()
         }
-        nav = settled_cash + unsettled_cash + sum(
+        nav = settled_cash + unsettled_cash + dividend_receivable + sum(
             position.market_value for position in broker_positions.values()
         )
         return AccountSnapshot(
@@ -717,6 +915,7 @@ class ExecutionRepository(BaseRepository):
                 else None
             ),
             version=int(account_row["version"]),
+            dividend_receivable=dividend_receivable,
         )
 
     def cancel_cycle_orders(self, paper_cycle_id: int) -> tuple[str, ...]:
@@ -765,6 +964,7 @@ class ExecutionRepository(BaseRepository):
         order_intent_id: int,
         fill: ExecutionFill,
     ) -> AccountSnapshot:
+        validate_fill(fill)
         if not fill.settlement_date:
             raise ValueError("Paper fills require a T+1 settlement date.")
         with self.engine.begin() as conn:
@@ -781,15 +981,17 @@ class ExecutionRepository(BaseRepository):
             ).mappings().one_or_none()
             if account is None:
                 raise KeyError(account_ref)
+            if order["strategy_version"] != account["strategy_version"] or order["client_order_id"] != fill.client_order_id:
+                raise ValueError("Fill order does not belong to this account strategy or client identity.")
             existing = conn.execute(
-                select(execution_fills.c.id).where(
+                select(execution_fills).where(
                     execution_fills.c.environment == self.environment,
                     execution_fills.c.broker_execution_id == fill.broker_execution_id,
                 )
-            ).scalar_one_or_none()
+            ).mappings().one_or_none()
             duplicate = existing is not None
             if duplicate:
-                pass
+                self._verify_duplicate_fill(existing, order_intent_id, fill)
             elif order["status"] not in {
                 OrderState.SUBMITTED.value,
                 OrderState.PARTIAL.value,
@@ -802,24 +1004,21 @@ class ExecutionRepository(BaseRepository):
                 raw_positions = dict(account["positions_json"] or {})
                 account_metadata = dict(raw_positions.get("_meta") or {})
                 positions = self._decode_positions(raw_positions)
-                current = positions.get(str(order["ticker"]), {"quantity": 0.0, "mark_price": fill.price})
+                state_payload = dict(account["accounting_state_json"] or {})
                 signed_quantity = fill.quantity if order["side"] == Side.BUY.value else -fill.quantity
-                new_quantity = float(current["quantity"]) + signed_quantity
-                if new_quantity < -1e-8:
-                    raise ValueError("Paper fill would create a short position.")
-                if abs(new_quantity) < 1e-8:
-                    positions.pop(str(order["ticker"]), None)
-                else:
-                    positions[str(order["ticker"])] = {
-                        "quantity": new_quantity,
-                        "mark_price": fill.price,
-                    }
-                cash_amount = fill.quantity * fill.price
-                cash_amount = (
-                    -(cash_amount + fill.commission)
-                    if order["side"] == Side.BUY.value
-                    else cash_amount - fill.commission
+                applied = apply_fill(
+                    quantities={k: v["quantity"] for k, v in positions.items()},
+                    average_costs=dict(state_payload.get("average_costs") or {}),
+                    ticker=str(order["ticker"]), quantity_change=signed_quantity,
+                    price=fill.price, commission=fill.commission,
                 )
+                positions = {ticker: {"quantity": quantity,
+                             "mark_price": fill.price if ticker == order["ticker"] else positions[ticker]["mark_price"]}
+                             for ticker, quantity in applied.quantities.items()}
+                state_payload["average_costs"] = applied.average_costs
+                state_payload["quantities"] = applied.quantities
+                state_payload["settled_cash"] = float(account["settled_cash"])
+                cash_amount = applied.cash_change
                 pending_before = float(
                     conn.execute(
                         select(func.coalesce(func.sum(paper_cash_movements.c.amount), 0.0)).where(
@@ -860,15 +1059,12 @@ class ExecutionRepository(BaseRepository):
                 market_value = sum(
                     item["quantity"] * item["mark_price"] for item in positions.values()
                 )
-                nav = float(account["settled_cash"]) + pending_after + market_value
-                result = conn.execute(
-                    paper_accounts.update()
-                    .where(
-                        paper_accounts.c.id == account["id"],
-                        paper_accounts.c.version == account["version"],
-                    )
-                    .values(
+                nav = finite_number(float(account["settled_cash"]) + pending_after + market_value
+                                    + self._receivable_total(state_payload), "Post-fill NAV", positive=True)
+                self._update_account(
+                    conn, account,
                         nav=nav,
+                        accounting_state_json=state_payload,
                         available_cash=float(account["settled_cash"]) + pending_after,
                         positions_json={
                             **positions,
@@ -880,12 +1076,8 @@ class ExecutionRepository(BaseRepository):
                                 + fill.commission,
                             },
                         },
-                        version=int(account["version"]) + 1,
                         updated_at=_utc_naive(fill.filled_at),
-                    )
                 )
-                if result.rowcount != 1:
-                    raise RuntimeError("Concurrent paper-account update detected.")
                 target = (
                     OrderState.FILLED
                     if cumulative >= float(order["quantity"]) - 1e-8
@@ -927,7 +1119,12 @@ class ExecutionRepository(BaseRepository):
                 ).scalar_one()
                 or 0.0
             )
-            if abs(due) > 0.0:
+            due_count = conn.execute(select(func.count()).select_from(paper_cash_movements).where(
+                paper_cash_movements.c.account_id == account["id"],
+                paper_cash_movements.c.status == "PENDING",
+                paper_cash_movements.c.settlement_date <= session,
+            )).scalar_one()
+            if due_count:
                 conn.execute(
                     paper_cash_movements.update()
                     .where(
@@ -947,132 +1144,216 @@ class ExecutionRepository(BaseRepository):
                     or 0.0
                 )
                 settled_cash = float(account["settled_cash"]) + due
-                conn.execute(
-                    paper_accounts.update()
-                    .where(paper_accounts.c.id == account["id"])
-                    .values(
-                        settled_cash=settled_cash,
-                        available_cash=settled_cash + remaining,
-                        version=int(account["version"]) + 1,
-                        updated_at=now,
-                    )
-                )
+                finite_number(settled_cash, "Settled cash", nonnegative=True)
+                state_payload = dict(account["accounting_state_json"] or {})
+                state_payload["settled_cash"] = settled_cash
+                self._update_account(conn, account, settled_cash=settled_cash,
+                    available_cash=settled_cash + remaining, accounting_state_json=state_payload, updated_at=now)
         return self.get_account(account_ref)
 
     def mark_account(
-        self,
-        account_ref: str,
-        *,
-        prices: Mapping[str, float],
-        valuation_session: str,
-        at: datetime,
-        drawdown_limit: float,
-        daily_loss_limit: float,
-        paper_cycle_id: int | None = None,
+        self, account_ref: str, *, prices: Mapping[str, float], valuation_session: str,
+        at: datetime, drawdown_limit: float, daily_loss_limit: float,
+        paper_cycle_id: int | None = None, config: Config | None = None,
     ) -> tuple[AccountSnapshot, str | None, float | None, int | None]:
+        marks = {ticker: finite_number(price, f"{ticker} mark", positive=True) for ticker, price in prices.items()}
+        calendar = NyseCalendar()
+        if not calendar.is_session(valuation_session):
+            raise ValueError("Valuation requires an exchange session.")
+        policy = replace(config or Config(), portfolio_drawdown_stop=drawdown_limit, daily_loss_halt=daily_loss_limit)
         with self.engine.begin() as conn:
-            account = conn.execute(
-                select(paper_accounts).where(
-                    paper_accounts.c.environment == self.environment,
-                    paper_accounts.c.account_ref == account_ref,
-                )
-            ).mappings().one_or_none()
+            account = conn.execute(select(paper_accounts).where(
+                paper_accounts.c.environment == self.environment,
+                paper_accounts.c.account_ref == account_ref,
+            )).mappings().one_or_none()
             if account is None:
                 raise KeyError(account_ref)
+            last = account["last_valuation_session"]
+            if last is not None and valuation_session < str(last):
+                raise ValueError("Account valuations cannot move backwards in session time.")
             raw_positions = dict(account["positions_json"] or {})
-            account_metadata = dict(raw_positions.get("_meta") or {})
             positions = self._decode_positions(raw_positions)
-            missing = sorted(set(positions) - set(prices))
+            missing = set(positions) - set(marks)
             if missing:
-                raise ValueError(f"Missing marks for active positions: {', '.join(missing)}.")
+                raise ValueError(f"Missing marks for active positions: {', '.join(sorted(missing))}.")
             for ticker, item in positions.items():
-                price = float(prices[ticker])
-                if price <= 0.0:
-                    raise ValueError(f"Invalid mark for {ticker}.")
-                item["mark_price"] = price
-            pending = float(
-                conn.execute(
-                    select(func.coalesce(func.sum(paper_cash_movements.c.amount), 0.0)).where(
-                        paper_cash_movements.c.account_id == account["id"],
-                        paper_cash_movements.c.status == "PENDING",
-                    )
-                ).scalar_one()
-                or 0.0
+                item["mark_price"] = marks[ticker]
+            pending = float(conn.execute(select(func.coalesce(func.sum(paper_cash_movements.c.amount), 0.0)).where(
+                paper_cash_movements.c.account_id == account["id"], paper_cash_movements.c.status == "PENDING",
+            )).scalar_one())
+            nav = portfolio_nav(quantities={k: v["quantity"] for k, v in positions.items()}, prices=marks,
+                                settled_cash=float(account["settled_cash"]), unsettled_cash=pending,
+                                dividend_receivable=self._receivable_total(account["accounting_state_json"]))
+            prior_session = str(calendar.previous_session(valuation_session).date())
+            close = conn.execute(select(paper_account_closes).where(
+                paper_account_closes.c.account_id == account["id"],
+                paper_account_closes.c.session == prior_session,
+                paper_account_closes.c.baseline_kind == "CLOSE",
+            )).mappings().one_or_none()
+            # The funding baseline is explicit and may be used on inception day
+            # only. A missing intervening close never falls back to a stale NAV.
+            if close is None:
+                close = conn.execute(select(paper_account_closes).where(
+                    paper_account_closes.c.account_id == account["id"],
+                    paper_account_closes.c.session == valuation_session,
+                    paper_account_closes.c.baseline_kind == "INCEPTION",
+                )).mappings().one_or_none()
+            reasons = set(account["halt_reasons_json"] or ())
+            legacy = str(account["risk_state"])
+            if legacy.endswith("HALTED"):
+                reasons.add(legacy)
+            assessment = evaluate_account_risk(
+                config=policy, nav=nav, high_water=float(account["high_water"]),
+                previous_close_nav=float(close["nav"]) if close is not None else None,
+                weights={k: v["quantity"] * v["mark_price"] / nav for k, v in positions.items()},
+                halt_reasons=reasons,
             )
-            nav = float(account["settled_cash"]) + pending + sum(
-                item["quantity"] * item["mark_price"] for item in positions.values()
-            )
-            high_water = max(float(account["high_water"]), nav)
-            drawdown = nav / high_water - 1.0 if high_water > 0.0 else -1.0
-            daily_return = None
-            if account["last_valuation_session"] not in {None, valuation_session}:
-                prior_nav = float(account["nav"])
-                daily_return = nav / prior_nav - 1.0 if prior_nav > 0.0 else -1.0
-            risk_state = str(account["risk_state"])
+            incident_id = None
             trigger = None
             trigger_value = None
-            incident_id = None
-            if risk_state not in {"DRAWDOWN_HALTED", "DAILY_LOSS_HALTED"}:
-                if drawdown <= -drawdown_limit:
-                    risk_state = "DRAWDOWN_HALTED"
-                    trigger = risk_state
-                    trigger_value = drawdown
-                elif daily_return is not None and daily_return <= -daily_loss_limit:
-                    risk_state = "DAILY_LOSS_HALTED"
-                    trigger = risk_state
-                    trigger_value = daily_return
-            if trigger is not None:
-                existing_incident = conn.execute(
-                    select(risk_incidents.c.id).where(
-                        risk_incidents.c.strategy_version == account["strategy_version"],
-                        risk_incidents.c.environment == self.environment,
-                        risk_incidents.c.account_ref == account_ref,
-                        risk_incidents.c.paper_cycle_id.is_(paper_cycle_id)
-                        if paper_cycle_id is None
-                        else risk_incidents.c.paper_cycle_id == paper_cycle_id,
-                        risk_incidents.c.code == trigger,
-                        risk_incidents.c.status == "open",
-                    )
-                ).scalar_one_or_none()
-                if existing_incident is None:
-                    inserted_incident = conn.execute(
-                        risk_incidents.insert().values(
-                            created_at=_utc_naive(at),
-                            strategy_version=account["strategy_version"],
-                            environment=self.environment,
-                            account_ref=account_ref,
-                            paper_cycle_id=paper_cycle_id,
-                            code=trigger,
-                            severity="CRITICAL",
-                            trigger_value=trigger_value,
-                            details_json={
-                                "nav": nav,
-                                "high_water": high_water,
-                                "valuation_session": valuation_session,
-                                "triggered_at": _aware_utc(at).isoformat(),
-                            },
-                            notification_status="PENDING",
-                            notification_attempts=0,
-                        )
-                    )
-                    incident_id = int(inserted_incident.inserted_primary_key[0])
-                else:
-                    incident_id = int(existing_incident)
-            conn.execute(
-                paper_accounts.update()
-                .where(paper_accounts.c.id == account["id"])
-                .values(
-                    nav=nav,
-                    available_cash=float(account["settled_cash"]) + pending,
-                    positions_json={**positions, "_meta": account_metadata},
-                    high_water=high_water,
-                    risk_state=risk_state,
-                    last_valuation_session=valuation_session,
-                    version=int(account["version"]) + 1,
-                    updated_at=_utc_naive(at),
-                )
-            )
+            for reason in assessment.new_halts:
+                value = assessment.drawdown if reason == "DRAWDOWN_HALTED" else assessment.daily_return
+                incident = conn.execute(select(risk_incidents.c.id).where(
+                    risk_incidents.c.environment == self.environment,
+                    risk_incidents.c.account_ref == account_ref,
+                    risk_incidents.c.code == reason, risk_incidents.c.status == "open",
+                )).scalar_one_or_none()
+                if incident is None:
+                    incident = int(conn.execute(risk_incidents.insert().values(
+                        created_at=_utc_naive(at), strategy_version=account["strategy_version"],
+                        environment=self.environment, account_ref=account_ref, paper_cycle_id=paper_cycle_id,
+                        code=reason, severity="CRITICAL", trigger_value=value,
+                        details_json={"nav": nav, "high_water": assessment.high_water,
+                                      "valuation_session": valuation_session, "triggered_at": _aware_utc(at).isoformat(),
+                                      "previous_close_session": prior_session},
+                        notification_status="PENDING", notification_attempts=0,
+                    )).inserted_primary_key[0])
+                trigger, trigger_value, incident_id = reason, value, int(incident)
+            if assessment.drift_state != str(account["drift_state"]):
+                conn.execute(risk_incidents.update().where(
+                    risk_incidents.c.environment == self.environment, risk_incidents.c.account_ref == account_ref,
+                    risk_incidents.c.code.in_(["POSITION_DRIFT_WARNING", "POSITION_DRIFT_REVIEW"]),
+                    risk_incidents.c.status == "open",
+                ).values(status="resolved", resolved_at=_utc_naive(at), resolution_note="Position drift state changed after valuation."))
+                if assessment.drift_state != "NORMAL":
+                    code = "POSITION_DRIFT_REVIEW" if assessment.drift_state == "DRIFT_REVIEW" else "POSITION_DRIFT_WARNING"
+                    drift_incident = conn.execute(risk_incidents.insert().values(
+                        created_at=_utc_naive(at), strategy_version=account["strategy_version"],
+                        environment=self.environment, account_ref=account_ref, paper_cycle_id=paper_cycle_id,
+                        code=code, severity="HIGH" if assessment.drift_state == "DRIFT_REVIEW" else "WARNING",
+                        details_json={"valuation_session": valuation_session, "nav": nav},
+                        notification_status="PENDING", notification_attempts=0,
+                    ))
+                    incident_id = incident_id or int(drift_incident.inserted_primary_key[0])
+            self._update_account(conn, account, nav=nav, available_cash=float(account["settled_cash"]) + pending,
+                positions_json={**positions, "_meta": dict(raw_positions.get("_meta") or {})},
+                high_water=assessment.high_water, risk_state=assessment.state,
+                halt_reasons_json=list(assessment.halt_reasons), drift_state=assessment.drift_state,
+                last_valuation_session=valuation_session, updated_at=_utc_naive(at))
         return self.get_account(account_ref), trigger, trigger_value, incident_id
+
+    def record_session_close(self, account_ref: str, *, session: str,
+                             prices: Mapping[str, float], recorded_at: datetime,
+                             source_snapshot_id: int | None = None) -> int:
+        calendar = NyseCalendar()
+        schedule = calendar.schedule(session, session)
+        if schedule.empty:
+            raise ValueError("A formal close requires an exchange session.")
+        closed_at = schedule.iloc[0]["market_close"].to_pydatetime()
+        if _aware_utc(recorded_at) < _aware_utc(closed_at):
+            raise ValueError("A formal close cannot be recorded before the exchange close.")
+        marks = {k: finite_number(v, f"{k} close", positive=True) for k, v in prices.items()}
+        with self.engine.begin() as conn:
+            row = conn.execute(select(paper_accounts).where(paper_accounts.c.environment == self.environment,
+                paper_accounts.c.account_ref == account_ref)).mappings().one()
+            if row["last_valuation_session"] and str(row["last_valuation_session"]) > session:
+                raise ValueError("Cannot infer an earlier close from a later account state.")
+            positions = self._decode_positions(row["positions_json"])
+            if positions:
+                self.verify_execution_snapshot(source_snapshot_id, session=session, tickers=positions,
+                    closes=marks, known_at=recorded_at, connection=conn)
+            pending = float(conn.execute(select(func.coalesce(func.sum(paper_cash_movements.c.amount), 0.0)).where(
+                paper_cash_movements.c.account_id == row["id"], paper_cash_movements.c.status == "PENDING",
+            )).scalar_one())
+            nav = portfolio_nav(quantities={k: v["quantity"] for k, v in positions.items()}, prices=marks,
+                settled_cash=float(row["settled_cash"]), unsettled_cash=pending,
+                dividend_receivable=self._receivable_total(row["accounting_state_json"]))
+            digest = sha256(json.dumps({"session": session, "nav": nav, "prices": marks,
+                "positions": positions, "settled_cash": float(row["settled_cash"]), "unsettled_cash": pending,
+                "dividend_receivable": self._receivable_total(row["accounting_state_json"]),
+                "source_snapshot_id": source_snapshot_id}, sort_keys=True, allow_nan=False).encode()).hexdigest()
+            existing = conn.execute(select(paper_account_closes).where(paper_account_closes.c.account_id == row["id"],
+                paper_account_closes.c.session == session,
+                paper_account_closes.c.baseline_kind == "CLOSE")).mappings().one_or_none()
+            if existing is not None:
+                if existing["input_hash"] == digest:
+                    return int(existing["id"])
+                else:
+                    raise ValueError("Formal close already exists with different immutable inputs.")
+            inserted = conn.execute(paper_account_closes.insert().values(account_id=row["id"], session=session,
+                nav=nav, account_version=int(row["version"]) + 1, closed_at=_utc_naive(closed_at),
+                recorded_at=_utc_naive(recorded_at), source_snapshot_id=source_snapshot_id,
+                input_hash=digest, baseline_kind="CLOSE"))
+            self._update_account(conn, row)
+            return int(inserted.inserted_primary_key[0])
+
+    def process_corporate_actions(self, account_ref: str, *, actions, session: str, at: datetime,
+                                  source_snapshot_id: int | None = None) -> AccountSnapshot:
+        """Post entitlements and confirmed payments with an immutable journal."""
+        actions = tuple(actions)
+        with self.engine.begin() as conn:
+            row = conn.execute(select(paper_accounts).where(paper_accounts.c.environment == self.environment,
+                paper_accounts.c.account_ref == account_ref)).mappings().one()
+            raw = dict(row["positions_json"] or {})
+            positions = self._decode_positions(raw)
+            state = CorporateActionState.from_dict(dict(row["accounting_state_json"] or {}))
+            state = replace(state, quantities={k: v["quantity"] for k, v in positions.items()},
+                            settled_cash=float(row["settled_cash"]))
+            updated = apply_corporate_actions(state, actions, session)
+            if updated == state:
+                return self.get_account(account_ref)
+            cash_change = updated.settled_cash - state.settled_cash
+            receivable_change = updated.dividend_receivable - state.dividend_receivable
+            quantities_delta = {ticker: updated.quantities.get(ticker, 0) - state.quantities.get(ticker, 0)
+                                for ticker in set(updated.quantities) | set(state.quantities)}
+            before_keys = set(state.applied_actions)
+            new_keys = set(updated.applied_actions) - before_keys
+            paid_keys = {item.action_key for item in state.receivables} - {item.action_key for item in updated.receivables}
+            paid_keys.update(action.action_key for action in actions
+                if action.action_key in new_keys and action.action_type == "dividend"
+                and action.payment_date is not None and action.payment_source
+                and str(action.payment_date.date()) <= session
+                and state.quantities.get(action.ticker, 0) > 0 and action.status == "active")
+            event_keys = [(key, "EX_DATE") for key in sorted(new_keys)] + [(key, "PAYMENT") for key in sorted(paid_keys)]
+            # One transaction may contain several actions; financial deltas are
+            # recorded once so the journal can rebuild the account independently.
+            for index, (key, phase) in enumerate(event_keys):
+                revision = updated.applied_actions.get(key, state.applied_actions.get(key, ""))
+                payload = {"account_version": int(row["version"]) + 1,
+                           "source_snapshot_id": source_snapshot_id,
+                           "quantities_delta": quantities_delta if index == 0 else {},
+                           "settled_cash_change": cash_change if index == 0 else 0.0,
+                           "receivable_change": receivable_change if index == 0 else 0.0,
+                           "state_after": updated.to_dict()}
+                conn.execute(paper_account_actions.insert().values(account_id=row["id"], action_key=key,
+                    phase=phase, revision_hash=revision, session=session, payload_json=payload, recorded_at=_utc_naive(at)))
+            next_positions = {}
+            for ticker, quantity in updated.quantities.items():
+                old = positions[ticker]
+                # Splits adjust the stale mark inversely until the session's
+                # raw quote arrives; a dividend leaves the mark unchanged.
+                mark = old["mark_price"] * old["quantity"] / quantity
+                next_positions[ticker] = {"quantity": quantity, "mark_price": mark}
+            pending = float(conn.execute(select(func.coalesce(func.sum(paper_cash_movements.c.amount), 0.0)).where(
+                paper_cash_movements.c.account_id == row["id"], paper_cash_movements.c.status == "PENDING",
+            )).scalar_one())
+            nav = portfolio_nav(quantities=updated.quantities,
+                prices={k: v["mark_price"] for k, v in next_positions.items()}, settled_cash=updated.settled_cash,
+                unsettled_cash=pending, dividend_receivable=updated.dividend_receivable)
+            self._update_account(conn, row, positions_json={**next_positions, "_meta": raw.get("_meta", {})},
+                accounting_state_json=updated.to_dict(), settled_cash=updated.settled_cash,
+                available_cash=updated.settled_cash + pending, nav=nav, updated_at=_utc_naive(at))
+        return self.get_account(account_ref)
 
     def open_order_ids(self, *, paper_cycle_id: int | None = None) -> tuple[str, ...]:
         stmt = select(order_intents.c.client_order_id).where(
@@ -1228,6 +1509,7 @@ class ExecutionRepository(BaseRepository):
         authorized_by: str,
         note: str,
         at: datetime | None = None,
+        reasons: Sequence[str] | None = None,
     ) -> AccountSnapshot:
         if not authorized_by.strip() or not note.strip():
             raise ValueError("Risk recovery requires an operator and explanation.")
@@ -1248,35 +1530,35 @@ class ExecutionRepository(BaseRepository):
             risk_state = str(account["risk_state"])
             if risk_state not in {"DRAWDOWN_HALTED", "DAILY_LOSS_HALTED"}:
                 raise ValueError("Only drawdown or daily-loss halts may be recovered.")
-            incident = conn.execute(
-                select(risk_incidents)
-                .where(
+            selected = set(reasons or (risk_state,))
+            active_reasons = set(account["halt_reasons_json"] or ()) | {risk_state}
+            if not selected or not selected <= {"DRAWDOWN_HALTED", "DAILY_LOSS_HALTED"} or not selected <= active_reasons:
+                raise ValueError("Recovery must explicitly select active financial halt reasons.")
+            risk_state = "DRAWDOWN_HALTED" if "DRAWDOWN_HALTED" in selected else "DAILY_LOSS_HALTED"
+            incidents = {}
+            for selected_reason in sorted(selected):
+                incident = conn.execute(select(risk_incidents).where(
                     risk_incidents.c.environment == self.environment,
                     risk_incidents.c.account_ref == account_ref,
                     risk_incidents.c.strategy_version == account["strategy_version"],
-                    risk_incidents.c.code == risk_state,
+                    risk_incidents.c.code == selected_reason,
                     risk_incidents.c.status == "open",
-                )
-                .order_by(risk_incidents.c.id.desc())
-                .limit(1)
-            ).mappings().one_or_none()
-            if incident is None:
-                raise ValueError("Risk recovery requires the persisted trigger incident.")
-            trigger_session = str(
-                dict(incident["details_json"] or {}).get("valuation_session") or ""
-            )
-            if not trigger_session:
-                raise ValueError("Risk incident is missing its trigger session.")
-            if risk_state == "DRAWDOWN_HALTED":
-                earliest = calendar.next_month_end_session(trigger_session).date()
-                if self._decode_positions(account["positions_json"]):
-                    raise ValueError("Drawdown recovery requires a fully liquidated account.")
-            else:
-                earliest = calendar.next_session(trigger_session).date()
-            if effective_at.astimezone(NEW_YORK).date() < earliest:
-                raise ValueError(
-                    f"Risk recovery is not eligible before {earliest.isoformat()}."
-                )
+                ).order_by(risk_incidents.c.id.desc()).limit(1)).mappings().one_or_none()
+                if incident is None:
+                    raise ValueError("Risk recovery requires the persisted trigger incident.")
+                trigger_session = str(dict(incident["details_json"] or {}).get("valuation_session") or "")
+                if not trigger_session:
+                    raise ValueError("Risk incident is missing its trigger session.")
+                if selected_reason == "DRAWDOWN_HALTED":
+                    earliest = calendar.next_month_end_session(trigger_session).date()
+                    if self._decode_positions(account["positions_json"]):
+                        raise ValueError("Drawdown recovery requires a fully liquidated account.")
+                else:
+                    earliest = calendar.next_session(trigger_session).date()
+                if effective_at.astimezone(NEW_YORK).date() < earliest:
+                    raise ValueError(f"Risk recovery is not eligible before {earliest.isoformat()}.")
+                incidents[selected_reason] = incident
+            incident = incidents[risk_state]
             unfinished = tuple(
                 conn.execute(
                     select(order_intents.c.client_order_id).where(
@@ -1321,15 +1603,23 @@ class ExecutionRepository(BaseRepository):
                 ) from exc
             if reconciled_at.tzinfo is None or reconciled_at.utcoffset() is None:
                 raise ValueError("Risk recovery reconciliation timestamp must be timezone-aware.")
+            if reconciled_at.astimezone(NEW_YORK).date() != effective_at.astimezone(NEW_YORK).date():
+                raise ValueError("Risk recovery requires a same-session reconciliation.")
             if effective_at.astimezone(timezone.utc) < reconciled_at.astimezone(
                 timezone.utc
             ):
                 raise ValueError("Risk recovery cannot predate its reconciliation.")
             if reconciled_at.astimezone(timezone.utc) < _aware_utc(account["updated_at"]):
                 raise ValueError("Risk recovery requires reconciliation of the latest account state.")
+            reconciled_version = dict(reconciliation["details_json"] or {}).get("account_version")
+            if reconciled_version != int(account["version"]):
+                raise ValueError("Risk recovery requires reconciliation of the latest account version.")
+            remaining_reasons = set(account["halt_reasons_json"] or ()) - selected
             account_updates: dict[str, object] = {
-                "risk_state": "NORMAL",
+                "risk_state": risk_state_projection(remaining_reasons, str(account["drift_state"])),
+                "halt_reasons_json": sorted(remaining_reasons),
                 "updated_at": now,
+                "version": int(account["version"]) + 1,
             }
             if risk_state == "DRAWDOWN_HALTED":
                 account_updates["high_water"] = float(account["nav"])
@@ -1337,7 +1627,8 @@ class ExecutionRepository(BaseRepository):
                 paper_accounts.update()
                 .where(
                     paper_accounts.c.id == account["id"],
-                    paper_accounts.c.risk_state == risk_state,
+                    paper_accounts.c.risk_state == account["risk_state"],
+                    paper_accounts.c.version == account["version"],
                 )
                 .values(**account_updates)
             )
@@ -1346,7 +1637,9 @@ class ExecutionRepository(BaseRepository):
             conn.execute(
                 risk_incidents.update()
                 .where(
-                    risk_incidents.c.id == incident["id"],
+                    risk_incidents.c.account_ref == account_ref,
+                    risk_incidents.c.environment == self.environment,
+                    risk_incidents.c.code.in_(selected),
                     risk_incidents.c.status == "open",
                 )
                 .values(

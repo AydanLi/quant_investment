@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Any, Optional
 
 import pandas as pd
+from sqlalchemy.engine import Connection
 
 from storage.repositories.base import BaseRepository
 from storage.schema import orders
@@ -14,7 +15,7 @@ def _opt_float(value: Any) -> Optional[float]:
 
 
 class OrderRepository(BaseRepository):
-    def save(self, run_id: int, order_df: pd.DataFrame) -> None:
+    def save(self, run_id: int, order_df: pd.DataFrame, *, connection: Connection | None = None) -> None:
         """Persist the broker order log. Expects columns
         ``date, ticker, side, weight_change`` (``price``/``est_cost`` optional)."""
         if order_df.empty:
@@ -44,7 +45,7 @@ class OrderRepository(BaseRepository):
                 }
             )
 
-        with self.engine.begin() as conn:
+        with self.transaction(connection) as conn:
             conn.execute(orders.insert(), rows)
 
     def get(self, run_id: int) -> pd.DataFrame:

@@ -7,6 +7,9 @@ import pandas as pd
 
 from config.settings import Config
 from config.universe import CASH_ETF, EligibilityRules
+from data.calendar import NyseCalendar
+from data.models import CorporateAction
+from data.adjustments import locally_adjust_ohlcv
 
 
 class FeatureEngineer:
@@ -17,30 +20,58 @@ class FeatureEngineer:
     def make_price_frame(self) -> pd.DataFrame:
         prices = {}
         for ticker, df in self.data.items():
-            column = "Adjusted Close" if "Adjusted Close" in df.columns else "Close"
-            if column in df.columns:
-                prices[ticker] = df[column]
-        price_df = pd.DataFrame(prices).sort_index().dropna(how="all")
-        if self.config.benchmark in price_df:
-            benchmark_sessions = price_df[self.config.benchmark].dropna().index
-            price_df = price_df.reindex(benchmark_sessions)
+            if "Adjusted Close" in df:
+                prices[ticker] = df["Adjusted Close"]
+            elif ticker == self.config.fear_gauge and "Close" in df:
+                prices[ticker] = df["Close"]
+            elif "Close" in df and "corporate_actions" in df.attrs:
+                prices[ticker] = locally_adjust_ohlcv(df, df.attrs["corporate_actions"])["Adjusted Close"]
+            else:
+                raise ValueError(f"{ticker} signal prices require total-return data or an explicit corporate-action history.")
+        price_df = self._align_calendar(pd.DataFrame(prices).sort_index())
         if price_df.empty:
             raise ValueError("Price frame is empty. Cannot continue.")
+        price_df.attrs["price_basis"] = "total_return"
         return price_df
 
     def make_open_frame(self) -> pd.DataFrame:
         prices = {}
         for ticker, df in self.data.items():
-            if "Adjusted Open" in df.columns:
-                prices[ticker] = df["Adjusted Open"]
-            elif "Open" in df.columns:
+            if "Open" in df.columns:
                 prices[ticker] = df["Open"]
-        result = pd.DataFrame(prices).sort_index()
-        if self.config.benchmark in result:
-            result = result.reindex(result[self.config.benchmark].dropna().index)
+        result = self._align_calendar(pd.DataFrame(prices).sort_index())
         if result.empty:
             raise ValueError("Open-price frame is empty. Cannot continue.")
+        result.attrs["price_basis"] = "raw"
         return result
+
+    def make_raw_close_frame(self) -> pd.DataFrame:
+        result = self._align_calendar(pd.DataFrame({
+            ticker: frame["Close"] for ticker, frame in self.data.items() if "Close" in frame
+        }).sort_index())
+        if result.empty:
+            raise ValueError("Raw Close-price frame is empty. Cannot continue.")
+        result.attrs["price_basis"] = "raw"
+        return result
+
+    def corporate_actions(self) -> tuple[CorporateAction, ...]:
+        actions: dict[str, CorporateAction] = {}
+        for frame in self.data.values():
+            for raw in frame.attrs.get("corporate_actions", ()):
+                action = raw.normalized()
+                previous = actions.get(action.action_key)
+                if previous is not None and previous.revision_hash != action.revision_hash:
+                    raise ValueError(f"Conflicting corporate action revision: {action.action_key}.")
+                actions[action.action_key] = action
+        return tuple(actions.values())
+
+    def _align_calendar(self, frame: pd.DataFrame) -> pd.DataFrame:
+        if frame.empty:
+            return frame
+        benchmark = self.data.get(self.config.benchmark)
+        index = benchmark.index if benchmark is not None and not benchmark.empty else frame.index
+        sessions = NyseCalendar().sessions(index.min(), index.max())
+        return frame.reindex(sessions)
 
     def make_median_dollar_volume_frame(self, window: int = 60) -> pd.DataFrame:
         values = {}
@@ -67,7 +98,9 @@ class FeatureEngineer:
         features["vol_20"] = returns.rolling(20).std() * np.sqrt(252)
         features["ma_50"] = prices.rolling(50).mean()
         features["ma_200"] = prices.rolling(200).mean()
-        features["drawdown_200"] = prices / features["ma_200"] - 1.0
+        features["ma200_deviation"] = prices / features["ma_200"] - 1.0
+        # Historical report compatibility; this is MA deviation, not drawdown.
+        features["drawdown_200"] = features["ma200_deviation"]
         features["universe_eligible"] = self._universe_eligibility(prices)
         return features
 

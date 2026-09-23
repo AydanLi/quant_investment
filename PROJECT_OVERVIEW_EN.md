@@ -2,7 +2,7 @@
 
 Language: [中文](PROJECT_OVERVIEW.md) | English
 
-Last updated: 2026-08-26
+Last updated: 2026-09-22
 
 ## Project Positioning
 
@@ -72,7 +72,8 @@ The research protocol locks the code commit, data snapshot, universe version,
 candidate parameters, cost scenarios, fold dates, benchmarks, and selection
 rules. Admission uses at least five years of training history and 12-month
 outer test windows. Results for all 135 candidates must be retained. A
-`StrategyVersion` can be frozen only after its `AdmissionRun` passes every gate.
+`StrategyVersion` can be frozen only after its `AdmissionRun` passes every gate
+and a human explicitly approves it. Passing research does not start observation.
 
 ### 4. Simulated Execution and Risk Control
 
@@ -97,7 +98,15 @@ earlier than the next trading session.
 | Broker paper | Real quotes, orders, fills, and implementation shortfall | Not integrated |
 | Small live account | USD 10,000 cash account with per-order manual approval | Not admitted; date cannot be determined |
 
-Database evidence as of 2026-08-26:
+The remediation separates total-return signals from raw-price accounting and
+adds dividend receivables, official closing baselines, and frozen runtime identity.
+Continuous outer accounts validate the selection procedure, not an equivalent
+independent holdout return for the final fixed strategy. See the
+[remediation record](docs/remediation_status_en.md). External data, historical
+universe, new samples, and broker evidence remain separate gates;
+`CURRENT_UNIVERSE_BACKCAST` remains in effect.
+
+Database evidence rechecked read-only on 2026-09-22:
 
 - Five data snapshots, all `BLOCKED`.
 - Two narrow XLF 2016 event decisions cover 2,640 derivative blocking issues.
@@ -142,7 +151,7 @@ Resolve data blocks
   -> manually approve the UniverseVersion
   -> freeze the research protocol and run all 135 candidates
   -> AdmissionRun: ADMITTED or REJECTED
-  -> only ADMITTED may freeze a StrategyVersion
+  -> explicitly approve and freeze an ADMITTED StrategyVersion
   -> start the prospective local replay clock
   -> at least 12 months / 12 rebalances / 30 broker-paper fills
   -> then evaluate a USD 10,000 manually approved live account

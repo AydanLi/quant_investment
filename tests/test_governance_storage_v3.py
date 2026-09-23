@@ -6,6 +6,8 @@ import pytest
 from sqlalchemy import func, select
 
 from config.settings import Config
+from data.models import DATA_QUALITY_MODEL_VERSION
+from research.runtime import build_runtime_manifest, capture_code_identity, canonical_hash, config_payload
 from config.universe import EligibilityRules, INITIAL_ETF_UNIVERSE, UniverseVersion
 from execution.models import (
     BrokerEnvironment,
@@ -61,6 +63,7 @@ def _strategy_draft(engine):
                     status="TRUSTED",
                     decision_set_hash=None,
                     quality_json={
+                        "quality_model_version": DATA_QUALITY_MODEL_VERSION,
                         "status": "TRUSTED",
                         "primary_source": "fixture",
                         "secondary_source": "check",
@@ -76,14 +79,22 @@ def _strategy_draft(engine):
     repository.create_strategy_version(
         version="SV-001",
         universe_version="UV-001",
-        protocol={"hash": "one"},
+        protocol={"hash": "one", "base_config": config_payload(Config(strategy_version="SV-001"))},
         dataset_snapshot_id=snapshot_id,
-        code_commit="a" * 40,
+        code_commit=capture_code_identity()["code_commit"],
     )
     return repository, snapshot_id
 
 
 def _admit_and_freeze(repository):
+    with repository.engine.connect() as connection:
+        strategy = connection.execute(select(strategy_versions).where(
+            strategy_versions.c.version == "SV-001")).mappings().one()
+    manifest = build_runtime_manifest(
+        Config(strategy_version="SV-001"), code_identity=capture_code_identity(),
+        research_cutoff="2026-07-17", dataset_snapshot_id=int(strategy["dataset_snapshot_id"]),
+        protocol_hash=canonical_hash(strategy["protocol_json"]),
+    )
     admission_id = repository.start_admission(
         strategy_version="SV-001",
         methodology="nested_expanding_v3",
@@ -106,10 +117,22 @@ def _admit_and_freeze(repository):
             "selection_uses_future_holdout": False,
             "admitted": True,
             "gates": {"historical": True},
+            "runtime_manifest": manifest.to_dict(),
+            "runtime_hash": manifest.runtime_hash,
         },
     )
-    repository.freeze_strategy_version("SV-001", admission_run_id=admission_id)
+    repository.freeze_strategy_version("SV-001", admission_run_id=admission_id, approved_by="reviewer")
     return admission_id
+
+
+def test_config_cannot_claim_point_in_time_universe_without_approved_evidence():
+    repository, snapshot_id = _strategy_draft(_engine())
+    with pytest.raises(ValueError, match="Historical universe integrity"):
+        repository.create_strategy_version(
+            version="SV-UNVERIFIED-PIT", universe_version="UV-001",
+            protocol={"base_config": config_payload(Config(historical_universe_integrity=True))},
+            dataset_snapshot_id=snapshot_id, code_commit=capture_code_identity()["code_commit"],
+        )
 
 
 def test_universe_strategy_and_admission_lifecycle_is_fail_closed():
@@ -147,6 +170,7 @@ def test_universe_strategy_and_admission_lifecycle_is_fail_closed():
                     status="TRUSTED",
                     decision_set_hash=None,
                     quality_json={
+                        "quality_model_version": DATA_QUALITY_MODEL_VERSION,
                         "status": "TRUSTED",
                         "primary_source": "fixture",
                         "secondary_source": "check",
@@ -162,12 +186,12 @@ def test_universe_strategy_and_admission_lifecycle_is_fail_closed():
     repository.create_strategy_version(
         version="SV-001",
         universe_version="UV-001",
-        protocol={"hash": "one"},
+        protocol={"hash": "one", "base_config": config_payload(Config(strategy_version="SV-001"))},
         dataset_snapshot_id=snapshot_id,
-        code_commit="a" * 40,
+        code_commit=capture_code_identity()["code_commit"],
     )
     with pytest.raises(ValueError, match="AdmissionRun"):
-        repository.freeze_strategy_version("SV-001")
+        repository.freeze_strategy_version("SV-001", approved_by="reviewer")
     admission_id = _admit_and_freeze(repository)
     with pytest.raises(ValueError, match="immutable"):
         repository.create_strategy_version(
@@ -175,7 +199,7 @@ def test_universe_strategy_and_admission_lifecycle_is_fail_closed():
             universe_version="UV-001",
             protocol={"hash": "changed"},
             dataset_snapshot_id=snapshot_id,
-            code_commit="a" * 40,
+            code_commit=capture_code_identity()["code_commit"],
         )
     assert repository.is_universe_approved("UV-001") is True
     assert repository.is_strategy_frozen("SV-001") is True

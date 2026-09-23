@@ -4,12 +4,18 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import math
 from typing import Any, Mapping, Optional
 
 import pandas as pd
 from sqlalchemy import delete, select
+from sqlalchemy.engine import Connection
 
+from config.settings import Config
+from data.models import DATA_QUALITY_MODEL_VERSION
+from research.runtime import FrozenRuntimeManifest, assert_runtime_matches
 from storage.repositories.base import BaseRepository
+from storage.repositories.governance import GovernanceRepository
 from storage.schema import (
     admission_runs,
     dataset_snapshots,
@@ -75,6 +81,21 @@ def _opt_float(value: Any) -> Optional[float]:
     return float(value) if value is not None and pd.notna(value) else None
 
 
+def _summary_json(value: Any) -> Any:
+    """Persist unavailable metrics as JSON null, never non-standard NaN tokens."""
+    if isinstance(value, Mapping):
+        return {str(key): _summary_json(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_summary_json(item) for item in value]
+    if hasattr(value, "item"):
+        value = value.item()
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if value is pd.NA:
+        return None
+    return value
+
+
 class ExperimentRepository(BaseRepository):
     def save_run(
         self,
@@ -91,6 +112,7 @@ class ExperimentRepository(BaseRepository):
         strategy_version: str | None = None,
         admissible: bool = False,
         invalidated_reason: str | None = None,
+        connection: Connection | None = None,
     ) -> int:
         """Insert one experiment_runs row; returns the new run id."""
         config_dict, config_hash = serialize_config(config)
@@ -118,15 +140,17 @@ class ExperimentRepository(BaseRepository):
             "strategy_version": strategy_version,
             "admissible": 0,
             "invalidated_reason": invalidated_reason,
+            "summary_json": _summary_json(summary.to_dict()),
         }
         for field in _PROMOTED_CONFIG_FIELDS:
             values[field] = config_dict.get(field)
         for label, column in _SUMMARY_TO_COLUMN.items():
             values[column] = _opt_float(summary.get(label))
 
-        with self.engine.begin() as conn:
+        with self.transaction(connection) as conn:
             derived_admissible, governance_reason = self._derive_admissibility(
                 conn,
+                config=config,
                 dataset_snapshot_id=dataset_snapshot_id,
                 universe_version=universe_version,
                 strategy_version=strategy_version,
@@ -136,6 +160,9 @@ class ExperimentRepository(BaseRepository):
                 and status == "complete"
                 and frequency not in {"D", "W"}
             )
+            if derived_admissible:
+                values["runtime_hash"] = conn.scalar(select(strategy_versions.c.runtime_hash).where(
+                    strategy_versions.c.version == strategy_version))
             if not values["admissible"] and governance_reason:
                 values["invalidated_reason"] = invalidated_reason or governance_reason
                 if status == "complete":
@@ -169,6 +196,7 @@ class ExperimentRepository(BaseRepository):
     def _derive_admissibility(
         conn,
         *,
+        config: Any,
         dataset_snapshot_id: int | None,
         universe_version: str | None,
         strategy_version: str | None,
@@ -183,15 +211,9 @@ class ExperimentRepository(BaseRepository):
         if snapshot is None:
             return False, "Dataset snapshot does not exist."
         quality = snapshot["quality_json"] or {}
-        if (
-            snapshot["status"]
-            not in {"TRUSTED", "WARNING", "TRUSTED_WITH_EXCEPTIONS"}
-            or quality.get("stale_sessions") != 0
-            or (
-                snapshot["status"] == "TRUSTED_WITH_EXCEPTIONS"
-                and not snapshot["decision_set_hash"]
-            )
-        ):
+        if quality.get("quality_model_version") != DATA_QUALITY_MODEL_VERSION:
+            return False, "Dataset snapshot requires requalification under the current quality model."
+        if not GovernanceRepository._snapshot_is_actionable(snapshot):
             return False, "Dataset snapshot is not actionable."
         if not universe_version:
             return False, "Universe version is missing."
@@ -211,11 +233,25 @@ class ExperimentRepository(BaseRepository):
         ).mappings().one_or_none()
         if strategy is None or strategy["status"] != "frozen":
             return False, "Strategy version is not frozen."
-        if (
-            strategy["universe_version"] != universe_version
-            or int(strategy["dataset_snapshot_id"]) != int(dataset_snapshot_id)
-        ):
-            return False, "Experiment references do not match the frozen strategy."
+        if not str(strategy["approved_by"] or "").strip() or not strategy["approved_at"]:
+            return False, "Strategy version requires explicit human approval."
+        if strategy["universe_version"] != universe_version:
+            return False, "Experiment universe does not match the frozen strategy."
+        # New daily snapshots may advance; the research dataset bound inside
+        # the manifest remains immutable. Old records cannot acquire a signature.
+        if not strategy["runtime_manifest_json"] or not strategy["runtime_hash"]:
+            return False, "Frozen runtime manifest is missing; legacy approval is unverified."
+        try:
+            manifest = FrozenRuntimeManifest.from_dict(strategy["runtime_manifest_json"])
+            actual_config = config if isinstance(config, Config) else Config(**dict(config))
+            assert_runtime_matches(actual_config, manifest)
+            if (manifest.runtime_hash != strategy["runtime_hash"]
+                    or manifest.dataset_snapshot_id != strategy["dataset_snapshot_id"]
+                    or actual_config.strategy_version != strategy_version
+                    or actual_config.universe_version != universe_version):
+                return False, "Frozen runtime references do not match the experiment."
+        except (TypeError, ValueError) as exc:
+            return False, f"Frozen runtime verification failed: {exc}"
         admitted = conn.execute(
             select(admission_runs.c.id)
             .where(
@@ -223,6 +259,7 @@ class ExperimentRepository(BaseRepository):
                 admission_runs.c.status == "admitted",
                 admission_runs.c.completed_at.is_not(None),
                 admission_runs.c.selection_uses_future_holdout == 0,
+                admission_runs.c.runtime_hash == manifest.runtime_hash,
             )
             .limit(1)
         ).scalar_one_or_none()

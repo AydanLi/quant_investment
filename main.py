@@ -42,6 +42,8 @@ def run_backtest() -> None:
         strategy=strategy,
         risk_engine=risk_engine,
         execution_prices=execution_prices,
+        raw_close_prices=fe.make_raw_close_frame(),
+        corporate_actions=fe.corporate_actions(),
         median_dollar_volume=median_dollar_volume,
     )
     results = bt.run()
@@ -58,6 +60,7 @@ def run_backtest() -> None:
     summary = reporter.summarize(
         portfolio,
         risk_free_returns=risk_free,
+        risk_free_source="FRED DGS3MO",
         benchmark_returns=build_benchmark_returns(prices),
         orders=orders,
         asset_returns=returns,

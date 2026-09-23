@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 from inspect import signature
 import json
 from pathlib import Path
@@ -16,15 +17,17 @@ if __package__ in {None, ""}:
 
 from config.settings import Config
 from data.adjustments import locally_adjust_ohlcv
+from data.models import DATA_QUALITY_MODEL_VERSION
 from data.quality import raw_market_data_hash
 from research.admission_service import build_nested_admission_payload
-from research.core_evaluator import CoreStrategyEvaluator
+from research.core_evaluator import CoreStrategyEvaluator, METRIC_POLICY
 from research.nested_walk_forward import (
     NestedExpandingAdmissionRunner,
     fixed_current_baseline_candidate,
     historical_admission_gates,
 )
 from research.protocol import ResearchProtocol, build_protocol
+from research.runtime import build_runtime_manifest
 from storage.db import create_db_engine
 from storage.repositories.governance import GovernanceRepository
 from storage.repositories.trusted_data import TrustedMarketDataRepository
@@ -55,12 +58,7 @@ def _jsonable(value: object) -> object:
 def load_protocol(path: Path) -> ResearchProtocol:
     payload = json.loads(path.read_text(encoding="utf-8"))
     stored_hash = str(payload.pop("content_hash", ""))
-    protocol = build_protocol(
-        protocol_version=str(payload.get("protocol_version", "")),
-        code_commit=str(payload.get("code_commit", "")),
-        dataset_snapshot_id=int(payload.get("dataset_snapshot_id", 0)),
-        universe_version=str(payload.get("universe_version", "")),
-    )
+    protocol = ResearchProtocol.from_dict(payload)
     expected = json.loads(json.dumps(protocol.to_dict(), sort_keys=True))
     if payload != expected or stored_hash != protocol.content_hash:
         raise ValueError("Protocol content or hash does not match the fixed 135-candidate protocol.")
@@ -91,6 +89,8 @@ def load_immutable_snapshot(
     if not snapshot.content_hash:
         raise ValueError("Admission requires an immutable snapshot content hash.")
     quality = dict(snapshot.quality_json or {})
+    if quality.get("quality_model_version") != DATA_QUALITY_MODEL_VERSION:
+        raise ValueError("Admission requires a newly audited current-quality snapshot; legacy reports cannot be reused.")
     if quality.get("stale_sessions") != 0:
         raise ValueError("Core admission requires a zero-staleness dataset snapshot.")
     if quality.get("content_hash") != snapshot.content_hash:
@@ -218,6 +218,7 @@ def _trial_cache(
             raise ValueError("Persisted admission trial has malformed fold data.")
         saved = dict(folds[0])
         cache[(str(row["stage"]), str(row["fold_key"]), str(row["label"]))] = {
+            "protocol_hash": saved.get("protocol_hash"),
             "status": str(saved.get("status", row["status"])),
             "metrics": saved.get("metrics"),
             **({"error": saved["error"]} if "error" in saved else {}),
@@ -318,6 +319,10 @@ def _replacement_hurdle_metrics(
         else float("nan")
     )
     baseline_worst_drawdown = float(min(baseline_drawdowns))
+    continuous = result.get("continuous_outer_metrics", {})
+    if continuous:
+        candidate_worst_drawdown = float(continuous["outer_evaluation/7.0"]["max_drawdown"])
+        baseline_worst_drawdown = float(continuous["replacement_baseline/7.0"]["max_drawdown"])
     baseline_drawdown_depth = abs(baseline_worst_drawdown)
     drawdown_improvement = (
         (baseline_drawdown_depth - abs(candidate_worst_drawdown))
@@ -351,6 +356,7 @@ def execute_core_admission(
 ) -> dict[str, object]:
     if not strategy_version.strip():
         raise ValueError("strategy_version is required.")
+    protocol.validate_runtime()
     _governance_call(
         repository,
         "create_strategy_version",
@@ -382,17 +388,6 @@ def execute_core_admission(
                 raise ValueError(
                     "Terminal AdmissionRun lacks mandatory fixed-baseline evidence."
                 )
-            _governance_call(
-                repository,
-                "freeze_strategy_version",
-                version=strategy_version,
-                admission_run_id=int(existing["id"]),
-            )
-            _governance_call(
-                repository,
-                "start_local_sim_clock",
-                version=strategy_version,
-            )
         return {
             "admission_run_id": int(existing["id"]),
             "strategy_version": strategy_version,
@@ -400,6 +395,7 @@ def execute_core_admission(
             "final_selected_label": stored.get("final_selected_label"),
             "gates": stored.get("gates", {}),
             "reused_terminal_run": True,
+            "strategy_approval": "SEPARATE_MANUAL_STEP",
         }
 
     admission_run_id = _start_admission(
@@ -420,6 +416,7 @@ def execute_core_admission(
             folds=[
                 {
                     "cost_bps": trial["cost_bps"],
+                    "protocol_hash": protocol.content_hash,
                     "status": trial["status"],
                     "metrics": trial["metrics"],
                     **({"error": trial["error"]} if "error" in trial else {}),
@@ -431,7 +428,7 @@ def execute_core_admission(
 
     runner = NestedExpandingAdmissionRunner(
         protocol,
-        evaluator or CoreStrategyEvaluator(Config()),
+        evaluator or CoreStrategyEvaluator(protocol.make_base_config()),
         trial_callback=persist_trial,
         trial_cache=_trial_cache(repository, admission_run_id),
     )
@@ -440,6 +437,27 @@ def execute_core_admission(
         raw_result = runner.run(data)
         replacement = _replacement_hurdle_metrics(raw_result, protocol)
         result = {**raw_result, "replacement_comparison": replacement}
+        selected_candidate = next(candidate for candidate in protocol.candidates
+                                  if candidate.label == result["final_selected_label"])
+        from research.protocol import apply_candidate
+        frozen_config = replace(apply_candidate(protocol.make_base_config(), selected_candidate),
+                                strategy_version=strategy_version,
+                                universe_version=protocol.universe_version)
+        observed = [frame.index.max() for frame in data.values() if not frame.empty]
+        cutoff = max(observed) if observed else max(
+            item["fold"]["validation_end"] for item in result["outer_folds"]
+        )
+        manifest = build_runtime_manifest(
+            frozen_config, code_identity=protocol.code_identity,
+            research_cutoff=str(pd.Timestamp(cutoff).date()),
+            dataset_snapshot_id=protocol.dataset_snapshot_id,
+            protocol_hash=protocol.content_hash, selected_label=selected_candidate.label,
+        )
+        result.update(runtime_manifest=manifest.to_dict(), runtime_hash=manifest.runtime_hash,
+                      metric_policy=METRIC_POLICY,
+                      evidence_role="research_selector",
+                      deployment_policy="fixed_parameters_until_manually_approved_new_version",
+                      final_candidate_independent_oos=False)
         outer_results = list(result["outer_folds"])
         robustness = result["robustness"]
         gates = historical_admission_gates(
@@ -459,6 +477,11 @@ def execute_core_admission(
                 replacement["drawdown_improvement"]
             ),
         )
+        gates["continuous_outer_account"] = result.get("continuous_outer_account") is True
+        gates["confirmed_cash_flows"] = all(
+            item.get("confirmed_cash_flows", False) is True
+            for item in result.get("continuous_outer_metrics", {}).values()
+        ) and bool(result.get("continuous_outer_metrics"))
         payload, final_trials, admitted = build_nested_admission_payload(
             result=result,
             gates=gates,
@@ -483,24 +506,13 @@ def execute_core_admission(
             results=_jsonable(payload),
         )
         finished = True
-        if admitted:
-            _governance_call(
-                repository,
-                "freeze_strategy_version",
-                version=strategy_version,
-                admission_run_id=admission_run_id,
-            )
-            _governance_call(
-                repository,
-                "start_local_sim_clock",
-                version=strategy_version,
-            )
         return {
             "admission_run_id": admission_run_id,
             "strategy_version": strategy_version,
             "status": "ADMITTED" if admitted else "REJECTED",
             "final_selected_label": result["final_selected_label"],
             "gates": gates,
+            "strategy_approval": "SEPARATE_MANUAL_STEP",
         }
     except Exception as exc:
         if not finished:

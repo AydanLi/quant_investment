@@ -77,6 +77,7 @@ def test_feature_eligibility_is_frozen_by_quarter_without_history_backfill():
         index=sessions,
     )
     engineer = FeatureEngineer({"SPY": frame}, Config(universe=["SPY"]))
+    frame.attrs["corporate_actions"] = ()
     prices = engineer.make_price_frame()
     eligibility = engineer._universe_eligibility(prices)["SPY"]
 

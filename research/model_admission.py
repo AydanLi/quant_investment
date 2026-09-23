@@ -35,7 +35,7 @@ def performance_metrics(portfolio: pd.DataFrame) -> PerformanceMetrics:
     if portfolio.empty:
         raise ValueError("Cannot calculate metrics for an empty portfolio.")
     returns = portfolio["daily_return"].dropna().astype(float)
-    equity = (1.0 + returns).cumprod()
+    equity = pd.concat([pd.Series([1.0]), (1.0 + returns).cumprod().reset_index(drop=True)], ignore_index=True)
     return PerformanceMetrics(
         sharpe=sharpe_ratio(returns),
         max_drawdown=max_drawdown(equity),

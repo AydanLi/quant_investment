@@ -22,11 +22,16 @@ from execution.models import (
     Side,
 )
 from execution.oms import OrderManagementSystem, reconcile_account
+from execution.budget import price_order
+from execution.validation import finite_number
 from execution.pretrade import PreTradeVerification
 from services.models import PaperCycleStatus, SignalDecision, StoredSignalDecision
 from services.pushover import send_pushover
 from storage.repositories.execution import ExecutionRepository
 from storage.repositories.signals import SignalRepository
+from storage.repositories.governance import GovernanceRepository
+from storage.repositories.trusted_data import TrustedMarketDataRepository
+from research.runtime import assert_runtime_matches
 
 
 NEW_YORK = ZoneInfo("America/New_York")
@@ -67,6 +72,11 @@ def _account_payload(account: AccountSnapshot) -> dict[str, object]:
         "total_commission": account.total_commission,
         "last_valuation_session": account.last_valuation_session,
         "captured_at": account.captured_at.isoformat(),
+        "version": account.version,
+        "accounting_state": dict(account.accounting_state),
+        "dividend_receivable": account.dividend_receivable,
+        "halt_reasons": list(account.halt_reasons),
+        "drift_state": account.drift_state,
     }
 
 
@@ -99,6 +109,42 @@ class PaperCycle:
         self.notifier = notifier
         self.calendar = calendar or NyseCalendar()
 
+    @staticmethod
+    def _liquidation_allowed(account: AccountSnapshot) -> bool:
+        reasons = set(account.halt_reasons) | {account.risk_state}
+        return "DRAWDOWN_HALTED" in reasons and "RECONCILIATION_HALTED" not in reasons
+
+    def _assert_runtime(self, decision: SignalDecision) -> None:
+        manifest = GovernanceRepository(engine=self.execution.engine).load_frozen_runtime(decision.strategy_version)
+        assert_runtime_matches(self.config, manifest)
+        if decision.runtime_hash != manifest.runtime_hash:
+            raise ValueError("Decision runtime identity does not match the frozen execution policy.")
+
+    def _preflight_open(self, stored, intents, account, prices, at, *, source_snapshot_id, order_type="REPLAY_OPEN"):
+        """Validate the remaining basket before any simulated order is submitted."""
+        fills = {}
+        cash = account.available_cash
+        for intent in sorted(intents, key=lambda item: item.side == Side.BUY):
+            if intent.state == OrderState.FILLED:
+                continue
+            if intent.state not in {OrderState.APPROVED, OrderState.SUBMITTED, OrderState.PARTIAL}:
+                raise ValueError("Every remaining replay order must be approved and executable.")
+            if intent.ticker not in prices:
+                raise ValueError(f"Missing open for order {intent.ticker}.")
+            planned = price_order(self.config, ticker=intent.ticker, side=intent.side.value,
+                                  quantity=intent.remaining_quantity, reference_price=prices[intent.ticker],
+                                  risk_off=stored.decision.regime == "risk_off",
+                                  impact_bps=intent.estimated_impact_bps)
+            cash += planned.signed_cash_flow
+            if cash < -1e-6:
+                self._record_incident(stored, code="OPEN_BUDGET_EXCEEDED", severity="HIGH",
+                                      details={"ticker": intent.ticker, "cash_shortfall": -cash})
+                raise ValueError("Open replay basket exceeds available cash; no new fills were applied.")
+            fills[intent.client_order_id] = planned
+        self.execution.freeze_replay_inputs(stored.paper_cycle_id, account=account,
+                                            order_type=order_type, prices=prices, at=at, source_snapshot_id=source_snapshot_id)
+        return fills
+
     def initialize_account(
         self,
         *,
@@ -106,8 +152,14 @@ class PaperCycle:
         initial_cash: float | None = None,
         at: datetime | None = None,
     ) -> AccountSnapshot:
+        governance = GovernanceRepository(engine=self.execution.engine)
+        manifest = governance.load_frozen_runtime(strategy_version)
+        assert_runtime_matches(self.config, manifest)
+        # Starting the account is the explicit operational action that starts
+        # observation; research admission and human freezing do not start it.
+        governance.start_local_sim_clock(strategy_version)
         self.signals.assert_local_sim_ready(strategy_version)
-        return self.execution.initialize_account(
+        account = self.execution.initialize_account(
             account_ref=self.account_ref,
             strategy_version=strategy_version,
             initial_cash=float(
@@ -115,6 +167,35 @@ class PaperCycle:
             ),
             at=at,
         )
+        governance.start_validation_run(
+            strategy_version, account_ref=self.account_ref,
+            environment="PAPER", execution_model="REPLAY_OPEN",
+        )
+        return account
+
+    def process_actions(self, *, session: str, at: datetime, source_snapshot_id: int,
+                        require_current_coverage: bool = True) -> AccountSnapshot:
+        if require_current_coverage:
+            self.execution.verify_execution_snapshot(source_snapshot_id, session=session,
+                tickers=self.execution.get_account(self.account_ref).positions)
+        payload = TrustedMarketDataRepository(engine=self.execution.engine).load_snapshot(source_snapshot_id)
+        return self.execution.process_corporate_actions(
+            self.account_ref, actions=payload.actions, session=session, at=at,
+            source_snapshot_id=source_snapshot_id,
+        )
+
+    def record_close(self, *, session: str, prices: Mapping[str, float], at: datetime,
+                     source_snapshot_id: int | None = None) -> int:
+        prices = {ticker: finite_number(value, f"{ticker} close", positive=True) for ticker, value in prices.items()}
+        account = self.execution.get_account(self.account_ref)
+        if account.positions:
+            self.execution.verify_execution_snapshot(source_snapshot_id, session=session,
+                tickers=account.positions, closes=prices, known_at=at)
+        if source_snapshot_id is not None:
+            self.process_actions(session=session, at=at, source_snapshot_id=source_snapshot_id)
+        self.value_account(prices=prices, valuation_session=session, at=at)
+        return self.execution.record_session_close(self.account_ref, session=session, prices=prices,
+            recorded_at=at, source_snapshot_id=source_snapshot_id)
 
     def persist_decision(
         self,
@@ -122,6 +203,7 @@ class PaperCycle:
         *,
         recorded_at: datetime | None = None,
     ) -> StoredSignalDecision:
+        self._assert_runtime(decision)
         self.signals.assert_local_sim_ready(
             decision.strategy_version,
             universe_version=decision.universe_version,
@@ -287,7 +369,7 @@ class PaperCycle:
         if not operator or not explanation:
             raise ValueError("Liquidation redraft requires an operator and explanation.")
         account = self.execution.get_account(self.account_ref)
-        if account.risk_state != "DRAWDOWN_HALTED":
+        if not self._liquidation_allowed(account):
             raise ValueError("Only DRAWDOWN_HALTED may redraft liquidation orders.")
         existing = tuple(
             intent
@@ -359,7 +441,7 @@ class PaperCycle:
             ),
             at=at,
         )
-        if account.risk_state == "DRAWDOWN_HALTED":
+        if self._liquidation_allowed(account):
             self._create_liquidation_drafts(
                 stored, account=account, prices=prices, at=at
             )
@@ -421,9 +503,13 @@ class PaperCycle:
         reference_prices: Mapping[str, float],
         median_daily_dollar_volume: Mapping[str, float],
         verified_at: datetime,
+        source_snapshot_id: int | None = None,
     ) -> tuple[str, ...]:
         stored = self.signals.get_stored_decision(decision_id)
         now = _aware(verified_at)
+        self._assert_runtime(stored.decision)
+        if stored.cycle_status == PaperCycleStatus.DRAFTED:
+            return tuple(item.client_order_id for item in self.execution.list_intents(paper_cycle_id=stored.paper_cycle_id))
         if stored.cycle_status == PaperCycleStatus.MISSED:
             raise ValueError("Paper cycle is MISSED and cannot create orders.")
         if now.astimezone(timezone.utc) >= stored.approval_deadline.astimezone(timezone.utc):
@@ -431,6 +517,10 @@ class PaperCycle:
             raise ValueError("REPLAY_OPEN draft deadline is 09:25 ET.")
         if now.astimezone(NEW_YORK).date().isoformat() != stored.decision.next_rebalance_session:
             raise ValueError("Draft must be created on the T+1 execution session.")
+        source_snapshot_id = source_snapshot_id or stored.decision.dataset_snapshot_id
+        self.execution.verify_known_snapshot(source_snapshot_id, known_at=now)
+        self.process_actions(session=stored.decision.next_rebalance_session, at=now,
+            source_snapshot_id=source_snapshot_id, require_current_coverage=False)
         account = self.execution.settle_due(
             self.account_ref,
             session=stored.decision.next_rebalance_session,
@@ -440,10 +530,11 @@ class PaperCycle:
             account, _trigger, _trigger_value, _incident_id = self.execution.mark_account(
                 self.account_ref,
                 prices=reference_prices,
-                valuation_session=stored.decision.signal_session,
+                valuation_session=stored.decision.next_rebalance_session,
                 at=now,
                 drawdown_limit=self.config.portfolio_drawdown_stop,
                 daily_loss_limit=self.config.daily_loss_halt,
+            config=self.config,
                 paper_cycle_id=stored.paper_cycle_id,
             )
         except Exception as exc:
@@ -458,9 +549,6 @@ class PaperCycle:
         if account.risk_state not in {"NORMAL", "WARNING", "DRIFT_REVIEW"}:
             self._halt_cycle(stored, account=account, prices=reference_prices, at=now)
             raise ValueError("Paper account is risk halted.")
-        self.execution.save_cycle_baseline(
-            account=account, paper_cycle_id=stored.paper_cycle_id
-        )
         quotes = {
             ticker: Quote(ticker, float(price), float(price), now)
             for ticker, price in reference_prices.items()
@@ -550,7 +638,7 @@ class PaperCycle:
         if stored.cycle_status != PaperCycleStatus.HALTED:
             raise ValueError("Risk liquidation requires a HALTED paper cycle.")
         account = self.execution.get_account(self.account_ref)
-        if account.risk_state != "DRAWDOWN_HALTED":
+        if not self._liquidation_allowed(account):
             raise ValueError("Only DRAWDOWN_HALTED may approve liquidation orders.")
         operator = approved_by.strip()
         if not operator:
@@ -646,13 +734,14 @@ class PaperCycle:
         *,
         open_prices: Mapping[str, float],
         published_at: datetime,
+        source_snapshot_id: int | None = None,
     ) -> PaperCycleResult:
         """Replay an approved drawdown liquidation at its T+1 raw open."""
         stored = self.signals.get_stored_decision(decision_id)
         if stored.cycle_status != PaperCycleStatus.HALTED:
             raise ValueError("Risk liquidation requires a HALTED paper cycle.")
         account = self.execution.get_account(self.account_ref)
-        if account.risk_state != "DRAWDOWN_HALTED":
+        if not self._liquidation_allowed(account):
             raise ValueError("Only DRAWDOWN_HALTED may materialize liquidation.")
         intents = tuple(
             intent
@@ -702,6 +791,12 @@ class PaperCycle:
                 "Missing or invalid liquidation opens: "
                 + ", ".join(sorted(set(missing + invalid)))
             )
+        self._assert_runtime(stored.decision)
+        self.execution.verify_execution_snapshot(source_snapshot_id, session=execution_session,
+            tickers={item.ticker for item in intents}, opens=open_prices)
+        self.execution.verify_frozen_replay_inputs(stored.paper_cycle_id,
+            order_type="REPLAY_OPEN_LIQUIDATION", prices=open_prices, source_snapshot_id=source_snapshot_id)
+        self.process_actions(session=execution_session, at=now, source_snapshot_id=source_snapshot_id)
         account = self.execution.settle_due(
             self.account_ref, session=execution_session, settled_at=now
         )
@@ -712,6 +807,7 @@ class PaperCycle:
             at=now,
             drawdown_limit=self.config.portfolio_drawdown_stop,
             daily_loss_limit=self.config.daily_loss_halt,
+            config=self.config,
             paper_cycle_id=stored.paper_cycle_id,
         )
         quotes = {
@@ -724,6 +820,8 @@ class PaperCycle:
             InMemoryPaperBroker(account, quotes),
             repository=self.execution,
         )
+        planned_fills = self._preflight_open(stored, intents, account, open_prices, now,
+            source_snapshot_id=source_snapshot_id, order_type="REPLAY_OPEN_LIQUIDATION")
         settlement_date = str(
             self.calendar.next_session(pd.Timestamp(execution_session)).date()
         )
@@ -736,10 +834,10 @@ class PaperCycle:
             if intent.state not in {OrderState.SUBMITTED, OrderState.PARTIAL}:
                 raise ValueError("Liquidation order is not in an executable state.")
             quantity = intent.remaining_quantity
-            raw_open = float(open_prices[intent.ticker])
-            directional_bps = self.config.slippage_bps + intent.estimated_impact_bps
-            price = raw_open * (1.0 - directional_bps / 10_000.0)
-            commission = quantity * price * self.config.trading_cost_bps / 10_000.0
+            planned = planned_fills[intent.client_order_id]
+            price = planned.price
+            commission = planned.commission
+            directional_bps = (planned.slippage + planned.impact) / (quantity * planned.reference_price) * 10000
             execution_key = sha256(
                 f"{intent.client_order_id}|{quantity:.12f}|{price:.12f}".encode(
                     "utf-8"
@@ -786,18 +884,27 @@ class PaperCycle:
         *,
         open_prices: Mapping[str, float],
         published_at: datetime,
+        source_snapshot_id: int | None = None,
     ) -> PaperCycleResult:
         stored = self.signals.get_stored_decision(decision_id)
         now = _aware(published_at)
+        self._assert_runtime(stored.decision)
         local = now.astimezone(NEW_YORK)
         if local.date().isoformat() != stored.decision.next_rebalance_session:
             raise ValueError("Open prices belong to the wrong execution session.")
         if local.time().replace(tzinfo=None) < time(9, 30):
             raise ValueError("Open prices cannot be materialized before 09:30 ET.")
+        required = (set(stored.decision.target_weights) | set(self.execution.get_account(self.account_ref).positions)) - {self.config.synthetic_cash_asset}
+        self.execution.verify_execution_snapshot(source_snapshot_id, session=stored.decision.next_rebalance_session,
+            tickers=required, opens=open_prices)
+        self.execution.verify_frozen_replay_inputs(stored.paper_cycle_id,
+            order_type="REPLAY_OPEN", prices=open_prices, source_snapshot_id=source_snapshot_id)
         if stored.cycle_status == PaperCycleStatus.HALTED:
             account = self.execution.get_account(self.account_ref)
             return self._halt_cycle(stored, account=account, prices=open_prices, at=now)
         if stored.cycle_status == PaperCycleStatus.COMPLETED:
+            self._preflight_open(stored, self.execution.list_intents(paper_cycle_id=stored.paper_cycle_id),
+                self.execution.get_account(self.account_ref), open_prices, now, source_snapshot_id=source_snapshot_id)
             account, reconciliation_id, matched = self._reconcile_cycle(
                 stored, mark_prices=open_prices, at=now
             )
@@ -829,9 +936,14 @@ class PaperCycle:
             PaperCycleStatus.RECONCILED,
         }:
             raise ValueError("Paper cycle must be approved before open replay.")
+        open_prices = {ticker: finite_number(value, f"{ticker} open", positive=True)
+                       for ticker, value in open_prices.items()}
         invalid = [ticker for ticker, value in open_prices.items() if float(value) <= 0.0]
         if invalid:
             raise ValueError(f"Invalid open prices: {', '.join(sorted(invalid))}.")
+        tickers = (set(stored.decision.target_weights) | set(self.execution.get_account(self.account_ref).positions)) - {self.config.synthetic_cash_asset}
+        self.execution.verify_execution_snapshot(source_snapshot_id, session=stored.decision.next_rebalance_session, tickers=tickers)
+        self.process_actions(session=stored.decision.next_rebalance_session, at=now, source_snapshot_id=source_snapshot_id)
         account = self.execution.settle_due(
             self.account_ref,
             session=stored.decision.next_rebalance_session,
@@ -845,6 +957,7 @@ class PaperCycle:
                 at=now,
                 drawdown_limit=self.config.portfolio_drawdown_stop,
                 daily_loss_limit=self.config.daily_loss_halt,
+            config=self.config,
                 paper_cycle_id=stored.paper_cycle_id,
             )
         except Exception as exc:
@@ -869,6 +982,20 @@ class PaperCycle:
         )
         intents = self.execution.list_intents(paper_cycle_id=stored.paper_cycle_id)
         intents = tuple(sorted(intents, key=lambda item: item.side == Side.BUY))
+        baseline = next((item.account_before for item in intents if item.account_before), None)
+        if baseline is not None:
+            approved_actions = dict(dict(baseline.get("accounting_state") or {}).get("applied_actions") or {})
+            current_actions = dict(account.accounting_state.get("applied_actions") or {})
+            if current_actions != approved_actions:
+                self.execution.cancel_cycle_orders(stored.paper_cycle_id)
+                self.signals.transition_cycle(stored.paper_cycle_id, PaperCycleStatus.MISSED,
+                    expected=(PaperCycleStatus.APPROVED,), at=now, missed_reason="CORPORATE_ACTIONS_CHANGED_AFTER_APPROVAL")
+                self._record_incident(stored, code="CORPORATE_ACTIONS_CHANGED_AFTER_APPROVAL", severity="HIGH",
+                    details={"source_snapshot_id": source_snapshot_id, "reason": "Approved quantities require a new decision and approval."})
+                raise ValueError("Corporate actions changed after approval; no replay orders were filled.")
+        self.execution.verify_execution_snapshot(source_snapshot_id, session=stored.decision.next_rebalance_session,
+            tickers={item.ticker for item in intents}, opens=open_prices)
+        planned_fills = self._preflight_open(stored, intents, account, open_prices, now, source_snapshot_id=source_snapshot_id)
         settlement_date = str(
             self.calendar.next_session(pd.Timestamp(stored.decision.next_rebalance_session)).date()
         )
@@ -883,11 +1010,10 @@ class PaperCycle:
                 if intent.ticker not in open_prices:
                     raise ValueError(f"Missing open for order {intent.ticker}.")
                 quantity = intent.remaining_quantity
-                raw_open = float(open_prices[intent.ticker])
-                directional_bps = self.config.slippage_bps + intent.estimated_impact_bps
-                direction = 1.0 if intent.side == Side.BUY else -1.0
-                price = raw_open * (1.0 + direction * directional_bps / 10_000.0)
-                commission = quantity * price * self.config.trading_cost_bps / 10_000.0
+                planned = planned_fills[intent.client_order_id]
+                price = planned.price
+                commission = planned.commission
+                directional_bps = (planned.slippage + planned.impact) / (quantity * planned.reference_price) * 10000
                 execution_key = sha256(
                     f"{intent.client_order_id}|{quantity:.12f}|{price:.12f}".encode("utf-8")
                 ).hexdigest()
@@ -929,6 +1055,7 @@ class PaperCycle:
             at=now,
             drawdown_limit=self.config.portfolio_drawdown_stop,
             daily_loss_limit=self.config.daily_loss_halt,
+            config=self.config,
             paper_cycle_id=stored.paper_cycle_id,
         )
         account, reconciliation_id, reconciliation_matched = self._reconcile_cycle(
@@ -994,6 +1121,7 @@ class PaperCycle:
         *,
         prices: Mapping[str, float],
         at: datetime,
+        source_snapshot_id: int | None = None,
     ) -> PaperCycleResult:
         stored = self.signals.get_stored_decision(decision_id)
         if stored.cycle_status != PaperCycleStatus.HALTED:
@@ -1002,13 +1130,21 @@ class PaperCycle:
         if account.risk_state not in {"DRAWDOWN_HALTED", "DAILY_LOSS_HALTED"}:
             raise ValueError("Account has no recoverable risk halt.")
         now = _aware(at)
+        session = now.astimezone(NEW_YORK).date().isoformat()
+        prices = {ticker: finite_number(price, f"{ticker} reconciliation mark", positive=True)
+                  for ticker, price in prices.items()}
+        if source_snapshot_id is not None:
+            self.process_actions(session=session, at=now, source_snapshot_id=source_snapshot_id)
+        elif account.accounting_state.get("last_session") != session:
+            raise ValueError("Process a current-session execution snapshot before halt reconciliation.")
         account, _trigger, _trigger_value, _incident_id = self.execution.mark_account(
             self.account_ref,
             prices=prices,
-            valuation_session=now.astimezone(NEW_YORK).date().isoformat(),
+            valuation_session=session,
             at=now,
             drawdown_limit=self.config.portfolio_drawdown_stop,
             daily_loss_limit=self.config.daily_loss_halt,
+            config=self.config,
             paper_cycle_id=stored.paper_cycle_id,
         )
         order_type = (
@@ -1042,6 +1178,7 @@ class PaperCycle:
         authorized_by: str,
         note: str,
         at: datetime,
+        reasons: tuple[str, ...] | None = None,
     ) -> AccountSnapshot:
         return self.execution.authorize_risk_recovery(
             account_ref=self.account_ref,
@@ -1049,6 +1186,7 @@ class PaperCycle:
             authorized_by=authorized_by,
             note=note,
             at=at,
+            reasons=reasons,
         )
 
     def value_account(
@@ -1058,12 +1196,19 @@ class PaperCycle:
         valuation_session: str,
         at: datetime,
         decision_id: int | None = None,
+        source_snapshot_id: int | None = None,
     ) -> AccountSnapshot:
         stored = (
             self.signals.get_stored_decision(decision_id)
             if decision_id is not None
             else None
         )
+        if source_snapshot_id is not None:
+            self.execution.verify_execution_snapshot(source_snapshot_id, session=valuation_session,
+                tickers=self.execution.get_account(self.account_ref).positions)
+            self.process_actions(session=valuation_session, at=at, source_snapshot_id=source_snapshot_id)
+        elif self.execution.get_account(self.account_ref).accounting_state.get("last_session") != valuation_session:
+            raise ValueError("Process a current-session execution snapshot before account valuation.")
         account, _trigger, _trigger_value, incident_id = self.execution.mark_account(
             self.account_ref,
             prices=prices,
@@ -1071,6 +1216,7 @@ class PaperCycle:
             at=at,
             drawdown_limit=self.config.portfolio_drawdown_stop,
             daily_loss_limit=self.config.daily_loss_halt,
+            config=self.config,
             paper_cycle_id=(stored.paper_cycle_id if stored is not None else None),
         )
         if incident_id is not None:

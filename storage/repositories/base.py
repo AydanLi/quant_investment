@@ -1,6 +1,7 @@
 """Shared repository plumbing: engine handling and a portable upsert."""
 from __future__ import annotations
 
+from contextlib import contextmanager
 from typing import Iterable, Mapping, Optional, Sequence
 
 from sqlalchemy import Engine, Table
@@ -18,6 +19,17 @@ class BaseRepository:
 
     def __init__(self, engine: Optional[Engine] = None, db_url: str = DEFAULT_DB_URL):
         self.engine = engine if engine is not None else get_engine(db_url)
+
+    @contextmanager
+    def transaction(self, connection: Connection | None = None):
+        """Join the caller's unit of work, or own a standalone transaction."""
+        if connection is not None:
+            if connection.engine is not self.engine:
+                raise ValueError("Transaction belongs to a different repository engine.")
+            yield connection
+        else:
+            with self.engine.begin() as conn:
+                yield conn
 
 
 # Conservative cap on bind parameters per statement. SQLite's historical limit

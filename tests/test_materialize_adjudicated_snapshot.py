@@ -46,6 +46,10 @@ def test_materialization_creates_derived_snapshot_without_refetch_or_mutation():
         metadata={"SPY": {"source": "tiingo"}, "^VIX": {"source": "cboe"}},
         source="tiingo+cboe",
     )
+    # This scenario adjudicates one close discrepancy. Raw opens are separately
+    # gated and require their own evidence if they disagree.
+    primary.bars["SPY"].loc[pd.Timestamp("2024-01-03"), "Open"] = 100.0
+    primary.bars["SPY"].loc[pd.Timestamp("2024-01-03"), "Low"] = 100.0
     secondary = ProviderPayload(
         bars={"SPY": _bars([100.0, 100.0]), "^VIX": _bars([15.0, 16.0])},
         actions=(),
@@ -71,9 +75,9 @@ def test_materialization_creates_derived_snapshot_without_refetch_or_mutation():
         source_by_ticker={"SPY": "tiingo", "^VIX": "cboe"},
         secondary_payload=secondary,
     )
-    issue = next(
-        item for item in report.issues if item.severity == QualitySeverity.BLOCK
-    )
+    blocking = [item for item in report.issues if item.severity == QualitySeverity.BLOCK]
+    assert [item.code for item in blocking] == ["CROSS_SOURCE_CLOSE_MISMATCH"]
+    issue = blocking[0]
     repository.save_quality_decision(
         DataQualityDecision(
             source_snapshot_id=source_id,

@@ -5,10 +5,11 @@ import pandas as pd
 import pytest
 from sqlalchemy import create_engine
 
-from data.models import DataQualityReport, DataQualityStatus, ProviderPayload
+from data.models import DATA_QUALITY_MODEL_VERSION, DataQualityReport, DataQualityStatus, ProviderPayload
 from data.quality import raw_market_data_hash
 from config.universe import EligibilityRules, INITIAL_ETF_UNIVERSE, UniverseVersion
 from research.protocol import build_protocol
+from research.runtime import capture_code_identity
 from scripts import run_core_admission as cli
 from storage.db import create_all
 from storage.repositories.trusted_data import TrustedMarketDataRepository
@@ -19,7 +20,7 @@ from storage.schema import admission_runs, dataset_snapshot_bars, strategy_versi
 def _protocol():
     return build_protocol(
         protocol_version="cli-test-v1",
-        code_commit="a" * 40,
+        code_commit=capture_code_identity()["code_commit"],
         dataset_snapshot_id=7,
         universe_version="UV-001",
     )
@@ -73,6 +74,12 @@ def _result(
     baseline = cli.fixed_current_baseline_candidate(protocol)
     return {
         "protocol_hash": protocol.content_hash,
+        "continuous_outer_account": True,
+        "continuous_outer_metrics": {
+            "outer_evaluation/7.0": {**_metric(), "confirmed_cash_flows": True},
+            "replacement_baseline/7.0": {**_metric(excess_sharpe=baseline_sharpe,
+                max_drawdown=baseline_drawdown), "confirmed_cash_flows": True},
+        },
         "selection_uses_future_holdout": False,
         "outer_folds": [
             {
@@ -213,7 +220,7 @@ def _runner(result, *, fail=False):
     return FakeRunner
 
 
-def test_cli_uses_locked_governance_api_and_freezes_only_admitted(monkeypatch):
+def test_cli_admission_never_approves_a_strategy_or_starts_its_clock(monkeypatch):
     protocol = _protocol()
     repository = FakeGovernance()
     monkeypatch.setattr(
@@ -233,11 +240,9 @@ def test_cli_uses_locked_governance_api_and_freezes_only_admitted(monkeypatch):
     methods = [name for name, _ in repository.calls]
     assert output["status"] == "ADMITTED"
     assert methods[:2] == ["create_strategy_version", "start_admission"]
-    assert methods[-3:] == [
-        "finish_admission",
-        "freeze_strategy_version",
-        "start_local_sim_clock",
-    ]
+    assert methods[-1] == "finish_admission"
+    assert "freeze_strategy_version" not in methods
+    assert "start_local_sim_clock" not in methods
     summaries = [key for key in repository.trials if key[0] == "final_selection_summary"]
     assert len(summaries) == 135
     baselines = [key for key in repository.trials if key[0] == "replacement_baseline"]
@@ -372,6 +377,7 @@ def _snapshot(tmp_path, *, stale=0, status=DataQualityStatus.TRUSTED, decision_h
     )
     raw_hash = raw_market_data_hash(provider, None)
     report = DataQualityReport(
+        quality_model_version=DATA_QUALITY_MODEL_VERSION,
         status=status,
         primary_source="fixture",
         secondary_source=None,
@@ -418,7 +424,20 @@ def test_snapshot_loader_requires_fresh_decided_and_hash_verified_data(tmp_path)
         cli.load_immutable_snapshot(str(valid_path), valid_id)
 
 
-def test_terminal_admission_is_reused_without_finishing_again(monkeypatch):
+def test_legacy_snapshot_quality_is_not_silently_upgraded_for_admission(tmp_path):
+    from storage.schema import dataset_snapshots
+    path, engine, snapshot_id = _snapshot(tmp_path)
+    with engine.begin() as connection:
+        row = connection.execute(dataset_snapshots.select().where(dataset_snapshots.c.id == snapshot_id)).mappings().one()
+        old_quality = dict(row["quality_json"])
+        old_quality.pop("quality_model_version")
+        connection.execute(dataset_snapshots.update().where(dataset_snapshots.c.id == snapshot_id).values(quality_json=old_quality))
+    with pytest.raises(ValueError, match="newly audited current-quality"):
+        cli.load_immutable_snapshot(str(path), snapshot_id)
+
+
+@pytest.mark.parametrize("terminal_status", ["rejected", "admitted"])
+def test_terminal_admission_is_reused_without_finishing_or_approving(monkeypatch, terminal_status):
     protocol = _protocol()
     engine = create_engine("sqlite://", future=True)
     create_all(engine)
@@ -427,11 +446,12 @@ def test_terminal_admission_is_reused_without_finishing_again(monkeypatch):
             admission_runs.insert().values(
                 strategy_version="SV-TERMINAL",
                 methodology=cli.METHODOLOGY,
-                status="rejected",
+                status=terminal_status,
                 selection_uses_future_holdout=0,
                 results_json={
                     "protocol_hash": protocol.content_hash,
-                    "gates": {"example": False},
+                    "gates": {"replacement_sharpe": True, "replacement_drawdown": True},
+                    "replacement_comparison": {"baseline_label": cli.fixed_current_baseline_candidate(protocol).label},
                 },
             )
         )
@@ -450,9 +470,11 @@ def test_terminal_admission_is_reused_without_finishing_again(monkeypatch):
         evaluator=lambda *args: None,
     )
 
-    assert output["status"] == "REJECTED"
+    assert output["status"] == terminal_status.upper()
     assert output["reused_terminal_run"] is True
     assert "finish_admission" not in [name for name, _ in repository.calls]
+    assert "freeze_strategy_version" not in [name for name, _ in repository.calls]
+    assert "start_local_sim_clock" not in [name for name, _ in repository.calls]
 
 
 def test_cli_integrates_with_locked_governance_repository(tmp_path, monkeypatch):
@@ -469,7 +491,7 @@ def test_cli_integrates_with_locked_governance_repository(tmp_path, monkeypatch)
     repository.approve_universe_version("UV-001", approved_by="test-operator")
     protocol = build_protocol(
         protocol_version="cli-integration-v1",
-        code_commit="a" * 40,
+        code_commit=capture_code_identity()["code_commit"],
         dataset_snapshot_id=snapshot_id,
         universe_version="UV-001",
     )
@@ -494,5 +516,16 @@ def test_cli_integrates_with_locked_governance_repository(tmp_path, monkeypatch)
             )
         ).mappings().one()
     assert output["status"] == "ADMITTED"
-    assert strategy["status"] == "frozen"
-    assert strategy["local_sim_start"] is not None
+    assert strategy["status"] == "draft"
+    assert strategy["local_sim_start"] is None
+    with pytest.raises(ValueError, match="frozen runtime"):
+        repository.load_frozen_runtime("SV-INTEGRATION")
+    with pytest.raises(ValueError, match="approved_by"):
+        repository.freeze_strategy_version("SV-INTEGRATION", admission_run_id=output["admission_run_id"], approved_by="  ")
+    repository.freeze_strategy_version("SV-INTEGRATION", admission_run_id=output["admission_run_id"], approved_by="reviewer")
+    assert repository.load_frozen_runtime("SV-INTEGRATION").config["strategy_version"] == "SV-INTEGRATION"
+    with engine.connect() as connection:
+        approved = connection.execute(strategy_versions.select().where(strategy_versions.c.version == "SV-INTEGRATION")).mappings().one()
+    assert approved["approved_by"] == "reviewer"
+    assert approved["approved_at"] is not None
+    assert approved["local_sim_start"] is None

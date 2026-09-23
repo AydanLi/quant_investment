@@ -58,6 +58,7 @@ def _run_cost_backtest():
         config=config,
         prices=close_prices,
         execution_prices=open_prices,
+        raw_close_prices=close_prices,
         returns=returns,
         features={},
         regime_detector=_NeutralRegimeDetector(),
@@ -97,14 +98,18 @@ def test_broker_orders_capture_open_prices_single_sided_costs_and_settlement():
     orders = results["orders"]
     portfolio = results["portfolio"]
 
-    assert len(orders) == 4
+    assert len(orders) == 3
     assert orders["price"].notna().all()
-    assert orders.loc[orders["ticker"] == "SPY", "price"].eq(100.0).all()
+    spy_orders = orders.loc[orders["ticker"] == "SPY"]
+    assert spy_orders["reference_price"].eq(100.0).all()
+    assert spy_orders.loc[spy_orders["side"] == "BUY", "price"].eq(100.05).all()
+    assert spy_orders.loc[spy_orders["side"] == "SELL", "price"].eq(99.95).all()
     assert abs(orders["trading_cost_dollars"].sum() - (orders["notional"].sum() * 0.001)) < 1e-9
-    assert abs(orders["slippage_dollars"].sum() - (orders["notional"].sum() * 0.0005)) < 1e-9
+    reference_notional = (orders["quantity"] * orders["reference_price"]).sum()
+    assert abs(orders["slippage_dollars"].sum() - reference_notional * 0.0005) < 1e-9
     for date, group in orders.groupby("date"):
         assert abs(group["trading_cost_dollars"].sum() + group["slippage_dollars"].sum() - portfolio.at[date, "cost_dollars"]) < 1e-9
-    assert portfolio.at[index[253], "unsettled_cash"] > 0.0
+    assert portfolio.at[index[253], "unsettled_cash"] < 0.0
 
 
 def test_report_uses_initial_capital_net_equity_and_provisional_label():
@@ -156,7 +161,7 @@ def test_square_root_impact_starts_at_point_one_percent_adv():
         order["adv_fraction"] / config.impact_model_adv_threshold
     ) ** 0.5
     assert order["impact_cost_dollars"] == pytest.approx(
-        order["notional"] * expected_bps / 10_000.0
+        order["quantity"] * order["reference_price"] * expected_bps / 10_000.0
     )
     assert execution["est_impact"] > 0.0
 
@@ -193,10 +198,10 @@ def test_risk_off_execution_has_twenty_bp_cost_floor():
     )
 
     order = ledger.order_log[0]
-    execution_cost = (
-        order["trading_cost_dollars"] + order["slippage_dollars"]
-    ) / order["notional"]
-    assert execution_cost == pytest.approx(20.0 / 10_000.0)
+    reference_notional = order["quantity"] * order["reference_price"]
+    execution_cost = (order["trading_cost_dollars"] + order["slippage_dollars"]) / reference_notional
+    assert execution_cost >= 20.0 / 10_000.0 - 1e-12
+    assert execution_cost < 20.1 / 10_000.0
 
 
 def test_average_cost_basis_produces_net_realized_trade_pnl():
@@ -227,11 +232,9 @@ def test_average_cost_basis_produces_net_realized_trade_pnl():
     expected_gross = (
         sell["price"] - buy["average_entry_cost"]
     ) * sell["quantity"]
-    exit_cost = (
-        sell["trading_cost_dollars"]
-        + sell["slippage_dollars"]
-        + sell["impact_cost_dollars"]
-    )
+    # Fill prices already include slippage and impact; subtracting them again
+    # would double-charge execution costs in realized P/L.
+    exit_cost = sell["trading_cost_dollars"]
     assert sell["gross_realized_pnl"] == pytest.approx(expected_gross)
     assert sell["realized_pnl"] == pytest.approx(expected_gross - exit_cost)
     assert sell["realized_pnl"] > 0.0

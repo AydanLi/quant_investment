@@ -222,7 +222,9 @@ def test_oms_uses_configured_impact_coefficient_and_0935_execution_gate():
         account=account,
         verification=VERIFIED,
     )
-    assert all(intent.estimated_impact_bps == pytest.approx(25.0) for intent in drafts)
+    for intent in drafts:
+        expected = 25.0 * (intent.adv_fraction / .001) ** .5 if intent.adv_fraction >= .001 else 0.0
+        assert intent.estimated_impact_bps == pytest.approx(expected)
 
 
 def test_personal_research_mode_blocks_external_broker_but_allows_simulation():

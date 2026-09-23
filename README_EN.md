@@ -8,8 +8,9 @@ research conclusion traceable to a code commit, immutable data snapshot, ETF
 universe version, preregistered parameters, cost assumptions, and execution
 records. If any critical evidence is missing, the system fails closed.
 
-> Current status (2026-08-26): the engineering workflow is implemented and all
-> 270 tests pass, but all five data snapshots remain `BLOCKED`, with 706
+> Current status (2026-09-22): the pre-change baseline passed 283 tests; see
+> [economic workflow remediation](docs/remediation_status_en.md) for this change's evidence.
+> All five data snapshots remain `BLOCKED`, with 706
 > unresolved blocking issues in the latest snapshot. `UV-001` remains a
 > `draft`, and there are no strategy versions, admission runs, or local replay
 > fills. The project can currently support diagnostics and engineering
@@ -21,6 +22,7 @@ records. If any critical evidence is missing, the system fails closed.
 | Document | Purpose |
 |---|---|
 | [Project overview](PROJECT_OVERVIEW_EN.md) | Positioning, strategy outline, maturity, and current conclusion |
+| [Economic workflow remediation](docs/remediation_status_en.md) | Finding/change/test mapping, migration, and external gates |
 | [Architecture](quant_system_architecture_overview_en.md) | Data flow, governance state machines, storage model, and execution boundaries |
 | [Operations runbook](docs/upgrade_v3_runbook.md) | Data incidents, admission, local replay, halts, and recovery |
 | [Personal research operating profile](docs/personal_research_operating_profile.md) | Account, tax, data-source, alerting, and historical-universe constraints |
@@ -174,16 +176,29 @@ $commit = git rev-parse HEAD
 The admission command must persist exactly 135 final candidate results. It is
 a valid research conclusion for every candidate to be rejected; the parameter
 grid must not be expanded after reviewing results. The current database has no
-actionable snapshot, so formal admission should not be run yet.
+actionable snapshot, so formal admission should not be run yet. Passing research
+only records a result awaiting human approval; it never freezes or starts a clock.
+After reviewing the complete evidence, explicitly approve the version:
+
+```powershell
+.\.venv\Scripts\python.exe -m scripts.approve_strategy_version `
+  --version <strategy-version> --admission-run-id <run-id> --approved-by <operator>
+```
+
+Approval records the operator, timestamp and frozen version.
 
 ## Local Replay
 
-Local replay is available only after a strategy has been admitted, frozen, and
-its prospective clock has started:
+Local replay requires an admitted version explicitly approved by a human.
+Account initialization starts the actual validation stage; approval does not.
+Inspect the commands, then initialize when prerequisites are satisfied:
 
 ```powershell
 .\.venv\Scripts\python.exe -m scripts.paper_cycle `
   --strategy-version <strategy-version> --help
+
+.\.venv\Scripts\python.exe -m scripts.paper_cycle `
+  --strategy-version <strategy-version> --account-ref <account> init-account --cash 10000
 ```
 
 It deterministically replays T+1 raw-open prices plus preregistered costs and
@@ -203,9 +218,11 @@ fractional-share routing.
 .\.venv\Scripts\python.exe -m alembic check
 ```
 
-Validation recorded on 2026-08-26: 270 tests passed, dependencies were
-consistent, SQLite returned `integrity_check=ok` with no foreign-key
-violations, and Alembic was at `5f74c1a9d2b0 (head)`.
+The pre-change baseline on 2026-09-22 passed 283 tests. See
+[remediation and acceptance](docs/remediation_status_en.md) for this change's checks;
+the final full suite passed **368 tests**.
+The new migration is `6b2e1d9a4f30`; the readiness command reports the actual
+schema and blockers. Earlier test results are not this change's acceptance evidence.
 
 ## Repository Layout
 

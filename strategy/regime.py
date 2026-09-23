@@ -20,7 +20,9 @@ class RegimeDetector:
             benchmark_price = prices.at[date, benchmark]
             vix = prices.at[date, fear]
             ma_200 = features["ma_200"].at[date, benchmark]
-            dd_200 = features["drawdown_200"].at[date, benchmark]
+            # This is distance from the moving average, not peak-to-trough drawdown.
+            deviation = features.get("ma200_deviation", features.get("drawdown_200"))
+            dd_200 = deviation.at[date, benchmark]
         except (KeyError, TypeError) as exc:
             raise ValueError(
                 f"Regime inputs are incomplete for {pd.Timestamp(date).date()}."

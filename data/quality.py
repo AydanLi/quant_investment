@@ -11,6 +11,7 @@ import pandas as pd
 from config.settings import Config
 from data.calendar import NyseCalendar
 from data.models import (
+    DATA_QUALITY_MODEL_VERSION,
     CorporateAction,
     DataQualityDecision,
     DataQualityDisposition,
@@ -38,7 +39,11 @@ def dataset_content_hash(
             column for column in ("Open", "High", "Low", "Close", "Volume")
             if column in frame
         ]
-        frame = frame[columns].astype(float)
+        try:
+            frame = frame[columns].astype(float)
+        except (TypeError, ValueError):
+            # Invalid vendor fields still need a reproducible blocked snapshot.
+            frame = frame[columns].astype(str)
         digest.update(ticker.encode("utf-8"))
         digest.update(
             pd.util.hash_pandas_object(frame, index=True).to_numpy().tobytes()
@@ -52,12 +57,18 @@ def dataset_content_hash(
             "split": item.normalized().split_factor,
             "status": item.normalized().status,
             "source": item.normalized().source,
+            **({"payment_date": str(item.normalized().payment_date.date()),
+                "payment_source": item.normalized().payment_source}
+               if item.normalized().payment_date is not None else {}),
         }
         for item in actions
     ]
     digest.update(
         json.dumps(
-            sorted(canonical_actions, key=lambda item: tuple(item.values())),
+            sorted(canonical_actions, key=lambda item: (
+                item["ticker"], item["date"], item["type"], item["cash"], item["split"],
+                item["status"], item["source"], item.get("payment_date") or "", item.get("payment_source") or "",
+            )),
             sort_keys=True,
         ).encode("utf-8")
     )
@@ -99,6 +110,7 @@ def _quality_snapshot_hash(
     stale_sessions: int | None,
     issues: Sequence[DataQualityIssue],
     raw_data_hash: str,
+    quality_model_version: str | None = None,
 ) -> str:
     material = {
         "raw_data_hash": raw_data_hash,
@@ -127,6 +139,8 @@ def _quality_snapshot_hash(
             ),
         ),
     }
+    if quality_model_version is not None:
+        material["quality_model_version"] = quality_model_version
     return hashlib.sha256(
         json.dumps(material, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
@@ -290,18 +304,94 @@ def _split_normalized_close(payload: ProviderPayload, ticker: str) -> pd.Series:
     of false discrepancies. The transformation is used only for QA; immutable
     vendor rows remain untouched.
     """
-    close = payload.bars[ticker]["Close"].astype(float).copy()
+    return _split_normalized_field(payload, ticker, "Close")
+
+
+def _split_normalized_field(payload: ProviderPayload, ticker: str, field: str) -> pd.Series:
+    close = pd.to_numeric(payload.bars[ticker][field], errors="coerce").copy()
+    close = close[~close.index.duplicated(keep="last")]
     basis = payload.metadata.get(ticker, {}).get("price_split_basis")
     if basis != "as_traded":
         return close
     for raw_action in payload.actions:
         action = raw_action.normalized()
-        if action.ticker != ticker.upper() or action.action_type != "split":
+        if action.ticker != ticker.upper() or action.action_type != "split" or action.status != "active":
             continue
         if action.split_factor <= 0.0:
             continue
         close.loc[close.index < action.ex_date] /= action.split_factor
     return close
+
+
+def _validate_raw_payload(
+    payload: ProviderPayload, *, required_tickers: Sequence[str],
+    config: Config, calendar: NyseCalendar, role: str,
+) -> list[DataQualityIssue]:
+    """Validate each publication before cross-source intersections can hide rows."""
+    issues: list[DataQualityIssue] = []
+    for ticker in required_tickers:
+        frame = payload.bars.get(ticker)
+        if frame is None or frame.empty:
+            continue  # The existing missing-provider issue supplies this evidence.
+        if role == "primary" and ticker != config.fear_gauge and payload.metadata.get(ticker, {}).get("price_split_basis") == "current_share_basis":
+            issues.append(DataQualityIssue(
+                QualitySeverity.BLOCK, "PRIMARY_PRICE_BASIS_NOT_AS_TRADED",
+                "Raw-share execution requires as-traded primary prices; current-share-basis history is validation-only.",
+                ticker=ticker, context={"role": role},
+            ))
+        index = pd.DatetimeIndex(frame.index).tz_localize(None).normalize()
+        def block(code: str, message: str, session: object | None = None, field: str | None = None) -> None:
+            issues.append(DataQualityIssue(
+                QualitySeverity.BLOCK, code, message, ticker=ticker,
+                session=None if session is None or pd.isna(session) else str(pd.Timestamp(session).date()),
+                context={"role": role, "field": field},
+            ))
+        if index.hasnans:
+            block("INVALID_BAR_DATE", f"{role} {ticker} contains an invalid session date.")
+            continue
+        for date in index[index.duplicated()].unique():
+            block("DUPLICATE_BAR_DATE", f"{role} {ticker} has duplicate daily bars.", date)
+        sessions = calendar.sessions(index.min(), index.max())
+        for date in sessions.difference(index):
+            block("MISSING_TRADING_SESSION", f"{role} {ticker} is missing an in-range NYSE session.", date)
+        if ticker != config.fear_gauge:
+            for date in index.difference(sessions):
+                block("NON_TRADING_SESSION", f"{role} {ticker} contains a non-NYSE bar.", date)
+        # FRED redistributes VIX close only. It is not a tradable instrument and
+        # its zero volume is meaningful, not an ETF liquidity observation.
+        fields = ("Close",) if ticker == config.fear_gauge else ("Open", "High", "Low", "Close", "Volume")
+        for field in fields:
+            if field not in frame:
+                block("REQUIRED_BAR_FIELD_MISSING", f"{role} {ticker} lacks {field}.", field=field)
+                continue
+            values = pd.to_numeric(frame[field], errors="coerce")
+            invalid = ~np.isfinite(values) | (values.lt(0.) if field == "Volume" else values.le(0.))
+            for date in frame.index[invalid]:
+                block("INVALID_BAR_FIELD", f"{role} {ticker} has invalid {field}.", date, field)
+        if ticker != config.fear_gauge and set(("Open", "High", "Low", "Close")).issubset(frame):
+            prices = frame[["Open", "High", "Low", "Close"]].apply(pd.to_numeric, errors="coerce")
+            inconsistent = (
+                prices["Low"].gt(prices[["Open", "Close"]].min(axis=1))
+                | prices["High"].lt(prices[["Open", "Close"]].max(axis=1))
+                | prices["Low"].gt(prices["High"])
+            )
+            for date in frame.index[inconsistent]:
+                block("INCONSISTENT_OHLC", f"{role} {ticker} violates daily OHLC bounds.", date, "OHLC")
+    seen_actions: set[str] = set()
+    for raw in payload.actions:
+        action = raw.normalized()
+        invalid = (pd.isna(action.ex_date) or not np.isfinite(action.cash_amount)
+                   or action.cash_amount < 0. or not np.isfinite(action.split_factor)
+                   or action.split_factor <= 0. or action.action_type not in {"dividend", "split"}
+                   or (action.payment_date is not None and (pd.isna(action.payment_date) or action.payment_date < action.ex_date)))
+        if invalid or action.action_key in seen_actions:
+            issues.append(DataQualityIssue(
+                QualitySeverity.BLOCK, "INVALID_CORPORATE_ACTION" if invalid else "DUPLICATE_CORPORATE_ACTION",
+                f"{role} contains an invalid or duplicated corporate action.", ticker=action.ticker,
+                session=None if pd.isna(action.ex_date) else str(action.ex_date.date()), context={"role": role},
+            ))
+        seen_actions.add(action.action_key)
+    return issues
 
 
 def _cash_on_current_share_basis(
@@ -318,6 +408,7 @@ def _cash_on_current_share_basis(
         if (
             split.ticker == action.ticker
             and split.action_type == "split"
+            and split.status == "active"
             and split.ex_date > action.ex_date
             and split.split_factor > 0.0
         ):
@@ -355,7 +446,9 @@ def _compare_actions(
                 )
             )
             continue
-        if left.action_type == "dividend":
+        if left.status != right.status:
+            mismatch = True
+        elif left.action_type == "dividend":
             # Yahoo currently publishes ETF distributions to three decimals,
             # while Tiingo retains six. Differences no larger than one half of
             # Yahoo's last published decimal are representation rounding, not
@@ -417,6 +510,9 @@ def assess_market_data_quality(
     issues: list[DataQualityIssue] = []
     expected = calendar.latest_completed_session(as_of)
     latest_sessions: list[pd.Timestamp] = []
+    issues.extend(_validate_raw_payload(primary, required_tickers=required_tickers, config=config, calendar=calendar, role="primary"))
+    if secondary is not None:
+        issues.extend(_validate_raw_payload(secondary, required_tickers=required_tickers, config=config, calendar=calendar, role="secondary"))
 
     for ticker in required_tickers:
         frame = primary.bars.get(ticker)
@@ -430,9 +526,18 @@ def assess_market_data_quality(
                 )
             )
             continue
-        latest_sessions.append(pd.Timestamp(frame.index.max()).tz_localize(None).normalize())
+        close = pd.to_numeric(frame["Close"], errors="coerce")
+        valid = frame.index[np.isfinite(close) & close.gt(0.)]
+        if len(valid):
+            latest_sessions.append(pd.Timestamp(valid.max()).tz_localize(None).normalize())
 
     latest = min(latest_sessions) if latest_sessions else None
+    if any(session > expected for session in latest_sessions):
+        issues.append(DataQualityIssue(
+            QualitySeverity.BLOCK, "INCOMPLETE_OR_FUTURE_SESSION",
+            "A primary source contains prices after the latest completed NYSE session.",
+            session=str(max(latest_sessions).date()),
+        ))
     freshness = calendar.freshness(latest, as_of=as_of) if latest is not None else None
     if freshness and freshness.stale_sessions > config.actionable_staleness_sessions:
         severity = (
@@ -462,7 +567,7 @@ def assess_market_data_quality(
         for ticker in required_tickers:
             left = primary.bars.get(ticker)
             right = secondary.bars.get(ticker)
-            if left is None or right is None or left.empty or right.empty:
+            if left is None or right is None or left.empty or right.empty or "Close" not in left or "Close" not in right:
                 issues.append(
                     DataQualityIssue(
                         QualitySeverity.BLOCK,
@@ -472,6 +577,30 @@ def assess_market_data_quality(
                     )
                 )
                 continue
+            common_start = max(left.index.min(), right.index.min())
+            comparison_dates = left.index.union(right.index)
+            for session in comparison_dates[comparison_dates >= common_start]:
+                if session not in left.index or session not in right.index:
+                    issues.append(DataQualityIssue(
+                        QualitySeverity.BLOCK, "CROSS_SOURCE_SESSION_MISSING",
+                        f"{ticker} has no matching session across both providers.",
+                        ticker=ticker, session=str(pd.Timestamp(session).date()),
+                    ))
+            if ticker != config.fear_gauge and "Open" in left and "Open" in right:
+                opens = pd.concat([
+                    _split_normalized_field(primary, ticker, "Open").rename("primary"),
+                    _split_normalized_field(secondary, ticker, "Open").rename("secondary"),
+                ], axis=1).dropna()
+                open_difference = (opens["primary"] / opens["secondary"] - 1.).abs() * 10000.
+                for session, value in open_difference[open_difference > config.source_warning_bps].items():
+                    if not np.isfinite(value):
+                        continue  # The individual-field validation already blocks this input.
+                    issues.append(DataQualityIssue(
+                        QualitySeverity.BLOCK if value > config.source_block_bps else QualitySeverity.WARNING,
+                        "CROSS_SOURCE_OPEN_MISMATCH", f"{ticker} split-normalized opens differ by {value:.2f} bp.",
+                        ticker=ticker, session=str(pd.Timestamp(session).date()), value=float(value),
+                        context={"field": "Open"},
+                    ))
             aligned = pd.concat(
                 [
                     _split_normalized_close(primary, ticker).rename("primary"),
@@ -494,6 +623,8 @@ def assess_market_data_quality(
                 (aligned["primary"] / aligned["secondary"] - 1.0).abs() * 10000.0
             )
             for session, value in difference_bps[difference_bps > config.source_warning_bps].items():
+                if not np.isfinite(value):
+                    continue  # Invalid individual fields already have blocking evidence.
                 severity = (
                     QualitySeverity.BLOCK
                     if value > config.source_block_bps
@@ -510,8 +641,10 @@ def assess_market_data_quality(
                     )
                 )
 
-            primary_returns = left["Close"].astype(float).pct_change(fill_method=None)
-            secondary_returns = right["Close"].astype(float).pct_change(fill_method=None)
+            primary_close = pd.to_numeric(left["Close"], errors="coerce")
+            secondary_close = pd.to_numeric(right["Close"], errors="coerce")
+            primary_returns = primary_close[~primary_close.index.duplicated(keep="last")].pct_change(fill_method=None).replace([np.inf, -np.inf], np.nan)
+            secondary_returns = secondary_close[~secondary_close.index.duplicated(keep="last")].pct_change(fill_method=None).replace([np.inf, -np.inf], np.nan)
             # The 10% confirmation gate is an ETF rule. VIX is a volatility
             # index, where moves of this size are routine; it remains subject
             # to the CBOE/FRED VIXCLS close-difference checks above. FRED is an
@@ -573,6 +706,7 @@ def assess_market_data_quality(
         stale_sessions=None if freshness is None else freshness.stale_sessions,
         issues=tuple(issues),
         raw_data_hash=raw_data_hash,
+        quality_model_version=DATA_QUALITY_MODEL_VERSION,
         content_hash=_quality_snapshot_hash(
             status=status,
             expected_session=expected_text,
@@ -580,5 +714,6 @@ def assess_market_data_quality(
             stale_sessions=None if freshness is None else freshness.stale_sessions,
             issues=issues,
             raw_data_hash=raw_data_hash,
+            quality_model_version=DATA_QUALITY_MODEL_VERSION,
         ),
     )

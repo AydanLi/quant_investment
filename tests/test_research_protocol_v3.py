@@ -70,6 +70,8 @@ def test_nested_runner_never_exposes_validation_or_future_rows_to_training():
 
     assert observed
     assert result["selection_uses_future_holdout"] is False
+    assert result["final_candidate_independent_oos"] is False
+    assert result["continuous_outer_account"] is False
     assert len(result["trials"]) == 135 * len(result["outer_folds"])
     assert all(item["selected_label"] for item in result["outer_folds"])
     first_final = result["final_selection_trials"][0]["folds"][0]["fold"]
@@ -191,14 +193,17 @@ def test_historical_gates_use_return_windows_and_aggregate_twenty_bp_excess():
 
 
 def _ohlc(index, value):
-    return pd.DataFrame(
+    frame = pd.DataFrame(
         {"Open": value, "Close": value, "Volume": 1_000_000.0},
         index=index,
     )
+    frame.attrs["corporate_actions"] = ()
+    return frame
 
 
 def test_core_evaluator_blocks_missing_bil_benchmark(monkeypatch):
-    index = pd.bdate_range("2010-01-01", periods=400)
+    from data.calendar import NyseCalendar
+    index = NyseCalendar().sessions("2010-01-04", "2012-01-01")[:400]
     training_index = index[:300]
     validation_index = index[300:]
 
@@ -230,7 +235,8 @@ def test_core_evaluator_blocks_missing_bil_benchmark(monkeypatch):
 
 
 def test_core_evaluator_marks_all_cash_validation_as_degenerate(monkeypatch):
-    index = pd.bdate_range("2010-01-01", periods=400)
+    from data.calendar import NyseCalendar
+    index = NyseCalendar().sessions("2010-01-04", "2012-01-01")[:400]
     training_index = index[:300]
     validation_index = index[300:]
 
@@ -277,6 +283,7 @@ def test_nested_runner_reuses_persisted_stage_fold_trial_without_recomputing():
     candidate = protocol.candidates[0]
     cached = {
         ("inner_selection", "outer-001/inner-001", candidate.label): {
+            "protocol_hash": protocol.content_hash,
             "status": "evaluated",
             "metrics": {
                 "excess_sharpe": 0.2,

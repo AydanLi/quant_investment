@@ -1,5 +1,8 @@
 # Quant System v3 runbook
 
+For the current economic model, migration and acceptance evidence, see the
+[remediation record](remediation_status_en.md) ([中文](remediation_status.md)).
+
 ## 1. Security and setup
 
 - Never place Tiingo or broker credentials in source, `.env.example`, command
@@ -60,25 +63,34 @@ warning and 20 bp blocking thresholds; no discrepancy is silently suppressed.
 
    Treat the run as incomplete unless it reaches a terminal `AdmissionRun` and
    persists all 135 unique final candidate outcomes, including failures.
-4. Freeze one strategy version only if all historical gates pass.
-5. Evaluate the six risk-model candidates with:
+4. Research only persists the admitted result. Review it, then explicitly run
+   `python -m scripts.approve_strategy_version --version <version>`
+   `--admission-run-id <id> --approved-by <operator>`. This records human approval
+   and freezes the runtime, but does not start observation.
+5. Evaluate the six risk-model candidates on data untouched by core selection:
 
    `.\.venv\Scripts\python.exe -m scripts.validate_dynamic_factor_model`
-   `--snapshot-id <id> --strategy-version <version>`
+   `--snapshot-id <id> --strategy-version <frozen-parent-version>`
+   `--candidate-version <new-child-version> --holdout-start <YYYY-MM-DD>`
 
-   This command prints evaluation output; it does not by itself create the
-   admitted database record required to expose `dynamic_factor` in the formal
-   Dashboard.
+   This requires three complete post-core outer windows and a reserved final
+   252-session holdout. It persists candidate and failure outcomes; only a
+   passing child can be frozen. `--diagnostic-only` never grants admission.
+   Insufficient untouched data retains sample covariance. The core continuous
+   walk-forward result validates its selection procedure, not independent
+   fixed-parameter performance for the final winner.
 6. Keep sample covariance unless a selected candidate is persisted as admitted
    for the frozen strategy version.
-7. Start the local simulation clock only after the final strategy version is
-   frozen. It does not count as broker-paper validation unless a future
-   strategy version explicitly enters `BROKER_PAPER` mode.
+7. Initialize the local paper account using the verified frozen runtime.
+   Initialization starts a persisted validation stage at the actual current
+   time, separately for each account. Freezing a strategy does not start this
+   clock. Local replay does not count as broker-paper validation.
 
 Any change to the seed pool, filter rules, parameter grid, signal, cost formula,
 or execution method requires a new strategy version and a new 12-month paper
-period. A coefficient-only recalibration from the preregistered cost formula
-does not restart the clock.
+period. Economic coefficients are also frozen: changing them requires new
+research, acceptance and human approval. Source and dependency identity changes
+invalidate the old runtime; ordinary new trusted daily data does not.
 
 ## 4. Local simulation operating flow
 
@@ -95,13 +107,28 @@ it does not claim that a real 09:35 limit order would fill there.
   approve every order. At or after 09:25, an unapproved cycle is `MISSED` and
   must never be backdated.
 - After the T+1 raw open is published: replay each approved order once, derive
-  `PARTIAL/FILLED` only from persisted fills, update quantities and three cash
-  components, and create T+1 settlement entries.
+  `PARTIAL/FILLED` only from persisted fills, update quantities, cash and
+  non-spendable dividend receivables, and create T+1 settlement entries.
 - Reconcile positions, settled/unsettled/available cash, NAV, fees, fills and
   unfinished orders. A restart reuses the same cycle and execution IDs and
   cannot duplicate a fill.
 - Run the idempotent CLI with `python -m scripts.paper_cycle --help`; use Windows
   Task Scheduler for invocation. No always-on scheduler service is required.
+
+`replay-open`, `replay-liquidation-open`, `process-actions`, `value-account`,
+`record-close` and `reconcile-halt` require `--snapshot-id`. Raw prices must
+match that snapshot. Process ex-date ownership before opening trades; unknown
+payment evidence leaves dividends receivable. If execution-day actions change
+the approved baseline, book the real entitlement, cancel the remaining old
+orders, and obtain a new governed decision and approval. Do not rescale approved
+quantities. Preflight the whole basket before its first fill; a restart retains
+already completed fills and checks only the remainder.
+
+Record each official close with its source and receipt time. Missing the exact
+previous session's close blocks added risk; an older close is not a substitute.
+Keep computable drawdown checks and trusted risk-reducing sales available.
+Post-close daily snapshots can support local open replay, but their fills are
+excluded from prospective evidence when that information arrived after the fill.
 
 A future broker-paper implementation will separately enforce arrival
 bid/ask/mid capture, 09:35 limits, five-minute cancellation, second approval for
@@ -122,6 +149,10 @@ not validated by local raw-open replay.
 
 Every incident must retain trigger value, realized outcome, snapshots, operator,
 timestamps and recovery authorization.
+
+Halt reasons coexist. `authorize-recovery --clear-reason` explicitly chooses
+daily-loss or drawdown recovery after current account reconciliation; clearing
+one reason never clears drift or reconciliation restrictions.
 
 ## 6. Simulation and future broker gates
 

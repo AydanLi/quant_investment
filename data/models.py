@@ -12,6 +12,9 @@ from typing import Mapping
 import pandas as pd
 
 
+DATA_QUALITY_MODEL_VERSION = "raw_ohlcv_actions_v2"
+
+
 class QualitySeverity(StrEnum):
     INFO = "INFO"
     WARNING = "WARNING"
@@ -34,6 +37,8 @@ class CorporateAction:
     split_factor: float = 1.0
     status: str = "active"
     source: str = "unknown"
+    payment_date: pd.Timestamp | None = None
+    payment_source: str | None = None
 
     def normalized(self) -> "CorporateAction":
         return CorporateAction(
@@ -44,7 +49,27 @@ class CorporateAction:
             split_factor=float(self.split_factor),
             status=self.status.lower(),
             source=self.source.lower(),
+            payment_date=(None if self.payment_date is None else pd.Timestamp(self.payment_date).tz_localize(None).normalize()),
+            payment_source=None if self.payment_source is None else (self.payment_source.strip() or None),
         )
+
+    @property
+    def action_key(self) -> str:
+        action = self.normalized()
+        return f"{action.ticker}|{action.ex_date.date()}|{action.action_type}"
+
+    @property
+    def revision_hash(self) -> str:
+        action = self.normalized()
+        payload = {
+            "key": action.action_key, "cash_amount": action.cash_amount,
+            "split_factor": action.split_factor, "status": action.status,
+            "payment_date": None if action.payment_date is None else str(action.payment_date.date()),
+            # Evidence changes cash eligibility, so adding it after accrual
+            # requires replay just like changing the stated payment date.
+            "payment_source": action.payment_source,
+        }
+        return hashlib.sha256(json.dumps(payload, sort_keys=True, allow_nan=False).encode()).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -261,13 +286,17 @@ class DataQualityReport:
     source_snapshot_id: int | None = None
     decision_set_hash: str | None = None
     adjudicated_issue_fingerprints: tuple[str, ...] = field(default_factory=tuple)
+    quality_model_version: str | None = None
 
     @property
     def actionable(self) -> bool:
-        # Warnings are surfaced to the operator but only BLOCKED conditions
-        # prevent an order draft.  This preserves the documented 5 bp warning
-        # versus 20 bp block distinction.
-        return self.status != DataQualityStatus.BLOCKED and self.stale_sessions == 0
+        # Warnings remain usable only after the current QA has examined the
+        # payload. Legacy TRUSTED statuses cannot bypass newly added checks.
+        return (
+            self.status != DataQualityStatus.BLOCKED
+            and self.stale_sessions == 0
+            and self.quality_model_version == DATA_QUALITY_MODEL_VERSION
+        )
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -294,6 +323,7 @@ class DataQualityReport:
             "raw_data_hash": self.raw_data_hash,
             "source_snapshot_id": self.source_snapshot_id,
             "decision_set_hash": self.decision_set_hash,
+            "quality_model_version": self.quality_model_version,
             "adjudicated_issue_fingerprints": list(
                 self.adjudicated_issue_fingerprints
             ),
@@ -358,6 +388,10 @@ class DataQualityReport:
             adjudicated_issue_fingerprints=tuple(
                 str(value)
                 for value in payload.get("adjudicated_issue_fingerprints", ())
+            ),
+            quality_model_version=(
+                None if payload.get("quality_model_version") is None
+                else str(payload["quality_model_version"])
             ),
         )
 

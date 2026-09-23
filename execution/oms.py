@@ -19,6 +19,8 @@ from execution.models import (
     Side,
 )
 from execution.pretrade import PreTradeVerification
+from execution.budget import plan_rebalance
+from execution.validation import finite_number, validate_account, validate_fill
 from services.models import SignalDecision, SignalStatus
 
 if TYPE_CHECKING:
@@ -92,6 +94,14 @@ class OrderManagementSystem:
             raise ValueError("Only ACTIONABLE signal decisions may create order drafts.")
         if self.repository is not None and decision.decision_id is None:
             raise ValueError("Persistent orders require a persisted SignalDecision.")
+        if self.repository is not None:
+            from research.runtime import assert_runtime_matches
+            from storage.repositories.governance import GovernanceRepository
+
+            manifest = GovernanceRepository(engine=self.repository.engine).load_frozen_runtime(decision.strategy_version)
+            assert_runtime_matches(self.config, manifest)
+            if decision.runtime_hash != manifest.runtime_hash:
+                raise ValueError("Persistent orders require the frozen decision runtime identity.")
         verified_at = verification.verified_at
         if verified_at.tzinfo is None:
             verified_at = verified_at.replace(tzinfo=timezone.utc)
@@ -105,6 +115,7 @@ class OrderManagementSystem:
                 raise ValueError(
                     f"Initial limit orders cannot be drafted before {self.config.execution_time_et} ET."
                 )
+        validate_account(account)
         if account.settled_cash < -1e-9 or account.available_cash < -1e-9:
             raise ValueError("Cash-account invariant failed: negative cash detected.")
         if account.buying_power > account.nav + 1e-6:
@@ -120,16 +131,21 @@ class OrderManagementSystem:
             if 1e-9 < weight < self.config.min_asset_weight - 1e-9:
                 raise ValueError(f"{ticker} target is below the risky-asset minimum.")
 
-        current_values = {
-            ticker: float(position.market_value)
-            for ticker, position in account.positions.items()
-        }
-        tickers = set(decision.target_weights).union(current_values)
-        dollar_deltas = {
-            ticker: float(decision.target_weights.get(ticker, 0.0) * account.nav)
-            - current_values.get(ticker, 0.0)
-            for ticker in tickers
-        }
+        for ticker, quote in quotes.items():
+            finite_number(quote.bid, f"{ticker} bid", positive=True)
+            finite_number(quote.ask, f"{ticker} ask", positive=True)
+            if quote.ask < quote.bid or quote.spread_bps > self.config.spread_block_bps:
+                raise ValueError(f"{ticker} quote failed the 20 bp spread gate.")
+        required = (set(account.positions) | set(decision.target_weights)) - {self.config.synthetic_cash_asset}
+        missing = required - set(quotes)
+        if missing:
+            raise ValueError(f"Missing reference quote for {', '.join(sorted(missing))}.")
+        plan = plan_rebalance(
+            self.config, account.nav, account.available_cash,
+            {ticker: position.quantity for ticker, position in account.positions.items()},
+            decision.target_weights, {ticker: quote.mid for ticker, quote in quotes.items()},
+            median_daily_dollar_volume, decision.regime == "risk_off",
+        )
         account_before = {
             "account_ref": account.account_ref,
             "nav": account.nav,
@@ -158,13 +174,18 @@ class OrderManagementSystem:
             "total_commission": account.total_commission,
             "last_valuation_session": account.last_valuation_session,
             "captured_at": account.captured_at.isoformat(),
+            "version": account.version,
+            "accounting_state": dict(account.accounting_state),
+            "dividend_receivable": account.dividend_receivable,
+            "halt_reasons": list(account.halt_reasons),
+            "drift_state": account.drift_state,
         }
         drafts: list[OrderIntent] = []
         warnings: list[str] = []
         drift_review = account.risk_state.upper() == "DRIFT_REVIEW" or decision.risk_state.upper() == "DRIFT_REVIEW"
-        for ticker, dollar_delta in sorted(dollar_deltas.items()):
-            if ticker == self.config.synthetic_cash_asset or abs(dollar_delta) < 1.0:
-                continue
+        for planned in plan.orders:
+            ticker = planned.ticker
+            dollar_delta = planned.quantity * planned.reference_price * (1 if planned.side == "BUY" else -1)
             if (
                 drift_review
                 and dollar_delta > 0.0
@@ -178,7 +199,7 @@ class OrderManagementSystem:
             if quote.bid <= 0.0 or quote.ask < quote.bid or quote.spread_bps > self.config.spread_block_bps:
                 raise ValueError(f"{ticker} quote failed the 20 bp spread gate.")
             side = Side.BUY if dollar_delta > 0.0 else Side.SELL
-            quantity = abs(dollar_delta) / quote.mid
+            quantity = planned.quantity
             order_type = "REPLAY_OPEN" if execution_model == "REPLAY_OPEN" else "LMT"
             if not self.broker.supports_fractional(ticker, order_type) and abs(quantity - round(quantity)) > 1e-8:
                 raise ValueError(f"Fractional {order_type} order is not supported for {ticker}.")
@@ -226,17 +247,12 @@ class OrderManagementSystem:
                 account_before=account_before,
                 created_at=verified_at.astimezone(timezone.utc),
             )
-            if self.repository is not None:
-                self.repository.save_intent(intent)
-                intent = self.repository.get_intent(client_id)
-            self._intents[client_id] = intent
             drafts.append(intent)
 
         self.last_draft_warnings = tuple(warnings)
-        buys = sum(intent.notional for intent in drafts if intent.side == Side.BUY)
-        sells = sum(intent.notional for intent in drafts if intent.side == Side.SELL)
-        if buys > account.available_cash + sells + 1e-6:
-            raise ValueError("Draft buys exceed cash available after planned sells.")
+        if self.repository is not None:
+            self.repository.save_draft_batch(drafts, account=account, paper_cycle_id=paper_cycle_id)
+        self._intents.update({intent.client_order_id: intent for intent in drafts})
         return tuple(sorted(drafts, key=lambda item: item.side == Side.BUY))
 
     def approve(
@@ -290,6 +306,12 @@ class OrderManagementSystem:
             return intent
         if intent.state != OrderState.APPROVED or not intent.approved_by:
             raise ValueError("Every order requires explicit human approval before submission.")
+        if self.repository is not None:
+            from research.runtime import assert_runtime_matches
+            from storage.repositories.governance import GovernanceRepository
+
+            manifest = GovernanceRepository(engine=self.repository.engine).load_frozen_runtime(intent.strategy_version)
+            assert_runtime_matches(self.config, manifest)
         if intent.environment == BrokerEnvironment.LIVE and self.config.strategy_version == "UNFROZEN":
             raise ValueError("An unfrozen strategy cannot submit a live order.")
         if intent.order_type != "REPLAY_OPEN":
@@ -333,6 +355,9 @@ class OrderManagementSystem:
     ) -> OrderIntent:
         if self.repository is None:
             raise RuntimeError("Fill processing requires the persistent execution repository.")
+        validate_fill(fill)
+        if fill.client_order_id != client_order_id:
+            raise ValueError("Fill client order identity does not match its order.")
         intent_id = self.repository.get_intent_id(client_order_id)
         if account_ref is None:
             self.repository.save_fill(intent_id, fill)
@@ -436,6 +461,9 @@ def reconcile_account(
     reconciled_at: datetime | None = None,
 ) -> ReconciliationResult:
     """Reconcile quantities, cash, NAV identity, fees, unknowns and open orders."""
+    validate_account(account)
+    if expected_account is not None:
+        validate_account(expected_account)
     reasons: list[str] = []
     threshold = max(5.0, account.nav * 0.0005)
     actual_quantities = {
@@ -462,19 +490,22 @@ def reconcile_account(
         nav_difference = account.nav - expected_account.nav
     else:
         expected_quantities = {
-            str(ticker): float(quantity)
+            str(ticker): finite_number(quantity, f"{ticker} expected quantity", nonnegative=True)
             for ticker, quantity in dict(expected_positions or {}).items()
         }
-    if expected_quantities:
+    has_expected_positions = expected_account is not None or expected_positions is not None
+    if has_expected_positions:
         for ticker in set(actual_quantities).union(expected_quantities):
             difference = actual_quantities.get(ticker, 0.0) - expected_quantities.get(ticker, 0.0)
             if abs(difference) > 1e-8:
                 quantity_differences[ticker] = difference
         if quantity_differences:
             reasons.append("POSITION_QUANTITY_MISMATCH")
-    unknown = tuple(sorted(set(actual_quantities) - set(expected_quantities))) if expected_quantities else ()
+    unknown = tuple(sorted(set(actual_quantities) - set(expected_quantities))) if has_expected_positions else ()
 
     if expected_values is not None:
+        expected_values = {ticker: finite_number(value, f"{ticker} expected value", nonnegative=True)
+                           for ticker, value in expected_values.items()}
         actual_values = {
             ticker: position.market_value for ticker, position in account.positions.items()
         }
@@ -486,7 +517,9 @@ def reconcile_account(
         if value_difference > threshold:
             reasons.append("ACCOUNT_VALUE_MISMATCH")
 
-    identity_nav = account.settled_cash + account.unsettled_cash + sum(
+    receivable_difference = (account.dividend_receivable - expected_account.dividend_receivable
+                             if expected_account is not None else 0.0)
+    identity_nav = account.settled_cash + account.unsettled_cash + account.dividend_receivable + sum(
         position.market_value for position in account.positions.values()
     )
     identity_difference = account.nav - identity_nav
@@ -496,12 +529,14 @@ def reconcile_account(
         + abs(unsettled_difference)
         + abs(available_difference)
         + abs(nav_difference)
+        + abs(receivable_difference)
     )
     if dollar_differences > threshold:
         reasons.append("CASH_OR_NAV_MISMATCH")
     if abs(identity_difference) > threshold:
         reasons.append("NAV_IDENTITY_MISMATCH")
     if expected_total_commission is not None:
+        expected_total_commission = finite_number(expected_total_commission, "Expected commission", nonnegative=True)
         commission_difference = account.total_commission - expected_total_commission
         if abs(commission_difference) > 0.01:
             reasons.append("COMMISSION_MISMATCH")
@@ -533,4 +568,6 @@ def reconcile_account(
         available_cash_difference=float(available_difference),
         nav_difference=float(nav_difference),
         commission_difference=float(commission_difference),
+        account_version=account.version,
+        dividend_receivable_difference=float(receivable_difference),
     )

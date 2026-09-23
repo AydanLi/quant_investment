@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from hashlib import sha256
 import json
 from pathlib import Path
 from typing import Iterable
 
 from config.settings import Config
+from research.runtime import capture_code_identity, config_payload, assert_code_identity
 
 
 @dataclass(frozen=True)
@@ -62,6 +63,8 @@ class ResearchProtocol:
     outer_test_months: int
     minimum_outer_training_years: int
     candidates: tuple[CandidateParameters, ...]
+    base_config: dict[str, object] = field(default_factory=lambda: config_payload(Config()))
+    code_identity: dict[str, object] = field(default_factory=capture_code_identity)
     start_date_offsets_months: tuple[int, ...] = (0, 3, 6)
     thresholds: AdmissionThresholdsV3 = AdmissionThresholdsV3()
     rebalance_frequency: str = "M"
@@ -70,9 +73,46 @@ class ResearchProtocol:
     maximum_weight: float = 0.35
     frozen: bool = True
 
+    def validate_runtime(self) -> None:
+        if self.code_commit != self.code_identity.get("code_commit"):
+            raise ValueError("Protocol code_commit differs from the captured code identity.")
+        assert_code_identity(self.code_identity)
+        config = self.make_base_config()
+        config.validate_risk_constraints()
+        if config.universe_version != self.universe_version:
+            raise ValueError("Preregistered configuration and protocol universe identities differ.")
+
+    def make_base_config(self) -> Config:
+        from dataclasses import fields
+        if set(self.base_config) != {item.name for item in fields(Config)}:
+            raise ValueError("Protocol must contain the complete base configuration.")
+        payload = dict(self.base_config)
+        payload["cost_scenarios_bps"] = tuple(payload["cost_scenarios_bps"])
+        payload["universe"] = list(payload["universe"])
+        return Config(**payload)
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, object]) -> "ResearchProtocol":
+        values = dict(payload)
+        if "base_config" not in values or "code_identity" not in values:
+            raise ValueError("Legacy protocols lack runtime evidence; preregister a new version.")
+        values["candidates"] = tuple(CandidateParameters(
+            label=item["label"], momentum=MomentumProfile(**item["momentum"]),
+            top_n=item["top_n"], target_annual_vol=item["target_annual_vol"],
+            regime=RegimeProfile(**item["regime"]),
+        ) for item in values["candidates"])
+        values["thresholds"] = AdmissionThresholdsV3(**values["thresholds"])
+        for name in ("benchmark_names", "cost_scenarios_bps", "start_date_offsets_months"):
+            values[name] = tuple(values[name])
+        return cls(**values)
+
     def __post_init__(self) -> None:
         if len(self.candidates) != 135:
             raise ValueError("The admitted core protocol must contain exactly 135 candidates.")
+        if self.candidates != core_candidate_grid():
+            raise ValueError("Core candidate definitions must match the preregistered grid.")
+        if self.outer_test_months != 12 or self.minimum_outer_training_years != 5:
+            raise ValueError("Core admission requires five training years and twelve-month outer windows.")
         if self.rebalance_frequency != "M" or self.execution_lag_sessions != 1:
             raise ValueError("Admitted research is fixed to monthly T+1 execution.")
         if tuple(self.cost_scenarios_bps) != (2.0, 7.0, 20.0):
@@ -150,6 +190,7 @@ def build_protocol(
     code_commit: str,
     dataset_snapshot_id: int,
     universe_version: str,
+    base_config: Config | None = None,
 ) -> ResearchProtocol:
     if not code_commit or not universe_version or dataset_snapshot_id < 1:
         raise ValueError("Protocol requires code, dataset, and universe provenance.")
@@ -163,6 +204,7 @@ def build_protocol(
         outer_test_months=12,
         minimum_outer_training_years=5,
         candidates=core_candidate_grid(),
+        base_config=config_payload(base_config or Config(universe_version=universe_version)),
     )
 
 

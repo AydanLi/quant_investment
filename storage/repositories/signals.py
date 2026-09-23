@@ -11,6 +11,7 @@ from data.calendar import NEW_YORK, NyseCalendar
 from services.models import PaperCycleStatus, SignalDecision, StoredSignalDecision
 from storage.repositories.base import BaseRepository
 from storage.repositories.governance import GovernanceRepository
+from research.runtime import FrozenRuntimeManifest, assert_code_identity
 from storage.schema import (
     dataset_snapshots,
     order_intents,
@@ -119,8 +120,18 @@ class SignalRepository(BaseRepository):
             raise ValueError(f"Unknown strategy version {strategy_version}.")
         if strategy["status"] != "frozen" or strategy["frozen_at"] is None:
             raise ValueError("Local paper requires a frozen strategy version.")
+        if not str(strategy["approved_by"] or "").strip() or strategy["approved_at"] is None:
+            raise ValueError("Local paper requires explicit human strategy-version approval.")
         if strategy["local_sim_start"] is None:
             raise ValueError("Local paper requires a started local simulation clock.")
+        if not strategy["runtime_manifest_json"]:
+            raise ValueError("Local paper requires a verified runtime manifest.")
+        manifest = FrozenRuntimeManifest.from_dict(strategy["runtime_manifest_json"])
+        if strategy["runtime_hash"] != manifest.runtime_hash:
+            raise ValueError("Local paper runtime hash does not match its manifest.")
+        assert_code_identity(manifest.code_identity)
+        if decision is not None and decision.runtime_hash != manifest.runtime_hash:
+            raise ValueError("SignalDecision runtime hash differs from the frozen strategy.")
 
         baseline_universe_version = str(strategy["universe_version"])
         baseline_snapshot_id = int(strategy["dataset_snapshot_id"])
@@ -237,7 +248,7 @@ class SignalRepository(BaseRepository):
                 decision=decision,
             )
 
-    def save(self, run_id: int, latest_signal: Mapping[str, Any]) -> None:
+    def save(self, run_id: int, latest_signal: Mapping[str, Any], *, connection=None) -> None:
         """Persist the latest signal. ``latest_signal`` carries
         ``date``, ``regime`` and a ``weights`` ticker->weight mapping."""
         weights = latest_signal.get("weights") or {}
@@ -257,7 +268,7 @@ class SignalRepository(BaseRepository):
             for ticker, weight in weights.items()
         ]
 
-        with self.engine.begin() as conn:
+        with self.transaction(connection) as conn:
             conn.execute(signals.insert(), rows)
 
     def get(self, run_id: int) -> pd.DataFrame:
@@ -289,6 +300,12 @@ class SignalRepository(BaseRepository):
             signal_decisions.c.signal_session == decision.signal_session,
         )
         with self.engine.begin() as conn:
+            if decision.actionable:
+                self._require_local_sim_ready(
+                    conn, strategy_version=decision.strategy_version,
+                    universe_version=decision.universe_version,
+                    dataset_snapshot_id=decision.dataset_snapshot_id, decision=decision,
+                )
             existing = conn.execute(
                 select(signal_decisions).where(identity)
             ).mappings().one_or_none()
@@ -310,6 +327,7 @@ class SignalRepository(BaseRepository):
                     generated_at=generated_at.to_pydatetime().replace(tzinfo=None),
                     next_rebalance_session=decision.next_rebalance_session,
                     status=decision.status.value,
+                    runtime_hash=decision.runtime_hash,
                     regime=decision.regime,
                     decision_json=decision.immutable_payload(),
                 )
